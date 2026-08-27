@@ -131,7 +131,7 @@ class Main(Star):
             cached = self.store.daily_quotes(trade_date)
             if not cached:
                 try:
-                    snapshot = await self.quotes.fetch_market_snapshot()
+                    snapshot = await self.quotes.fetch_market_snapshot(str(self.config.get("daily_market_url", "")))
                     saved = self.store.save_daily_quotes(
                         trade_date,
                         snapshot,

@@ -26,9 +26,9 @@ class SinaQuoteProvider:
         self.timeout = timeout
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
 
-    async def fetch_market_snapshot(self) -> list[Quote]:
-        """Fetch one daily snapshot for the A-share universe from Eastmoney."""
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
+    async def fetch_market_snapshot(self, daily_market_url: str = "") -> list[Quote]:
+        """Fetch one daily snapshot; a custom URL may expose the same JSON shape."""
+        url = str(daily_market_url or "").strip() or "https://push2.eastmoney.com/api/qt/clist/get"
         fields = "f2,f3,f4,f5,f6,f12,f14"
         result: list[Quote] = []
         page = 1
