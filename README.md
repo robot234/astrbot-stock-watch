@@ -44,6 +44,8 @@
 - `daily_cache_enabled`：是否启用每日全市场快照缓存，默认 `true`。
 - `daily_cache_keep_days`：日快照保留天数，默认 180 天。
 - `daily_market_url`：自定义全市场快照接口。留空使用东方财富；自定义接口需要返回兼容格式的 JSON，并支持 `pn`、`pz`、`fs`、`fields` 分页参数。
+- `tushare_url`：Tushare Pro 接口地址，通常留空即可，默认使用 `https://api.tushare.pro`。
+- `tushare_token`：Tushare Pro Token。填写后每日快照优先调用 Tushare `daily` 接口；留空则不调用 Tushare，使用东方财富。
 - `quote_interval_seconds`：盘中自选股行情轮询间隔，默认 30 秒。
 
 自定义快照接口的返回格式示例：
@@ -84,9 +86,10 @@
 ## 数据源说明
 
 - 每日全市场快照默认使用东方财富公开接口，也可以通过 `daily_market_url` 替换。
+- 配置 `tushare_token` 后，每日全市场快照优先使用 Tushare Pro；Tushare 请求失败会退回东方财富。
 - 盘中自选股默认使用新浪批量行情接口，适合少量自选股轮询。
 - 历史日线和技术指标使用东方财富接口。
-- Tushare Pro 更适合每日和历史数据，不建议用于高频盘中监听。Token 不要放进 URL 或提交到 GitHub。
+- Tushare Pro 更适合每日和历史数据，不建议用于高频盘中监听。Token 只填入 AstrBot 配置或环境变量，不要放进 URL 或提交到 GitHub。
 
 公开接口可能出现限流、延迟或临时不可用。快照失败时插件会退回 `universe_codes` 或自选股扫描。
 

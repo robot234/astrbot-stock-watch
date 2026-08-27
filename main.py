@@ -25,7 +25,11 @@ class Main(Star):
         data_dir = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
         self.store = StockStore(data_dir / "stock_watch.sqlite3")
         timeout = self._float("request_timeout", 10, 3, 60)
-        self.quotes = SinaQuoteProvider(timeout)
+        self.quotes = SinaQuoteProvider(
+            timeout,
+            str(self.config.get("tushare_url", "")),
+            str(self.config.get("tushare_token", "")),
+        )
         self.news = RssNewsProvider(str(self.config.get("news_rss_url", "")), timeout)
         self.llm = OpenAICompatibleClient(
             str(self.config.get("llm_base_url", "https://api.openai.com/v1")),

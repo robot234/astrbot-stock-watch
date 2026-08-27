@@ -22,11 +22,57 @@ def _sina_symbol(code: str) -> str:
 class SinaQuoteProvider:
     """Prototype provider; replace it with a licensed/stable source for production."""
 
-    def __init__(self, timeout: float = 10):
+    def __init__(self, timeout: float = 10, tushare_url: str = "", tushare_token: str = ""):
         self.timeout = timeout
+        self.tushare_url = str(tushare_url or "").strip() or "https://api.tushare.pro"
+        self.tushare_token = str(tushare_token or "").strip()
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
 
-    async def fetch_market_snapshot(self, daily_market_url: str = "") -> list[Quote]:
+    async def fetch_market_snapshot(self, daily_market_url: str = "", trade_date: str = "") -> list[Quote]:
+        """Fetch one daily snapshot, preferring Tushare when a token is configured."""
+        if self.tushare_token:
+            try:
+                return await self._fetch_tushare_snapshot(trade_date)
+            except (httpx.HTTPError, ValueError, TypeError, KeyError, RuntimeError):
+                # Tushare permissions, quota, or transient errors should not stop the daily job.
+                pass
+        return await self._fetch_eastmoney_snapshot(daily_market_url)
+
+    async def _fetch_tushare_snapshot(self, trade_date: str = "") -> list[Quote]:
+        date_value = str(trade_date or datetime.now(CHINA_TZ).strftime("%Y%m%d")).replace("-", "")
+        payload = {
+            "api_name": "daily",
+            "token": self.tushare_token,
+            "params": {"trade_date": date_value, "limit": 6000},
+            "fields": "ts_code,trade_date,close,pre_close,pct_chg,vol,amount",
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(self.tushare_url, json=payload)
+            response.raise_for_status()
+            body = response.json()
+        if int(body.get("code") or 0) != 0:
+            raise RuntimeError(str(body.get("msg") or "Tushare returned an error"))
+        data = body.get("data") or {}
+        fields = list(data.get("fields") or [])
+        items = data.get("items") or []
+        result: list[Quote] = []
+        for values in items:
+            row = dict(zip(fields, values))
+            code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
+            if not code.isdigit() or len(code) != 6:
+                continue
+            try:
+                price = float(row.get("close") or 0)
+                prev_close = float(row.get("pre_close") or 0)
+                pct_change = float(row.get("pct_chg") or 0)
+                volume = float(row.get("vol") or 0)
+                amount = float(row.get("amount") or 0) * 1000
+            except (TypeError, ValueError):
+                continue
+            result.append(Quote(code, code, price, prev_close, amount, pct_change, volume, fetched_at=datetime.now(CHINA_TZ)))
+        return result
+
+    async def _fetch_eastmoney_snapshot(self, daily_market_url: str = "") -> list[Quote]:
         """Fetch one daily snapshot; a custom URL may expose the same JSON shape."""
         url = str(daily_market_url or "").strip() or "https://push2.eastmoney.com/api/qt/clist/get"
         fields = "f2,f3,f4,f5,f6,f12,f14"
