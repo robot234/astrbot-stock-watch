@@ -34,7 +34,13 @@ class SinaQuoteProvider:
         page = 1
         # Eastmoney may silently cap oversized pages; 200 keeps pagination predictable.
         page_size = 200
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                "Referer": "https://quote.eastmoney.com/",
+            },
+        ) as client:
             while True:
                 params = {
                     "pn": page,
