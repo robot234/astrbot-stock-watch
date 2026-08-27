@@ -76,6 +76,13 @@ def calc_rsi(closes: Iterable[float], period: int = 6) -> float | None:
     return round(100 - 100 / (1 + gains / losses), 2)
 
 
+def simple_moving_average(values: Iterable[float], period: int) -> float | None:
+    data = [float(value) for value in values]
+    if period <= 0 or len(data) < period:
+        return None
+    return sum(data[-period:]) / period
+
+
 def is_tradable(quote: Quote, price_min: float = 2, price_max: float = 80) -> bool:
     return price_min <= quote.price <= price_max and quote.price > 0 and not quote.suspended and not quote.limit_up and not quote.limit_down
 
@@ -119,4 +126,3 @@ def format_candidate(candidate: Candidate) -> str:
     quote = candidate.quote
     why = "、".join(candidate.reasons) or "暂无技术加分"
     return f"{quote.code} {quote.name} 现价{quote.price:.2f} 涨跌{quote.pct_change:+.2f}% 成交额{quote.amount:.0f} 分数{candidate.score}（{why}）"
-

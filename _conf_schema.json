@@ -15,6 +15,6 @@
   "llm_api_key": {"type": "string", "description": "模型 API Key", "default": "", "obvious_hint": true},
   "llm_model": {"type": "string", "description": "模型名称", "default": "gpt-4o-mini"},
   "request_timeout": {"type": "int", "description": "HTTP 请求超时秒数", "default": 10},
+  "max_concurrency": {"type": "int", "description": "历史行情和网络任务最大并发数", "default": 5},
   "paper_trading_only": {"type": "bool", "description": "仅研究/模拟盘", "default": true}
 }
-

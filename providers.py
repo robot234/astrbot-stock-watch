@@ -3,16 +3,18 @@ from __future__ import annotations
 import hashlib
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable
 
 import httpx
 
-from .core import NewsItem, Quote, normalize_code
+from .core import CHINA_TZ, NewsItem, Quote, calc_rsi, normalize_code, simple_moving_average
 
 
 def _sina_symbol(code: str) -> str:
     value = normalize_code(code)
+    if value.startswith(("4", "8")):
+        return "bj" + value
     return ("sh" if value.startswith(("6", "68", "9")) else "sz") + value
 
 
@@ -21,6 +23,7 @@ class SinaQuoteProvider:
 
     def __init__(self, timeout: float = 10):
         self.timeout = timeout
+        self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
 
     async def fetch_quotes(self, codes: Iterable[str]) -> list[Quote]:
         values = [normalize_code(code) for code in codes]
@@ -42,8 +45,48 @@ class SinaQuoteProvider:
             except (TypeError, ValueError):
                 continue
             pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
-            result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, fetched_at=datetime.now().astimezone()))
+            result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, fetched_at=datetime.now(CHINA_TZ)))
         return result
+
+    async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5) -> None:
+        """Fetch a short adjusted daily history for the small candidate set."""
+        if not quotes:
+            return
+        semaphore = __import__("asyncio").Semaphore(max(1, max_concurrency))
+
+        async def enrich(quote: Quote) -> None:
+            cached = self._indicator_cache.get(quote.code)
+            if cached and datetime.now(CHINA_TZ) - cached[0] < timedelta(minutes=15):
+                values = cached[1]
+                quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
+                return
+            secid = ("1." if quote.code.startswith(("6", "68", "9")) else "0.") + quote.code
+            url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+            params = {"secid": secid, "klt": "101", "fqt": "1", "beg": "", "end": "", "lmt": "60"}
+            try:
+                async with semaphore:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        response = await client.get(url, params=params)
+                        response.raise_for_status()
+                        payload = response.json()
+                klines = ((payload.get("data") or {}).get("klines") or [])
+                closes = [float(str(row).split(",")[2]) for row in klines if len(str(row).split(",")) > 6]
+                volumes = [float(str(row).split(",")[5]) for row in klines if len(str(row).split(",")) > 6]
+                if len(closes) < 20:
+                    return
+                values = {
+                    "rsi6": calc_rsi(closes, 6),
+                    "ma5": simple_moving_average(closes, 5),
+                    "ma10": simple_moving_average(closes, 10),
+                    "ma20": simple_moving_average(closes, 20),
+                    "volume_ratio": (volumes[-1] / (sum(volumes[-6:-1]) / 5)) if len(volumes) >= 6 and sum(volumes[-6:-1]) > 0 else None,
+                }
+                self._indicator_cache[quote.code] = (datetime.now(CHINA_TZ), values)
+                quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
+            except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+                return
+
+        await __import__("asyncio").gather(*(enrich(quote) for quote in quotes))
 
 
 class RssNewsProvider:
@@ -89,4 +132,3 @@ class OpenAICompatibleClient:
 
 def news_fingerprint(item: NewsItem) -> str:
     return hashlib.sha256((item.title + "|" + item.link).encode("utf-8")).hexdigest()
-

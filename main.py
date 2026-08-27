@@ -94,11 +94,14 @@ class Main(Star):
 
     async def _scan(self, codes: list[str], limit: int):
         quotes = await self.quotes.fetch_quotes(codes)
-        candidates = [score_quote(quote) for quote in quotes if is_tradable(
+        tradable = [quote for quote in quotes if is_tradable(
             quote,
             self._float("price_min", 2, 0.01, 100000),
             self._float("price_max", 80, 0.01, 100000),
         )]
+        tradable.sort(key=lambda quote: quote.amount, reverse=True)
+        await self.quotes.enrich_indicators(tradable[: max(40, limit * 2)], self._int("max_concurrency", 5, 1, 20))
+        candidates = [score_quote(quote) for quote in tradable]
         minimum = self._int("min_score", 15, -100, 100)
         candidates = [item for item in candidates if item.score >= minimum]
         candidates.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
@@ -108,7 +111,7 @@ class Main(Star):
         while True:
             now = datetime.now(CHINA_TZ)
             target = str(self.config.get("daily_scan_time", "15:10"))
-            if now.strftime("%H:%M") == target and self.last_daily_scan != now.date().isoformat():
+            if now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat():
                 self.last_daily_scan = now.date().isoformat()
                 try:
                     candidates = await self._scan(self._universe(), self._int("candidate_limit", 30, 1, 100))
@@ -229,4 +232,3 @@ class Main(Star):
         except Exception:
             logger.exception("[%s] 故事查询失败", PLUGIN_NAME)
             yield event.plain_result("故事查询失败，请检查 RSS 地址。")
-
