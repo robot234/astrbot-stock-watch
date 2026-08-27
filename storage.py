@@ -22,6 +22,18 @@ class StockStore:
                 CREATE TABLE IF NOT EXISTS watchlist(scope TEXT NOT NULL, code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(scope, code));
                 CREATE TABLE IF NOT EXISTS subscriptions(origin TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS whitelist(origin TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS daily_quotes(
+                    trade_date TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    prev_close REAL NOT NULL DEFAULT 0,
+                    amount REAL NOT NULL DEFAULT 0,
+                    pct_change REAL NOT NULL DEFAULT 0,
+                    volume REAL NOT NULL DEFAULT 0,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY(trade_date, code)
+                );
                 CREATE TABLE IF NOT EXISTS seen_news(fingerprint TEXT PRIMARY KEY, created_at TEXT NOT NULL);
             """)
 
@@ -76,6 +88,38 @@ class StockStore:
     def whitelist(self) -> list[str]:
         with self._connect() as db:
             return [str(row[0]) for row in db.execute("SELECT origin FROM whitelist WHERE enabled=1 ORDER BY origin")]
+
+    def save_daily_quotes(self, trade_date: str, quotes, keep_days: int = 180) -> int:
+        rows = [
+            (trade_date, quote.code, quote.name, quote.price, quote.prev_close, quote.amount,
+             quote.pct_change, quote.volume, quote.fetched_at.isoformat())
+            for quote in quotes
+        ]
+        if not rows:
+            return 0
+        cutoff = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        with self._connect() as db:
+            db.execute("DELETE FROM daily_quotes WHERE trade_date=?", (trade_date,))
+            db.executemany("INSERT INTO daily_quotes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            db.execute("DELETE FROM daily_quotes WHERE trade_date < ?", (cutoff,))
+        return len(rows)
+
+    def daily_quotes(self, trade_date: str) -> list:
+        from .core import Quote
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT code, name, price, prev_close, amount, pct_change, volume, fetched_at FROM daily_quotes WHERE trade_date=? ORDER BY code",
+                (trade_date,),
+            )
+            result = []
+            for row in rows:
+                try:
+                    fetched_at = datetime.fromisoformat(str(row[7]))
+                except ValueError:
+                    fetched_at = datetime.now()
+                result.append(Quote(str(row[0]), str(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), fetched_at=fetched_at))
+            return result
 
     def mark_news_seen(self, fingerprint: str, keep_days: int = 14) -> bool:
         cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()

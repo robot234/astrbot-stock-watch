@@ -108,8 +108,7 @@ class Main(Star):
             merged.extend(codes)
         return list(dict.fromkeys(merged))
 
-    async def _scan(self, codes: list[str], limit: int):
-        quotes = await self.quotes.fetch_quotes(codes)
+    async def _score_quotes(self, quotes, limit: int):
         tradable = [quote for quote in quotes if is_tradable(
             quote,
             self._float("price_min", 2, 0.01, 100000),
@@ -123,14 +122,37 @@ class Main(Star):
         candidates.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
         return candidates[:limit]
 
+    async def _scan(self, codes: list[str], limit: int):
+        return await self._score_quotes(await self.quotes.fetch_quotes(codes), limit)
+
+    async def _daily_candidates(self, limit: int):
+        if self._bool("daily_cache_enabled", True):
+            trade_date = datetime.now(CHINA_TZ).date().isoformat()
+            cached = self.store.daily_quotes(trade_date)
+            if not cached:
+                try:
+                    snapshot = await self.quotes.fetch_market_snapshot()
+                    saved = self.store.save_daily_quotes(
+                        trade_date,
+                        snapshot,
+                        self._int("daily_cache_keep_days", 180, 7, 730),
+                    )
+                    logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
+                    cached = self.store.daily_quotes(trade_date)
+                except Exception:
+                    logger.exception("[%s] 全市场日快照失败，退回股票池扫描", PLUGIN_NAME)
+            if cached:
+                return await self._score_quotes(cached, limit)
+        return await self._scan(self._universe(), limit)
+
     async def _daily_loop(self):
         while True:
             now = datetime.now(CHINA_TZ)
             target = str(self.config.get("daily_scan_time", "15:10"))
-            if now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat():
+            if now.weekday() < 5 and now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat():
                 self.last_daily_scan = now.date().isoformat()
                 try:
-                    candidates = await self._scan(self._universe(), self._int("candidate_limit", 30, 1, 100))
+                    candidates = await self._daily_candidates(self._int("candidate_limit", 30, 1, 100))
                     lines = ["收盘选股（仅研究/模拟盘）", *[format_candidate(item) for item in candidates]]
                     if not candidates:
                         lines.append("暂无候选，或尚未配置股票池/行情接口。")

@@ -1,6 +1,8 @@
 {
   "enabled": {"type": "bool", "description": "启用后台监听和收盘扫描", "default": true},
   "push_whitelist": {"type": "string", "description": "后台推送白名单，填写 unified_msg_origin，多个值用逗号或换行分隔；留空时仅允许通过/白名单 开启加入的会话；填写 * 将允许所有会话", "default": ""},
+  "daily_cache_enabled": {"type": "bool", "description": "是否每天收盘抓取全市场日快照并缓存到本地", "default": true},
+  "daily_cache_keep_days": {"type": "int", "description": "全市场日快照保留天数", "default": 180},
   "universe_codes": {"type": "string", "description": "选股代码，逗号分隔；留空时使用自选股", "default": ""},
   "watchlist_limit": {"type": "int", "description": "每个会话最多保存的自选股数量", "default": 100},
   "quote_interval_seconds": {"type": "int", "description": "盘中自选股行情轮询间隔", "default": 30},

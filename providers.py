@@ -26,6 +26,59 @@ class SinaQuoteProvider:
         self.timeout = timeout
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
 
+    async def fetch_market_snapshot(self) -> list[Quote]:
+        """Fetch one daily snapshot for the A-share universe from Eastmoney."""
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        fields = "f2,f3,f4,f5,f6,f12,f14"
+        result: list[Quote] = []
+        page = 1
+        # Eastmoney may silently cap oversized pages; 200 keeps pagination predictable.
+        page_size = 200
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            while True:
+                response = await client.get(url, params={
+                    "pn": page,
+                    "pz": page_size,
+                    "po": 1,
+                    "np": 1,
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                    "fltt": 2,
+                    "invt": 2,
+                    "fid": "f3",
+                    "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                    "fields": fields,
+                })
+                response.raise_for_status()
+                data = response.json().get("data") or {}
+                diff = data.get("diff") or []
+                if isinstance(diff, dict):
+                    diff = diff.values()
+                diff = list(diff)
+                for row in diff:
+                    quote = self._snapshot_row(row)
+                    if quote:
+                        result.append(quote)
+                total = data.get("total")
+                if not diff or (total is not None and page * page_size >= int(total)) or (total is None and len(diff) < page_size):
+                    break
+                page += 1
+        return result
+
+    @staticmethod
+    def _snapshot_row(row: dict) -> Quote | None:
+        code = str(row.get("f12") or "").zfill(6)
+        if not code.isdigit() or len(code) != 6:
+            return None
+        try:
+            price = float(row.get("f2") or 0)
+            pct_change = float(row.get("f3") or 0)
+            prev_close = price / (1 + pct_change / 100) if price and pct_change > -100 else 0.0
+            volume = float(row.get("f5") or 0)
+            amount = float(row.get("f6") or 0)
+        except (TypeError, ValueError):
+            return None
+        return Quote(code, str(row.get("f14") or code), price, prev_close, amount, pct_change, volume, fetched_at=datetime.now(CHINA_TZ))
+
     async def fetch_quotes(self, codes: Iterable[str]) -> list[Quote]:
         values = [normalize_code(code) for code in codes]
         if not values:
