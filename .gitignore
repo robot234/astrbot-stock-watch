@@ -6,4 +6,4 @@ __pycache__/
 *.sqlite3
 logs/
 data/
-
+/tests/
