@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import xml.etree.ElementTree as ET
@@ -52,7 +53,7 @@ class SinaQuoteProvider:
         """Fetch a short adjusted daily history for the small candidate set."""
         if not quotes:
             return
-        semaphore = __import__("asyncio").Semaphore(max(1, max_concurrency))
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
         async def enrich(quote: Quote) -> None:
             cached = self._indicator_cache.get(quote.code)
@@ -62,7 +63,17 @@ class SinaQuoteProvider:
                 return
             secid = ("1." if quote.code.startswith(("6", "68", "9")) else "0.") + quote.code
             url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-            params = {"secid": secid, "klt": "101", "fqt": "1", "beg": "", "end": "", "lmt": "60"}
+            params = {
+                "secid": secid,
+                "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": "101",
+                "fqt": "1",
+                "beg": "0",
+                "end": "20500101",
+                "lmt": "60",
+            }
             try:
                 async with semaphore:
                     async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -86,7 +97,7 @@ class SinaQuoteProvider:
             except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
                 return
 
-        await __import__("asyncio").gather(*(enrich(quote) for quote in quotes))
+        await asyncio.gather(*(enrich(quote) for quote in quotes))
 
 
 class RssNewsProvider:
