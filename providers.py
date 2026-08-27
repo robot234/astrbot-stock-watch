@@ -36,7 +36,7 @@ class SinaQuoteProvider:
         page_size = 200
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             while True:
-                response = await client.get(url, params={
+                params = {
                     "pn": page,
                     "pz": page_size,
                     "po": 1,
@@ -47,9 +47,18 @@ class SinaQuoteProvider:
                     "fid": "f3",
                     "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
                     "fields": fields,
-                })
-                response.raise_for_status()
-                data = response.json().get("data") or {}
+                }
+                data = None
+                for attempt in range(3):
+                    try:
+                        response = await client.get(url, params=params)
+                        response.raise_for_status()
+                        data = response.json().get("data") or {}
+                        break
+                    except (httpx.HTTPError, ValueError):
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(1.5 * (attempt + 1))
                 diff = data.get("diff") or []
                 if isinstance(diff, dict):
                     diff = diff.values()
