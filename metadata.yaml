@@ -1,0 +1,8 @@
+name: astrbot_stock_watch
+display_name: "A股选股与自选监听"
+version: 0.1.0
+author: "DIO"
+description: "收盘后规则选股、盘中自选股行情监听与新闻故事提醒（研究/模拟盘）"
+repo: ""
+astrbot_version: ">=4.0.0"
+

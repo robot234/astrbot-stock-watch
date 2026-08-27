@@ -1,0 +1,20 @@
+{
+  "enabled": {"type": "bool", "description": "启用后台监听和收盘扫描", "default": true},
+  "universe_codes": {"type": "string", "description": "选股代码，逗号分隔；留空时使用自选股", "default": ""},
+  "watchlist_limit": {"type": "int", "description": "每个会话最多保存的自选股数量", "default": 100},
+  "quote_interval_seconds": {"type": "int", "description": "盘中自选股行情轮询间隔", "default": 30},
+  "news_interval_seconds": {"type": "int", "description": "新闻/RSS轮询间隔", "default": 180},
+  "daily_scan_time": {"type": "string", "description": "收盘扫描时间（北京时间）", "default": "15:10"},
+  "candidate_limit": {"type": "int", "description": "收盘推送候选数量", "default": 30},
+  "min_score": {"type": "int", "description": "技术评分最低分", "default": 15},
+  "price_min": {"type": "float", "description": "最低股价", "default": 2},
+  "price_max": {"type": "float", "description": "最高股价", "default": 80},
+  "news_rss_url": {"type": "string", "description": "可选 RSS 地址，留空关闭故事监听", "default": ""},
+  "llm_enabled": {"type": "bool", "description": "是否调用模型 API 摘要新闻", "default": false},
+  "llm_base_url": {"type": "string", "description": "OpenAI 兼容接口地址", "default": "https://api.openai.com/v1"},
+  "llm_api_key": {"type": "string", "description": "模型 API Key", "default": "", "obvious_hint": true},
+  "llm_model": {"type": "string", "description": "模型名称", "default": "gpt-4o-mini"},
+  "request_timeout": {"type": "int", "description": "HTTP 请求超时秒数", "default": 10},
+  "paper_trading_only": {"type": "bool", "description": "仅研究/模拟盘", "default": true}
+}
+
