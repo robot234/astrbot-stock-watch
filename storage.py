@@ -21,6 +21,7 @@ class StockStore:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS watchlist(scope TEXT NOT NULL, code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(scope, code));
                 CREATE TABLE IF NOT EXISTS subscriptions(origin TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS whitelist(origin TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS seen_news(fingerprint TEXT PRIMARY KEY, created_at TEXT NOT NULL);
             """)
 
@@ -60,6 +61,22 @@ class StockStore:
         with self._connect() as db:
             return [str(row[0]) for row in db.execute("SELECT origin FROM subscriptions WHERE enabled=1")]
 
+    def set_whitelist(self, origin: str, enabled: bool) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO whitelist VALUES (?, ?, ?) ON CONFLICT(origin) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at",
+                (origin, int(enabled), datetime.utcnow().isoformat()),
+            )
+
+    def is_whitelisted(self, origin: str) -> bool:
+        with self._connect() as db:
+            row = db.execute("SELECT enabled FROM whitelist WHERE origin=?", (origin,)).fetchone()
+            return bool(row and row[0])
+
+    def whitelist(self) -> list[str]:
+        with self._connect() as db:
+            return [str(row[0]) for row in db.execute("SELECT origin FROM whitelist WHERE enabled=1 ORDER BY origin")]
+
     def mark_news_seen(self, fingerprint: str, keep_days: int = 14) -> bool:
         cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
         with self._connect() as db:
@@ -68,4 +85,3 @@ class StockStore:
                 return False
             db.execute("INSERT INTO seen_news VALUES (?, ?)", (fingerprint, datetime.utcnow().isoformat()))
             return True
-

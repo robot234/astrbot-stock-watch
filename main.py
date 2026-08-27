@@ -17,7 +17,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.1.0")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.2.0")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -75,8 +75,24 @@ class Main(Star):
     def _origin(event: AstrMessageEvent) -> str:
         return str(getattr(event, "unified_msg_origin", "") or "")
 
-    async def _push(self, origin: str, text: str):
+    def _configured_whitelist(self) -> set[str]:
+        raw = self.config.get("push_whitelist", "")
+        if isinstance(raw, (list, tuple, set)):
+            values = raw
+        else:
+            values = str(raw or "").replace("，", ",").replace("\n", ",").split(",")
+        return {str(value).strip() for value in values if str(value).strip()}
+
+    def _push_allowed(self, origin: str) -> bool:
+        origin = str(origin or "").strip()
         if not origin:
+            return False
+        configured = self._configured_whitelist()
+        return "*" in configured or origin in configured or self.store.is_whitelisted(origin)
+
+    async def _push(self, origin: str, text: str):
+        if not self._push_allowed(origin):
+            logger.debug("[%s] 已跳过非白名单会话推送：%s", PLUGIN_NAME, origin or "<empty>")
             return
         try:
             await self.context.send_message(origin, MessageChain([Plain(text)]))
@@ -189,13 +205,44 @@ class Main(Star):
     async def listen(self, event: AstrMessageEvent, action: str = "状态"):
         origin, action = self._origin(event), str(action or "状态").strip().lower()
         if action in {"开启", "开", "on", "start"}:
+            if not self._push_allowed(origin):
+                yield event.plain_result("当前会话不在推送白名单，请先执行 /白名单 开启。")
+                return
             self.store.set_subscription(origin, True)
             yield event.plain_result("已开启盘中行情和故事提醒。")
         elif action in {"关闭", "关", "off", "stop"}:
             self.store.set_subscription(origin, False)
             yield event.plain_result("已关闭提醒。")
         else:
-            yield event.plain_result("监听状态：" + ("开启" if self.store.is_subscribed(origin) else "关闭"))
+            yield event.plain_result(
+                "监听状态：{}\n白名单：{}\n当前会话标识：{}".format(
+                    "开启" if self.store.is_subscribed(origin) else "关闭",
+                    "已加入" if self._push_allowed(origin) else "未加入",
+                    origin or "无法读取",
+                )
+            )
+
+    @filter.command("白名单")
+    async def whitelist(self, event: AstrMessageEvent, action: str = "状态"):
+        origin, action = self._origin(event), str(action or "状态").strip().lower()
+        if not origin:
+            yield event.plain_result("无法读取当前会话标识，暂不能设置白名单。")
+            return
+        if action in {"开启", "开", "on", "add", "加入"}:
+            self.store.set_whitelist(origin, True)
+            yield event.plain_result("已加入推送白名单。\n会话标识：" + origin)
+        elif action in {"关闭", "关", "off", "remove", "移除"}:
+            self.store.set_whitelist(origin, False)
+            yield event.plain_result("已移出推送白名单。")
+        elif action in {"列表", "list"}:
+            values = sorted(set(self._configured_whitelist()) | set(self.store.whitelist()))
+            yield event.plain_result("推送白名单：\n" + ("\n".join(values) if values else "暂无（后台推送默认关闭）"))
+        else:
+            yield event.plain_result(
+                "当前会话白名单：{}\n会话标识：{}\n用法：/白名单 开启|关闭|列表|状态".format(
+                    "已加入" if self._push_allowed(origin) else "未加入", origin
+                )
+            )
 
     @filter.command("行情")
     async def quote(self, event: AstrMessageEvent, code: str = ""):
