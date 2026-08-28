@@ -203,6 +203,16 @@ class StockStore:
                 result.append(Quote(str(row[0]), str(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), fetched_at=fetched_at))
             return result
 
+    def latest_daily_trade_date(self, before_or_equal: str) -> str | None:
+        """Return the newest locally cached trade date not later than the requested date."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT MAX(trade_date) FROM daily_quotes WHERE trade_date<=?",
+                (before_or_equal,),
+            ).fetchone()
+            value = str(row[0] or "").strip() if row else ""
+            return value or None
+
     def mark_news_seen(self, fingerprint: str, keep_days: int = 14) -> bool:
         cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
         with self._connect() as db:

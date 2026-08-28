@@ -335,10 +335,23 @@ class Main(Star):
             cached = self.store.daily_quotes(lookup_date)
             if cached:
                 return cached, False, lookup_date
-            result = await self.quotes.fetch_market_snapshot_result(
-                str(self.config.get("daily_market_url", "")), trade_date
-            )
-            if not result.quotes:
+            try:
+                result = await self.quotes.fetch_market_snapshot_result(
+                    str(self.config.get("daily_market_url", "")), trade_date
+                )
+            except Exception:
+                result = None
+            if result is None or not result.quotes:
+                # A transient source failure should not discard a usable prior snapshot.
+                actual_date = self.store.latest_daily_trade_date(trade_date)
+                if actual_date:
+                    fallback = self.store.daily_quotes(actual_date)
+                    if fallback:
+                        self._daily_date_alias[trade_date] = actual_date
+                        logger.warning("[%s] 当日快照不可用，使用最近缓存交易日：%s", PLUGIN_NAME, actual_date)
+                        return fallback, False, actual_date
+                if result is None:
+                    raise RuntimeError("daily snapshot source unavailable")
                 return [], True, trade_date
             actual_date = result.trade_date or trade_date
             saved = self.store.save_daily_quotes(
@@ -375,7 +388,7 @@ class Main(Star):
                         *[format_candidate(item) for item in candidates],
                     ]
                     if not candidates:
-                        lines.append("暂无候选，或尚未配置股票池/行情接口。")
+                        lines.append("暂无候选，可能是行情源不可用、技术指标不足或 min_score 过滤较严。")
                     push_failed = False
                     for origin in self.store.subscriptions():
                         if not await self._push(origin, "\n".join(lines)):
