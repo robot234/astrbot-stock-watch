@@ -71,6 +71,30 @@ class Main(Star):
             }
         }
 
+    def _minute_signal_text(self, quote, completed) -> str:
+        if not completed or not self._bool("minute_trigger_enabled", False):
+            return ""
+        bars = self.minute_bars.bars(quote.code)
+        lookback = self._int("minute_trigger_lookback", 5, 1, 60)
+        minimum = self._int("minute_trigger_min_bars", 5, 1, 120)
+        consecutive = self._int("minute_trigger_consecutive_up", 3, 1, 20)
+        if len(bars) < max(minimum, lookback + 1, consecutive + 1):
+            return ""
+        step_pct = self._float("minute_trigger_step_pct", 0.1, 0.0, 20.0)
+        window = bars[-(consecutive + 1):]
+        if any(current.close < previous.close * (1 + step_pct / 100) for previous, current in zip(window, window[1:])):
+            return ""
+        prior = bars[-(lookback + 1):-1]
+        breakout_pct = self._float("minute_trigger_breakout_pct", 0.5, 0.0, 20.0)
+        reference = max(bar.high for bar in prior)
+        if completed.close < reference * (1 + breakout_pct / 100):
+            return ""
+        return (
+            "分钟触发（仅研究/模拟盘）\n"
+            f"{quote.code} {quote.name} {completed.start:%H:%M} 收盘{completed.close:.2f}："
+            f"连续上涨{consecutive}根，突破近{lookback}根高点+{breakout_pct:.2f}%（仅提醒，不自动下单）"
+        )
+
     async def initialize(self):
         if not self._bool("enabled", True):
             logger.info("[%s] 后台任务已关闭", PLUGIN_NAME)
@@ -349,10 +373,17 @@ class Main(Star):
                         quotes = self._fresh_quotes(raw_quotes)
                         health["stale_quotes"] += max(0, len(raw_quotes) - len(quotes))
                         health["accepted_quotes"] += len(quotes)
+                        minute_signals = {}
+                        completed_codes = set()
                         if self._bool("minute_enabled", True):
                             for quote in quotes:
-                                if self.minute_bars.update(quote) is not None:
+                                completed = self.minute_bars.update(quote)
+                                if completed is not None:
+                                    completed_codes.add(quote.code)
                                     health["completed_bars"] += 1
+                                    signal = self._minute_signal_text(quote, completed)
+                                    if signal:
+                                        minute_signals[quote.code] = signal
                         if quotes:
                             if cycle_failed:
                                 health["failed_cycles"] += 1
@@ -385,18 +416,23 @@ class Main(Star):
                                 for code in codes:
                                     quote = quotes_by_code.get(code)
                                     candidate = by_code.get(code)
+                                    minute_signal = minute_signals.get(code, "")
                                     cost_signal = self._cost_signal(quote, watch_details.get(origin, {}).get(code)) if quote else ""
+                                    is_minute = bool(minute_signal and not candidate and not cost_signal)
                                     if quote and not candidate:
                                         self.store.reset_confirmation(origin, code)
-                                    if not candidate and not cost_signal:
+                                    if quote and code in completed_codes and not is_minute:
+                                        self.store.reset_confirmation(origin, "minute:" + code)
+                                    if not candidate and not cost_signal and not minute_signal:
                                         continue
                                     threshold = self._int("intraday_failure_threshold", 0, 0, 100)
                                     if threshold > 0 and health["consecutive_failures"] >= threshold:
                                         continue
                                     if not cost_signal and self._bool("confirmation_enabled", False):
+                                        confirmation_code = "minute:" + code if is_minute else code
                                         confirmed = self.store.observe_confirmation(
                                             origin,
-                                            code,
+                                            confirmation_code,
                                             self._int("confirmation_periods", 2, 1, 5),
                                             self._int("confirmation_max_gap_seconds", 90, 30, 600),
                                         )
@@ -407,6 +443,8 @@ class Main(Star):
                                         continue
                                     if cost_signal:
                                         text = cost_signal
+                                    elif is_minute:
+                                        text = minute_signal
                                     else:
                                         text = "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate)
                                         annotation = self._annotation_text(code)

@@ -55,6 +55,10 @@
 - `quote_interval_seconds`：盘中自选股行情轮询间隔，默认 30 秒。
 - `minute_enabled`：是否记录盘中一分钟聚合行情，默认开启；只用于观测和后续指标，不改变现有评分。成交量/额按行情源累计值计算为分钟增量，开始监听前的累计部分不会回溯。
 - `minute_bar_history`：每只股票保留的已完成分钟线数量，默认 120 根。
+- `minute_trigger_enabled`：是否启用分钟线突破提醒，默认关闭。开启后要求连续上涨并突破近几根分钟线高点，只发研究提醒，不自动下单。
+- `minute_trigger_lookback`、`minute_trigger_min_bars`：突破参考窗口和最少分钟线数量，默认都是 5 根。
+- `minute_trigger_consecutive_up`：连续上涨根数，默认 3 根。
+- `minute_trigger_step_pct`、`minute_trigger_breakout_pct`：每根最小涨幅和突破幅度，默认 0.1% 和 0.5%。
 - `intraday_failure_threshold`：连续行情失败达到该次数后暂缓信号推送；默认 0，仅统计不暂缓。
 - `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送止盈观察，默认 5%。
 - `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%。
