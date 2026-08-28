@@ -62,19 +62,23 @@ class StockStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
                 db.execute("ALTER TABLE watchlist ADD COLUMN cost_price REAL NULL")
+            if "name" not in columns:
+                db.execute("ALTER TABLE watchlist ADD COLUMN name TEXT NULL")
 
-    def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None) -> bool:
+    def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
             cost_price = None
+        clean_name = str(name or "").strip().replace("\n", " ").replace("\r", " ") or None
         with self._connect() as db:
             exists = db.execute("SELECT 1 FROM watchlist WHERE scope=? AND code=?", (scope, code)).fetchone()
             count = db.execute("SELECT COUNT(*) FROM watchlist WHERE scope=?", (scope,)).fetchone()[0]
             if not exists and count >= limit:
                 return False
             db.execute(
-                "INSERT INTO watchlist(scope, code, created_at, cost_price) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(scope, code) DO UPDATE SET cost_price=COALESCE(excluded.cost_price, watchlist.cost_price)",
-                (scope, code, datetime.utcnow().isoformat(), cost_price),
+                "INSERT INTO watchlist(scope, code, created_at, cost_price, name) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scope, code) DO UPDATE SET cost_price=COALESCE(excluded.cost_price, watchlist.cost_price), "
+                "name=COALESCE(excluded.name, watchlist.name)",
+                (scope, code, datetime.utcnow().isoformat(), cost_price, clean_name),
             )
             return True
 
@@ -101,6 +105,19 @@ class StockStore:
                 except (TypeError, ValueError):
                     value = None
                 result.append((str(code), value))
+            return result
+
+    def list_watch_details_with_names(self, scope: str) -> list[tuple[str, str | None, float | None]]:
+        with self._connect() as db:
+            rows = db.execute("SELECT code, name, cost_price FROM watchlist WHERE scope=? ORDER BY code", (scope,))
+            result = []
+            for code, name, cost in rows:
+                try:
+                    value = float(cost) if cost is not None and math.isfinite(float(cost)) and float(cost) > 0 else None
+                except (TypeError, ValueError):
+                    value = None
+                clean_name = str(name or "").strip().replace("\n", " ").replace("\r", " ") or None
+                result.append((str(code), clean_name, value))
             return result
 
     def list_watch(self, scope: str) -> list[str]:

@@ -546,14 +546,32 @@ class Main(Star):
             if len(raw_parts) > 1 and cost_price is None:
                 yield event.plain_result("用法：/自选 添加 600000 [成本价]")
                 return
-            ok = self.store.add_watch(origin, codes[0], self._int("watchlist_limit", 100, 1, 1000), cost_price)
+            code_value = codes[0]
+            stock_name = None
+            try:
+                matched = await self.quotes.fetch_quotes([code_value])
+                if matched and matched[0].name.strip():
+                    stock_name = matched[0].name.strip()
+            except Exception:
+                logger.debug("[%s] 添加自选时获取股票名称失败：%s", PLUGIN_NAME, code_value)
+            ok = self.store.add_watch(
+                origin,
+                code_value,
+                self._int("watchlist_limit", 100, 1, 1000),
+                cost_price,
+                stock_name,
+            )
             suffix = f"，成本价 {cost_price:.2f}" if cost_price else ""
-            yield event.plain_result(("已加入自选：" if ok else "添加失败，可能已达到数量上限：") + codes[0] + suffix)
+            label = f"{stock_name}（{code_value}）" if stock_name else code_value
+            yield event.plain_result(("已加入自选：" if ok else "添加失败，可能已达到数量上限：") + label + suffix)
         elif action in {"删除", "移除", "del", "remove"} and codes:
-            yield event.plain_result(("已移除：" if self.store.remove_watch(origin, codes[0]) else "自选中没有：") + codes[0])
+            existing = {item_code: item_name for item_code, item_name, _ in self.store.list_watch_details_with_names(origin)}
+            code_value = codes[0]
+            label = f"{existing.get(code_value) or code_value}（{code_value}）" if existing.get(code_value) else code_value
+            yield event.plain_result(("已移除：" if self.store.remove_watch(origin, code_value) else "自选中没有：") + label)
         else:
-            current = self.store.list_watch_details(origin)
-            values = [f"{code}(成本{cost:.2f})" if cost else code for code, cost in current]
+            current = self.store.list_watch_details_with_names(origin)
+            values = [f"{name or code}（{code}）" + (f"(成本{cost:.2f})" if cost else "") for code, name, cost in current]
             yield event.plain_result("自选股：" + ("、".join(values) if values else "暂无。用 /自选 添加 600000 [成本价]"))
 
     @filter.command("监听")
