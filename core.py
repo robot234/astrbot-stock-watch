@@ -28,6 +28,8 @@ class Quote:
     support20: float | None = None
     resistance20: float | None = None
     volatility20: float | None = None
+    momentum5: float | None = None
+    momentum20: float | None = None
     history_days: int = 0
     source: str = ""
     provider_ts: datetime | None = None
@@ -42,7 +44,7 @@ class Candidate:
     quote: Quote
     score: int
     reasons: list[str]
-    score_max: int = 30
+    score_max: int = 50
     risk_level: str = "unknown"
     risk_flags: list[str] = field(default_factory=list)
     price_plan: "PricePlan | None" = None
@@ -288,22 +290,40 @@ def is_tradable(quote: Quote, price_min: float = 2, price_max: float = 80) -> bo
 
 
 def score_quote(quote: Quote) -> Candidate:
+    """Multi-factor research score; it ranks setups, never predicts returns."""
     score = 0
     reasons: list[str] = []
-    if quote.rsi6 is not None:
-        if quote.rsi6 < 25:
-            score += 15
-            reasons.append("RSI6超卖+15")
-        elif quote.rsi6 < 40:
-            score += 8
-            reasons.append("RSI6低位+8")
+    if quote.rsi6 is not None and math.isfinite(float(quote.rsi6)):
+        if 40 <= quote.rsi6 <= 65:
+            score += 5
+            reasons.append("RSI6处于可跟踪区间+5")
+        elif quote.rsi6 < 30 and (quote.momentum5 or 0) > 0:
+            score += 6
+            reasons.append("RSI6超卖后回升+6")
+        elif quote.rsi6 >= 75:
+            score -= 5
+            reasons.append("RSI6过热-5")
     if quote.ma5 is not None and quote.ma10 is not None and quote.ma20 is not None:
         if quote.ma5 > quote.ma10 > quote.ma20:
-            score += 10
-            reasons.append("均线多头+10")
+            score += 12
+            reasons.append("均线多头趋势+12")
         elif quote.ma5 < quote.ma10 < quote.ma20:
             score -= 10
             reasons.append("均线空头-10")
+    if quote.momentum5 is not None and math.isfinite(float(quote.momentum5)):
+        if quote.momentum5 > 3:
+            score += 8
+            reasons.append("5日动量转强+8")
+        elif quote.momentum5 < -5:
+            score -= 4
+            reasons.append("5日动量偏弱-4")
+    if quote.momentum20 is not None and math.isfinite(float(quote.momentum20)):
+        if quote.momentum20 > 0:
+            score += 5
+            reasons.append("20日趋势为正+5")
+        elif quote.momentum20 < -10:
+            score -= 5
+            reasons.append("20日趋势偏弱-5")
     if quote.volume_ratio is not None:
         if quote.pct_change > 0 and quote.volume_ratio > 1:
             score += 5
@@ -311,6 +331,9 @@ def score_quote(quote: Quote) -> Candidate:
         elif quote.pct_change < 0 and quote.volume_ratio > 1:
             score -= 5
             reasons.append("放量下跌-5")
+    if quote.volatility20 is not None and math.isfinite(float(quote.volatility20)) and quote.volatility20 >= 0.08:
+        score -= 5
+        reasons.append("波动率偏高-5")
     candidate = Candidate(quote, score, reasons)
     review = review_risk(quote, candidate)
     candidate.risk_level = review.verdict
@@ -338,6 +361,8 @@ def format_candidate(candidate: Candidate) -> str:
         metrics.append(f"MA5/10/20={quote.ma5:.2f}/{quote.ma10:.2f}/{quote.ma20:.2f}")
     if quote.volume_ratio is not None:
         metrics.append(f"量比={quote.volume_ratio:.2f}")
+    if quote.momentum5 is not None and quote.momentum20 is not None:
+        metrics.append(f"5/20日动量={quote.momentum5:+.1f}%/{quote.momentum20:+.1f}%")
     evidence = "、".join(metrics) or "当前可用技术指标不足"
     risk_items: list[str] = list(candidate.risk_flags)
     if any("空头" in reason or "放量下跌" in reason for reason in candidate.reasons):

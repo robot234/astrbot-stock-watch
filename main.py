@@ -231,12 +231,22 @@ class Main(Star):
             if bars:
                 self.store.save_daily_bars(quote.code, bars, quote.source or "eastmoney")
         self._last_screen_diagnostics = {"input": len(quotes), "tradable": len(tradable), "enriched": sum(1 for q in enrich_targets if q.history_days >= 20)}
-        candidates = [score_quote(quote) for quote in tradable]
-        minimum = self._int("min_score", 15, -100, 100)
-        candidates = [item for item in candidates if item.score >= minimum]
-        candidates.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
-        self._last_screen_diagnostics.update({"qualified": len(candidates), "max_score": max((score_quote(q).score for q in tradable), default=0), "min_score": minimum})
-        return candidates[:limit]
+        scored = [score_quote(quote) for quote in tradable]
+        minimum = self._int("min_score", 10, -100, 100)
+        scored.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
+        qualified = [item for item in scored if item.score >= minimum and item.risk_level != "blocked"]
+        fallback_limit = self._int("fallback_limit", 5, 0, 30)
+        fallback = []
+        if not qualified and fallback_limit and scored:
+            # 只从有历史指标且未触发硬风险的项目中给出“观察候选”，不绕过风险门禁。
+            fallback = [item for item in scored if item.risk_level not in {"blocked", "unknown"} and item.quote.history_days >= 20][:fallback_limit]
+            for item in fallback:
+                item.reasons = ["未达到最低分，列入观察候选"] + item.reasons
+        self._last_screen_diagnostics.update({
+            "qualified": len(qualified), "fallback": len(fallback),
+            "max_score": max((item.score for item in scored), default=0), "min_score": minimum,
+        })
+        return (qualified or fallback)[:limit]
 
     async def _scan(self, codes: list[str], limit: int):
         return await self._score_quotes(await self.quotes.fetch_quotes(codes), limit)
@@ -412,12 +422,13 @@ class Main(Star):
         if self._bool("daily_cache_enabled", True):
             trade_date = datetime.now(CHINA_TZ).date().isoformat()
             try:
-                cached, _, _ = await self._daily_snapshot(trade_date)
+                cached, _, actual_date = await self._daily_snapshot(trade_date)
             except Exception:
                 logger.exception("[%s] 全市场日快照失败，退回股票池扫描", PLUGIN_NAME)
                 cached = []
+                actual_date = trade_date
             if cached:
-                return await self._score_quotes(cached, limit, cached[0].fetched_at.date().isoformat() if cached else "")
+                return await self._score_quotes(cached, limit, actual_date or trade_date)
         return await self._scan(self._universe(), limit)
 
     def _record_screen(self, requested_date: str, actual_date: str, source: str, quotes, candidates, status: str = "completed", quality: str = "good", error: str | None = None) -> str:
@@ -690,7 +701,7 @@ class Main(Star):
                     "可能是 Tushare 尚未发布该日期数据，或行情接口暂时不可用。"
                 )
                 return
-            candidates = await self._score_quotes(quotes, limit)
+            candidates = await self._score_quotes(quotes, limit, actual_date)
             self._record_screen(trade_date, actual_date, "cache/eastmoney/tushare", quotes, candidates)
             lines = [
                 f"{source}：{len(quotes)} 只",
@@ -700,7 +711,7 @@ class Main(Star):
             lines.extend(format_candidate(item) for item in candidates)
             if not candidates:
                 d = self._last_screen_diagnostics
-                lines.append(f"暂无达标候选：可交易{d.get('tradable', 0)}只，成功补齐历史指标{d.get('enriched', 0)}只，最高分{d.get('max_score', 0)}，最低门槛{d.get('min_score', self._int('min_score', 15, -100, 100))}。")
+                lines.append(f"暂无达标候选：可交易{d.get('tradable', 0)}只，成功补齐历史指标{d.get('enriched', 0)}只，最高分{d.get('max_score', 0)}，最低门槛{d.get('min_score', self._int('min_score', 10, -100, 100))}。")
                 lines.append("若想扩大观察范围，可把 min_score 调低；指标补齐数为 0 时请检查行情接口限流或配置。")
             yield event.plain_result("\n".join(lines))
         except Exception:

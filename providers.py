@@ -273,6 +273,7 @@ class SinaQuoteProvider:
                 values = cached[1]
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
                 quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values.get("atr14"), values.get("support20"), values.get("resistance20"), values.get("volatility20"), int(values.get("history_days") or 0))
+                quote.momentum5, quote.momentum20 = values.get("momentum5"), values.get("momentum20")
                 return
             secid = ("1." if quote.code.startswith(("6", "68", "9")) else "0.") + quote.code
             url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -327,10 +328,13 @@ class SinaQuoteProvider:
                     "resistance20": max(highs[-20:]) if len(highs) >= 20 else None,
                     "volatility20": volatility,
                     "history_days": len(closes),
+                    "momentum5": ((closes[-1] / closes[-6] - 1) * 100) if len(closes) >= 6 and closes[-6] > 0 else None,
+                    "momentum20": ((closes[-1] / closes[-21] - 1) * 100) if len(closes) >= 21 and closes[-21] > 0 else None,
                 }
                 self._indicator_cache[cache_key] = (datetime.now(CHINA_TZ), values)
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
                 quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values["atr14"], values["support20"], values["resistance20"], values["volatility20"], values["history_days"])
+                quote.momentum5, quote.momentum20 = values.get("momentum5"), values.get("momentum20")
             except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
                 return
 
