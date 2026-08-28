@@ -81,14 +81,30 @@ class StockStore:
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
-                db.execute("ALTER TABLE watchlist ADD COLUMN cost_price REAL NULL")
+                try:
+                    db.execute("ALTER TABLE watchlist ADD COLUMN cost_price REAL NULL")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             if "name" not in columns:
-                db.execute("ALTER TABLE watchlist ADD COLUMN name TEXT NULL")
+                try:
+                    db.execute("ALTER TABLE watchlist ADD COLUMN name TEXT NULL")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             quote_columns = {row[1] for row in db.execute("PRAGMA table_info(daily_quotes)")}
             if "source" not in quote_columns:
-                db.execute("ALTER TABLE daily_quotes ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+                try:
+                    db.execute("ALTER TABLE daily_quotes ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             if "provider_ts" not in quote_columns:
-                db.execute("ALTER TABLE daily_quotes ADD COLUMN provider_ts TEXT NULL")
+                try:
+                    db.execute("ALTER TABLE daily_quotes ADD COLUMN provider_ts TEXT NULL")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             db.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '2')")
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
