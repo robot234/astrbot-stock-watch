@@ -253,7 +253,10 @@ class Main(Star):
         raw_evidence = annotation.get("evidence", [])
         if not isinstance(raw_evidence, list):
             raw_evidence = []
-        evidence = "、".join(self._clean_external_text(item, 80) for item in raw_evidence[:3] if str(item).strip())
+        cleaned_evidence = [self._clean_external_text(item, 80) for item in raw_evidence[:3] if str(item).strip()]
+        if any(not self._model_text_is_research_safe(item) for item in cleaned_evidence):
+            return ""
+        evidence = "、".join(cleaned_evidence)
         summary = self._clean_external_text(annotation.get("summary", ""), 300)
         if not self._model_text_is_research_safe(summary):
             return ""
@@ -712,8 +715,8 @@ class Main(Star):
                 return
             if self._bool("llm_enabled", False):
                 try:
-                    summary = await self.llm.summarize(items[:10])
-                    if summary:
+                    summary = self._clean_external_text(await self.llm.summarize(items[:10]), 3000)
+                    if summary and self._model_text_is_research_safe(summary):
                         yield event.plain_result(summary)
                         return
                 except Exception:
