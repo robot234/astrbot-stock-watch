@@ -51,6 +51,13 @@ class StockStore:
                     last_sent_at TEXT NOT NULL,
                     PRIMARY KEY(origin, code)
                 );
+                CREATE TABLE IF NOT EXISTS confirmation_events(
+                    origin TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    consecutive_count INTEGER NOT NULL,
+                    last_observed_at TEXT NOT NULL,
+                    PRIMARY KEY(origin, code)
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
@@ -228,3 +235,58 @@ class StockStore:
                 "DELETE FROM signal_events WHERE origin=? AND code=? AND last_sent_at=?",
                 (origin, code, current.isoformat()),
             )
+
+    def reset_confirmation(self, origin: str, code: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM confirmation_events WHERE origin=? AND code=?", (origin, code))
+
+    def observe_confirmation(
+        self,
+        origin: str,
+        code: str,
+        required: int,
+        max_gap_seconds: int,
+        qualifies: bool = True,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically record one qualifying observation and report confirmation."""
+        try:
+            required = max(1, int(required))
+        except (TypeError, ValueError):
+            required = 1
+        try:
+            max_gap_seconds = max(0, int(max_gap_seconds))
+        except (TypeError, ValueError):
+            max_gap_seconds = 0
+        current = now or datetime.utcnow()
+        if current.tzinfo is not None:
+            current = current.astimezone(timezone.utc).replace(tzinfo=None)
+        current_iso = current.isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not qualifies:
+                db.execute("DELETE FROM confirmation_events WHERE origin=? AND code=?", (origin, code))
+                return False
+            row = db.execute(
+                "SELECT consecutive_count, last_observed_at FROM confirmation_events WHERE origin=? AND code=?",
+                (origin, code),
+            ).fetchone()
+            count = 1
+            if row:
+                try:
+                    previous = datetime.fromisoformat(str(row[1]))
+                    if previous.tzinfo is not None:
+                        previous = previous.astimezone(timezone.utc).replace(tzinfo=None)
+                    if (current - previous).total_seconds() <= max_gap_seconds:
+                        count = max(0, int(row[0])) + 1
+                except (TypeError, ValueError):
+                    count = 1
+            if count >= required:
+                db.execute("DELETE FROM confirmation_events WHERE origin=? AND code=?", (origin, code))
+                return True
+            db.execute(
+                "INSERT INTO confirmation_events(origin, code, consecutive_count, last_observed_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(origin, code) DO UPDATE SET consecutive_count=excluded.consecutive_count, last_observed_at=excluded.last_observed_at",
+                (origin, code, count, current_iso),
+            )
+            return False

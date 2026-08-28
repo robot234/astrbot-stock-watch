@@ -9,6 +9,7 @@
 - Tushare 当天暂无数据时自动寻找最近有数据的交易日
 - 盘中轮询自选股，触发信号后推送提醒
 - 盘中行情按会话合并抓取，信号冷却状态持久化到 SQLite
+- 连续确认状态持久化到 SQLite，插件重启后可继续累计
 - 轮询 RSS 或公告流，去重后推送市场故事
 - 可选调用 OpenAI 兼容模型 API，总结新闻和事件
 - 支持群聊、私聊推送白名单
@@ -57,7 +58,7 @@
 - `intraday_failure_threshold`：连续行情失败达到该次数后暂缓信号推送；默认 0，仅统计不暂缓。
 - `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送止盈观察，默认 5%。
 - `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%。
-- `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号。
+- `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号，确认进度会保存到 SQLite。
 - `confirmation_periods`：连续确认次数，默认 2 次。
 - `confirmation_max_gap_seconds`：连续确认最大间隔，默认 90 秒。
 

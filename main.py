@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,7 +47,6 @@ class Main(Star):
         self._annotation_task: asyncio.Task | None = None
         self._annotation_cache: dict[str, tuple[datetime, dict]] = {}
         self._last_annotation_at: datetime | None = None
-        self._signal_observations: dict[tuple[str, str], deque[datetime]] = defaultdict(deque)
         self.minute_bars = MinuteBarAggregator(self._int("minute_bar_history", 120, 10, 2000))
         self._intraday_date: str | None = None
         self._intraday_health = {
@@ -213,20 +211,6 @@ class Main(Star):
         if change <= -risk:
             return f"成本观察：{quote.code} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%，达到风险观察阈值（仅研究/模拟盘，不自动下单）"
         return ""
-
-    def _confirmed_candidate(self, origin: str, code: str) -> bool:
-        key = (origin, code)
-        now = datetime.now(CHINA_TZ)
-        history = self._signal_observations[key]
-        max_gap = self._int("confirmation_max_gap_seconds", 90, 30, 600)
-        while history and (now - history[0]).total_seconds() > max_gap:
-            history.popleft()
-        history.append(now)
-        required = self._int("confirmation_periods", 2, 1, 5)
-        if len(history) >= required:
-            history.clear()
-            return True
-        return False
 
     def _fresh_quotes(self, quotes):
         now = datetime.now(CHINA_TZ)
@@ -402,13 +386,22 @@ class Main(Star):
                                     quote = quotes_by_code.get(code)
                                     candidate = by_code.get(code)
                                     cost_signal = self._cost_signal(quote, watch_details.get(origin, {}).get(code)) if quote else ""
+                                    if quote and not candidate:
+                                        self.store.reset_confirmation(origin, code)
                                     if not candidate and not cost_signal:
                                         continue
                                     threshold = self._int("intraday_failure_threshold", 0, 0, 100)
                                     if threshold > 0 and health["consecutive_failures"] >= threshold:
                                         continue
-                                    if not cost_signal and self._bool("confirmation_enabled", False) and not self._confirmed_candidate(origin, code):
-                                        continue
+                                    if not cost_signal and self._bool("confirmation_enabled", False):
+                                        confirmed = self.store.observe_confirmation(
+                                            origin,
+                                            code,
+                                            self._int("confirmation_periods", 2, 1, 5),
+                                            self._int("confirmation_max_gap_seconds", 90, 30, 600),
+                                        )
+                                        if not confirmed:
+                                            continue
                                     claim_time = datetime.now(timezone.utc)
                                     if not self.store.claim_signal(origin, code, 600, now=claim_time):
                                         continue
