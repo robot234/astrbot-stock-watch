@@ -362,9 +362,14 @@ class Main(Star):
                 self._int("daily_cache_keep_days", 180, 7, 730),
             )
             logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
-            self._daily_date_alias[trade_date] = actual_date
-            self._daily_retry_after = None
-            return self.store.daily_quotes(actual_date), True, actual_date
+            if actual_date == trade_date:
+                self._daily_date_alias[trade_date] = actual_date
+                self._daily_retry_after = None
+                fetched = True
+            else:
+                self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                fetched = False
+            return self.store.daily_quotes(actual_date), fetched, actual_date
 
     async def _daily_candidates(self, limit: int):
         if self._bool("daily_cache_enabled", True):
