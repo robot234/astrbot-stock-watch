@@ -146,6 +146,13 @@ class StockStore:
                     if "duplicate column" not in str(exc).lower():
                         raise
             db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
+            # Normalize dates written by pre-v4 releases (YYYYMMDD) so range
+            # queries cannot mistake legacy rows for future data.
+            legacy = db.execute("SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at FROM daily_bars WHERE length(trade_date)=8").fetchall()
+            for row in legacy:
+                normalized = self._date_norm(str(row[1]))
+                db.execute("INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (row[0], normalized, row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9]))
+                db.execute("DELETE FROM daily_bars WHERE code=? AND trade_date=?", (row[0], row[1]))
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
