@@ -104,6 +104,7 @@ class SinaQuoteProvider:
         fields = list(data.get("fields") or [])
         items = data.get("items") or []
         result: list[Quote] = []
+        row_dates: set[str] = set()
         for values in items:
             row = dict(zip(fields, values))
             code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
@@ -117,8 +118,14 @@ class SinaQuoteProvider:
                 amount = float(row.get("amount") or 0) * 1000
             except (TypeError, ValueError):
                 continue
-            self._last_tushare_date = self._normalize_trade_date(str(row.get("trade_date") or date_value))
+            row_date = str(row.get("trade_date") or "").replace("-", "")
+            if len(row_date) != 8:
+                raise ValueError("Tushare row missing trade_date")
+            row_dates.add(row_date)
             result.append(Quote(code, code, price, prev_close, amount, pct_change, volume, source="tushare", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
+        if len(row_dates) != 1:
+            raise ValueError("Tushare response contains mixed or missing trade_date")
+        self._last_tushare_date = self._normalize_trade_date(next(iter(row_dates)))
         return result
 
     async def _fetch_tushare_trade_dates(self, client: httpx.AsyncClient, end_date: str) -> list[str]:
@@ -273,9 +280,13 @@ class SinaQuoteProvider:
                         payload = response.json()
                 klines = ((payload.get("data") or {}).get("klines") or [])
                 parsed = []
+                cutoff = str(as_of or "").replace("-", "")
                 for row in klines:
                     fields = str(row).split(",")
                     if len(fields) <= 6:
+                        continue
+                    row_date = fields[0].replace("-", "").strip()
+                    if cutoff and len(row_date) == 8 and row_date > cutoff:
                         continue
                     try:
                         parsed.append((float(fields[2]), float(fields[3]), float(fields[4]), float(fields[5])))

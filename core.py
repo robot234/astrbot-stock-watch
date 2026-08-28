@@ -179,7 +179,12 @@ def parse_codes(raw: str | Iterable[str]) -> list[str]:
 
 
 def calc_rsi(closes: Iterable[float], period: int = 6) -> float | None:
-    data = [float(value) for value in closes]
+    try:
+        data = [float(value) for value in closes]
+    except (TypeError, ValueError):
+        return None
+    if not data or not all(math.isfinite(value) for value in data):
+        return None
     if period <= 0 or len(data) <= period:
         return None
     changes = [data[index] - data[index - 1] for index in range(1, len(data))][-period:]
@@ -198,7 +203,12 @@ def simple_moving_average(values: Iterable[float], period: int) -> float | None:
 
 
 def calc_atr(highs: Iterable[float], lows: Iterable[float], closes: Iterable[float], period: int = 14) -> float | None:
-    high_data, low_data, close_data = list(map(float, highs)), list(map(float, lows)), list(map(float, closes))
+    try:
+        high_data, low_data, close_data = list(map(float, highs)), list(map(float, lows)), list(map(float, closes))
+    except (TypeError, ValueError):
+        return None
+    if not high_data or not all(math.isfinite(value) for value in high_data + low_data + close_data):
+        return None
     if period <= 0 or len(high_data) < period + 1 or len(low_data) != len(high_data) or len(close_data) != len(high_data):
         return None
     true_ranges = []
@@ -225,7 +235,7 @@ def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
     support = float(quote.support20) if quote.support20 and quote.support20 > 0 else None
     resistance = float(quote.resistance20) if quote.resistance20 and quote.resistance20 > 0 else None
     evidence: list[str] = []
-    if atr is None or quote.history_days < 20:
+    if atr is None or not math.isfinite(atr) or quote.history_days < 20:
         return PricePlan("unknown", price, atr, support, resistance, None, None, None, None, None, None, "insufficient", ["历史数据不足20根，暂不计算参考价位"])
     if support is None:
         support = max(0.01, price - 1.5 * atr)
@@ -256,13 +266,15 @@ def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
         flags.append("涨跌停")
     if not math.isfinite(float(quote.price)) or quote.price <= 0:
         flags.append("价格无效")
+    if quote.atr14 is not None and quote.support20 is not None and math.isfinite(float(quote.atr14)) and math.isfinite(float(quote.support20)) and quote.price <= quote.support20 - quote.atr14:
+        flags.append("跌破失效位")
     if quote.history_days and quote.history_days < 20:
         flags.append("历史数据不足")
     if candidate and any("空头" in reason or "放量下跌" in reason for reason in candidate.reasons):
         flags.append("技术趋势偏弱")
     if quote.volatility20 is not None and quote.volatility20 >= 0.08:
         flags.append("波动率偏高")
-    if flags and any(item in flags for item in ("停牌", "涨跌停", "价格无效")):
+    if flags and any(item in flags for item in ("停牌", "涨跌停", "价格无效", "跌破失效位")):
         return RiskReview("blocked", "high", flags, ["触发硬性交易状态过滤"])
     if not quote.history_days or quote.atr14 is None:
         return RiskReview("unknown", "unknown", flags + ["技术数据不完整"], ["缺少足够历史行情，不能判定风险"])
