@@ -299,6 +299,24 @@ class SinaQuoteProvider:
                     continue
         return result
 
+    async def fetch_tushare_factors(self, codes: Iterable[str], trade_date: str = "") -> dict[str, dict]:
+        """Optional Tushare daily_basic + stock_basic enrichment; permissions may vary."""
+        if not self.tushare_token:
+            return {}
+        values = [normalize_code(c) for c in codes]
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            payload = {"api_name": "daily_basic", "token": self.tushare_token, "params": {"trade_date": str(trade_date).replace("-", "")}, "fields": "ts_code,trade_date,pe,pb,turnover_rate,total_mv"}
+            response = await client.post(self.tushare_url, json=payload); response.raise_for_status()
+            body = response.json(); rows = ((body.get("data") or {}).get("items") or [])
+        result = {}
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            code = str(row[0]).split(".")[0]
+            if code in values:
+                result[code] = {"pe": row[2], "pb": row[3], "source": "tushare", "quality": "partial"}
+        return result
+
     async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> None:
         """Fetch a short adjusted daily history for the small candidate set."""
         if not quotes:

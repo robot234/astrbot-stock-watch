@@ -250,6 +250,15 @@ class Main(Star):
                                 item.reasons.append(f"行业/基本面修正{extra:+d}")
             except Exception:
                 logger.warning("[%s] 自定义因子源不可用，继续技术筛选", PLUGIN_NAME)
+        elif str(self.config.get("factor_source", "auto")) == "tushare":
+            try:
+                raw_factors = await self.quotes.fetch_tushare_factors([q.code for q in enrich_targets], as_of)
+                for item in scored:
+                    row = raw_factors.get(item.quote.code)
+                    if row and row.get("pe") is not None:
+                        item.quote.fundamental_score = max(-3, min(3, round(2 - float(row.get("pe")) / 20, 1)))
+            except Exception:
+                logger.warning("[%s] Tushare 因子源不可用，继续技术筛选", PLUGIN_NAME)
         elif str(self.config.get("factor_source", "auto")) in {"auto", "eastmoney"}:
             try:
                 raw_factors = await self.quotes.fetch_eastmoney_factors([q.code for q in enrich_targets])
@@ -260,6 +269,13 @@ class Main(Star):
                         item.quote.industry_score = None
             except Exception:
                 logger.warning("[%s] 东方财富因子源不可用，继续技术筛选", PLUGIN_NAME)
+        if str(self.config.get("factor_mode", "report_only")) == "score":
+            for item in scored:
+                if item.quote.fundamental_score is not None and not any("行业/基本面修正" in r for r in item.reasons):
+                    extra = max(-10, min(10, int(round(item.quote.fundamental_score))))
+                    item.score += extra
+                    if extra:
+                        item.reasons.append(f"基本面修正{extra:+d}")
         adjustment = market_adjustment(market.regime) if str(self.config.get("factor_mode", "report_only")) == "score" else 0
         if adjustment:
             for item in scored:
