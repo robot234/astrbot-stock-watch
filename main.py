@@ -75,6 +75,7 @@ class Main(Star):
             }
         }
         self._last_screen_run_id: str | None = None
+        self._last_screen_diagnostics: dict[str, int] = {}
 
     def _minute_signal_text(self, quote, completed) -> str:
         if not completed or not self._bool("minute_trigger_enabled", False):
@@ -222,16 +223,19 @@ class Main(Star):
             self._float("price_max", 80, 0.01, 100000),
         )]
         tradable.sort(key=lambda quote: quote.amount, reverse=True)
+        enrich_targets = tradable[: min(300, max(80, limit * 5))]
         # 日线历史请求只对流动性靠前的有限集合执行，控制网络和内存开销。
-        await self.quotes.enrich_indicators(tradable[: min(300, max(80, limit * 5))], self._int("max_concurrency", 5, 1, 20), as_of)
-        for quote in tradable[: min(300, max(80, limit * 5))]:
+        await self.quotes.enrich_indicators(enrich_targets, self._int("max_concurrency", 5, 1, 20), as_of)
+        for quote in enrich_targets:
             bars = self.quotes.history_bars.get(quote.code, [])
             if bars:
                 self.store.save_daily_bars(quote.code, bars, quote.source or "eastmoney")
+        self._last_screen_diagnostics = {"input": len(quotes), "tradable": len(tradable), "enriched": sum(1 for q in enrich_targets if q.history_days >= 20)}
         candidates = [score_quote(quote) for quote in tradable]
         minimum = self._int("min_score", 15, -100, 100)
         candidates = [item for item in candidates if item.score >= minimum]
         candidates.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
+        self._last_screen_diagnostics.update({"qualified": len(candidates), "max_score": max((score_quote(q).score for q in tradable), default=0), "min_score": minimum})
         return candidates[:limit]
 
     async def _scan(self, codes: list[str], limit: int):
@@ -446,7 +450,8 @@ class Main(Star):
                         *[format_candidate(item) for item in candidates],
                     ]
                     if not candidates:
-                        lines.append("暂无候选，可能是行情源不可用、技术指标不足或 min_score 过滤较严。")
+                        d = self._last_screen_diagnostics
+                        lines.append(f"暂无达标候选：可交易{d.get('tradable', 0)}只，补齐历史指标{d.get('enriched', 0)}只，最高分{d.get('max_score', 0)}，最低门槛{d.get('min_score', 15)}。")
                     push_failed = False
                     for origin in self.store.subscriptions():
                         if not await self._push(origin, "\n".join(lines)):
@@ -694,7 +699,9 @@ class Main(Star):
             ]
             lines.extend(format_candidate(item) for item in candidates)
             if not candidates:
-                lines.append("暂无候选，可能是行情接口未返回数据或评分条件较严。")
+                d = self._last_screen_diagnostics
+                lines.append(f"暂无达标候选：可交易{d.get('tradable', 0)}只，成功补齐历史指标{d.get('enriched', 0)}只，最高分{d.get('max_score', 0)}，最低门槛{d.get('min_score', self._int('min_score', 15, -100, 100))}。")
+                lines.append("若想扩大观察范围，可把 min_score 调低；指标补齐数为 0 时请检查行情接口限流或配置。")
             yield event.plain_result("\n".join(lines))
         except Exception:
             logger.exception("[%s] 手动全市场同步失败", PLUGIN_NAME)
