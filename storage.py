@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 import math
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -11,7 +12,14 @@ class StockStore:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        for attempt in range(5):
+            try:
+                self._init_db()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 4:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
     @contextmanager
     def _connect(self):
@@ -78,6 +86,27 @@ class StockStore:
                     success_count INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0,
                     last_quality TEXT NOT NULL DEFAULT 'unknown'
                 );
+                CREATE TABLE IF NOT EXISTS trading_calendar(
+                    trade_date TEXT PRIMARY KEY, is_open INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS job_runs(
+                    job_key TEXT PRIMARY KEY, job_name TEXT NOT NULL, trade_date TEXT NOT NULL,
+                    started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS risk_events(
+                    event_id TEXT PRIMARY KEY, run_id TEXT, code TEXT NOT NULL,
+                    state TEXT NOT NULL, risk_level TEXT NOT NULL, event_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS result_evaluations(
+                    evaluation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, code TEXT NOT NULL,
+                    as_of TEXT NOT NULL, horizon INTEGER NOT NULL, status TEXT NOT NULL,
+                    close REAL, return_pct REAL, mfe_pct REAL, mae_pct REAL,
+                    first_touch TEXT, sample_complete INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
@@ -105,7 +134,7 @@ class StockStore:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
-            db.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '2')")
+            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3')")
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
@@ -260,6 +289,11 @@ class StockStore:
             value = str(row[0] or "").strip() if row else ""
             return value or None
 
+    def daily_trade_dates(self, after: str, limit: int = 30) -> list[str]:
+        with self._connect() as db:
+            rows = db.execute("SELECT DISTINCT trade_date FROM daily_quotes WHERE trade_date>? ORDER BY trade_date LIMIT ?", (after, max(1, min(int(limit), 200))))
+            return [str(row[0]) for row in rows]
+
     def save_screen_run(self, run_id: str, job_name: str, requested_date: str, actual_trade_date: str | None,
                         source: str, started_at: str, finished_at: str | None, quote_count: int,
                         candidate_count: int, status: str, quality: str, error: str | None = None) -> None:
@@ -292,6 +326,48 @@ class StockStore:
     def latest_screen_candidates(self, limit: int = 30) -> list[dict]:
         with self._connect() as db:
             return [dict(row) for row in db.execute("SELECT c.*, r.actual_trade_date, r.source FROM screen_candidates c JOIN screen_runs r ON r.run_id=c.run_id WHERE r.run_id=(SELECT run_id FROM screen_runs WHERE status='completed' ORDER BY started_at DESC LIMIT 1) ORDER BY c.score DESC LIMIT ?", (max(1, min(int(limit), 100)),))]
+
+    def begin_job(self, job_key: str, job_name: str, trade_date: str) -> bool:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as db:
+            try:
+                db.execute("INSERT INTO job_runs(job_key,job_name,trade_date,started_at,status) VALUES(?,?,?,?,?)", (job_key, job_name, trade_date, now, "running"))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def finish_job(self, job_key: str, status: str = "completed", error: str | None = None) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE job_runs SET finished_at=?, status=?, error=? WHERE job_key=?", (datetime.utcnow().isoformat(), status, error, job_key))
+
+    def save_calendar(self, trade_date: str, is_open: bool, source: str = "") -> None:
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO trading_calendar(trade_date,is_open,source,fetched_at) VALUES(?,?,?,?)", (trade_date, int(is_open), source, datetime.utcnow().isoformat()))
+
+    def calendar_status(self, trade_date: str) -> bool | None:
+        with self._connect() as db:
+            row = db.execute("SELECT is_open FROM trading_calendar WHERE trade_date=?", (trade_date,)).fetchone()
+            return bool(row[0]) if row else None
+
+    def save_risk_event(self, event_id: str, run_id: str | None, code: str, state: str, risk_level: str, payload: str, event_at: str) -> bool:
+        with self._connect() as db:
+            try:
+                db.execute("INSERT INTO risk_events(event_id,run_id,code,state,risk_level,event_at,payload) VALUES(?,?,?,?,?,?,?)", (event_id, run_id, code, state, risk_level, event_at, payload))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def save_result_evaluation(self, evaluation_id: str, run_id: str, code: str, as_of: str, horizon: int, status: str, close: float | None, return_pct: float | None, mfe_pct: float | None, mae_pct: float | None, first_touch: str | None, sample_complete: bool) -> None:
+        with self._connect() as db:
+            db.execute("INSERT OR IGNORE INTO result_evaluations(evaluation_id,run_id,code,as_of,horizon,status,close,return_pct,mfe_pct,mae_pct,first_touch,sample_complete,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (evaluation_id, run_id, code, as_of, int(horizon), status, close, return_pct, mfe_pct, mae_pct, first_touch, int(sample_complete), datetime.utcnow().isoformat()))
+
+    def evaluations(self, run_id: str | None = None, limit: int = 50) -> list[dict]:
+        with self._connect() as db:
+            if run_id:
+                rows = db.execute("SELECT * FROM result_evaluations WHERE run_id=? ORDER BY created_at DESC LIMIT ?", (run_id, max(1, min(int(limit), 200))))
+            else:
+                rows = db.execute("SELECT * FROM result_evaluations ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 200)),))
+            return [dict(row) for row in rows]
 
     def mark_news_seen(self, fingerprint: str, keep_days: int = 14) -> bool:
         cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()

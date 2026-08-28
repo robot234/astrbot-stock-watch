@@ -409,6 +409,10 @@ class Main(Star):
             target = str(self.config.get("daily_scan_time", "15:10"))
             retry_ready = self._daily_retry_after is None or now >= self._daily_retry_after
             if now.weekday() < 5 and now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat() and retry_ready:
+                job_key = f"daily_screen:{now.date().isoformat()}"
+                if not self.store.begin_job(job_key, "daily_screen", now.date().isoformat()):
+                    await asyncio.sleep(20)
+                    continue
                 try:
                     requested_date = now.date().isoformat()
                     candidates = await self._daily_candidates(self._int("candidate_limit", 30, 1, 100))
@@ -429,7 +433,9 @@ class Main(Star):
                             push_failed = True
                     if not push_failed and self._daily_retry_after is None:
                         self.last_daily_scan = now.date().isoformat()
+                    self.store.finish_job(job_key, "completed")
                 except Exception:
+                    self.store.finish_job(job_key, "failed", "收盘扫描异常")
                     logger.exception("[%s] 收盘扫描失败", PLUGIN_NAME)
             await asyncio.sleep(20)
 
@@ -684,6 +690,34 @@ class Main(Star):
             f"数据质量：{latest['quality']}\n"
             "边界：模型只做摘要解释，价位由规则计算；仅研究/模拟盘，不提供订单或自动交易。"
         )
+
+    @filter.command("验证", alias={"结果", "回放"})
+    async def evaluate(self, event: AstrMessageEvent, horizon: int = 5):
+        rows = self.store.latest_screen_candidates(100)
+        if not rows:
+            yield event.plain_result("暂无候选运行记录，先执行 /全市场选股。")
+            return
+        horizon = max(1, min(int(horizon or 5), 20))
+        as_of = str(rows[0].get("actual_trade_date") or "")
+        future_dates = self.store.daily_trade_dates(as_of, horizon)
+        if len(future_dates) < horizon:
+            yield event.plain_result(f"验证暂不可用：候选日期 {as_of} 之后只有 {len(future_dates)} 个完整交易日，至少需要 {horizon} 个。")
+            return
+        run_id = str(rows[0].get("run_id") or "")
+        evaluated = 0
+        for row in rows:
+            base = self.store.daily_quotes(as_of)
+            base_quote = next((q for q in base if q.code == row["code"]), None)
+            future = [next((q for q in self.store.daily_quotes(date) if q.code == row["code"]), None) for date in future_dates[:horizon]]
+            if not base_quote or any(item is None for item in future):
+                continue
+            last = future[-1]
+            ret = (last.price - base_quote.price) / base_quote.price * 100 if base_quote.price else None
+            highs = [(item.price - base_quote.price) / base_quote.price * 100 for item in future]
+            lows = highs
+            self.store.save_result_evaluation(uuid.uuid4().hex, run_id, row["code"], as_of, horizon, "complete", last.price, ret, max(highs), min(lows), None, True)
+            evaluated += 1
+        yield event.plain_result(f"回放验证（仅研究）：基准日 {as_of}，周期 {horizon} 日，完成 {evaluated} 条。结果已写入本地历史；不代表未来收益。")
 
     @filter.command("自选")
     async def watch(self, event: AstrMessageEvent, action: str = "", code: str = "", cost: str = ""):
