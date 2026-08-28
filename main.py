@@ -376,9 +376,12 @@ class Main(Star):
                     ]
                     if not candidates:
                         lines.append("暂无候选，或尚未配置股票池/行情接口。")
+                    push_failed = False
                     for origin in self.store.subscriptions():
-                        await self._push(origin, "\n".join(lines))
-                    self.last_daily_scan = now.date().isoformat()
+                        if not await self._push(origin, "\n".join(lines)):
+                            push_failed = True
+                    if not push_failed:
+                        self.last_daily_scan = now.date().isoformat()
                 except Exception:
                     logger.exception("[%s] 收盘扫描失败", PLUGIN_NAME)
             await asyncio.sleep(20)
