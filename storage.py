@@ -141,7 +141,7 @@ class StockStore:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
-            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3')")
+            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
