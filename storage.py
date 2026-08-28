@@ -172,3 +172,7 @@ class StockStore:
                 (origin, code, current_iso),
             )
             return True
+
+    def release_signal(self, origin: str, code: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM signal_events WHERE origin=? AND code=?", (origin, code))

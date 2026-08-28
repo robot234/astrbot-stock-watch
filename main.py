@@ -95,14 +95,23 @@ class Main(Star):
         configured = self._configured_whitelist()
         return "*" in configured or origin in configured or self.store.is_whitelisted(origin)
 
-    async def _push(self, origin: str, text: str):
+    async def _push(self, origin: str, text: str) -> bool:
         if not self._push_allowed(origin):
             logger.debug("[%s] 已跳过非白名单会话推送：%s", PLUGIN_NAME, origin or "<empty>")
-            return
+            return False
         try:
             await self.context.send_message(origin, MessageChain([Plain(text)]))
+            return True
         except TypeError:
-            await self.context.send_message(origin, text)
+            try:
+                await self.context.send_message(origin, text)
+                return True
+            except Exception:
+                logger.exception("[%s] 推送失败：%s", PLUGIN_NAME, origin or "<empty>")
+                return False
+        except Exception:
+            logger.exception("[%s] 推送失败：%s", PLUGIN_NAME, origin or "<empty>")
+            return False
 
     def _universe(self) -> list[str]:
         configured = parse_codes(str(self.config.get("universe_codes", "")))
@@ -136,6 +145,8 @@ class Main(Star):
         fresh = []
         for quote in quotes:
             fetched_at = quote.fetched_at
+            if not isinstance(fetched_at, datetime):
+                continue
             if fetched_at.tzinfo is None:
                 fetched_at = fetched_at.replace(tzinfo=CHINA_TZ)
             if 0 <= (now - fetched_at).total_seconds() <= max_age:
@@ -206,7 +217,13 @@ class Main(Star):
                     active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
                     if union:
-                        quotes = self._fresh_quotes(await self.quotes.fetch_quotes(union))
+                        raw_quotes = []
+                        for start in range(0, len(union), 100):
+                            try:
+                                raw_quotes.extend(await self.quotes.fetch_quotes(union[start:start + 100]))
+                            except Exception:
+                                logger.exception("[%s] 盘中行情分批抓取失败：批次 %s", PLUGIN_NAME, start // 100 + 1)
+                        quotes = self._fresh_quotes(raw_quotes)
                         if quotes:
                             candidates = await self._score_quotes(quotes, len(quotes))
                             by_code = {candidate.quote.code: candidate for candidate in candidates}
@@ -215,7 +232,9 @@ class Main(Star):
                                     candidate = by_code.get(code)
                                     if not candidate or not self.store.claim_signal(origin, code, 600):
                                         continue
-                                    await self._push(origin, "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate))
+                                    sent = await self._push(origin, "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate))
+                                    if not sent:
+                                        self.store.release_signal(origin, code)
             except Exception:
                 logger.exception("[%s] 盘中监听失败", PLUGIN_NAME)
             await asyncio.sleep(self._int("quote_interval_seconds", 30, 10, 600))
