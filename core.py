@@ -78,6 +78,35 @@ class RiskReview:
 
 
 @dataclass(slots=True)
+class MarketContext:
+    regime: str
+    breadth: float
+    advancing: int
+    declining: int
+    total_amount: float
+    evidence: list[str] = field(default_factory=list)
+
+
+def assess_market_context(quotes: Iterable[Quote]) -> MarketContext:
+    """Derive a transparent market regime from the same daily snapshot."""
+    rows = [q for q in quotes if math.isfinite(float(q.pct_change)) and q.price > 0]
+    advancing = sum(1 for q in rows if q.pct_change > 0.2)
+    declining = sum(1 for q in rows if q.pct_change < -0.2)
+    breadth = advancing / len(rows) if rows else 0.0
+    ratio = (advancing - declining) / len(rows) if rows else 0.0
+    if not rows:
+        regime = "unknown"
+    elif ratio >= 0.15:
+        regime = "risk_on"
+    elif ratio <= -0.15:
+        regime = "risk_off"
+    else:
+        regime = "neutral"
+    evidence = [f"上涨{advancing}只、下跌{declining}只、样本{len(rows)}只", f"上涨占比{breadth:.1%}"]
+    return MarketContext(regime, breadth, advancing, declining, sum(max(0.0, q.amount) for q in rows), evidence)
+
+
+@dataclass(slots=True)
 class NewsItem:
     title: str
     link: str = ""
