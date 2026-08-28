@@ -11,7 +11,7 @@ from typing import Iterable
 
 import httpx
 
-from .core import CHINA_TZ, Candidate, NewsItem, Quote, calc_rsi, normalize_code, simple_moving_average
+from .core import CHINA_TZ, Candidate, NewsItem, Quote, calc_atr, calc_rsi, normalize_code, simple_moving_average
 
 
 def _sina_symbol(code: str) -> str:
@@ -111,7 +111,7 @@ class SinaQuoteProvider:
                 amount = float(row.get("amount") or 0) * 1000
             except (TypeError, ValueError):
                 continue
-            result.append(Quote(code, code, price, prev_close, amount, pct_change, volume, fetched_at=datetime.now(CHINA_TZ)))
+            result.append(Quote(code, code, price, prev_close, amount, pct_change, volume, source="tushare", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
         return result
 
     async def _fetch_tushare_trade_dates(self, client: httpx.AsyncClient, end_date: str) -> list[str]:
@@ -206,7 +206,7 @@ class SinaQuoteProvider:
             amount = float(row.get("f6") or 0)
         except (TypeError, ValueError):
             return None
-        return Quote(code, str(row.get("f14") or code), price, prev_close, amount, pct_change, volume, fetched_at=datetime.now(CHINA_TZ))
+        return Quote(code, str(row.get("f14") or code), price, prev_close, amount, pct_change, volume, source="eastmoney", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ))
 
     async def fetch_quotes(self, codes: Iterable[str]) -> list[Quote]:
         values = [normalize_code(code) for code in codes]
@@ -228,7 +228,7 @@ class SinaQuoteProvider:
             except (TypeError, ValueError):
                 continue
             pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
-            result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, fetched_at=datetime.now(CHINA_TZ)))
+            result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, source="sina", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
         return result
 
     async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5) -> None:
@@ -242,6 +242,7 @@ class SinaQuoteProvider:
             if cached and datetime.now(CHINA_TZ) - cached[0] < timedelta(minutes=15):
                 values = cached[1]
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
+                quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values.get("atr14"), values.get("support20"), values.get("resistance20"), values.get("volatility20"), int(values.get("history_days") or 0))
                 return
             secid = ("1." if quote.code.startswith(("6", "68", "9")) else "0.") + quote.code
             url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -263,19 +264,38 @@ class SinaQuoteProvider:
                         response.raise_for_status()
                         payload = response.json()
                 klines = ((payload.get("data") or {}).get("klines") or [])
-                closes = [float(str(row).split(",")[2]) for row in klines if len(str(row).split(",")) > 6]
-                volumes = [float(str(row).split(",")[5]) for row in klines if len(str(row).split(",")) > 6]
+                parsed = []
+                for row in klines:
+                    fields = str(row).split(",")
+                    if len(fields) <= 6:
+                        continue
+                    try:
+                        parsed.append((float(fields[2]), float(fields[3]), float(fields[4]), float(fields[5])))
+                    except (TypeError, ValueError):
+                        continue
+                closes = [item[0] for item in parsed]
+                highs = [item[1] for item in parsed]
+                lows = [item[2] for item in parsed]
+                volumes = [item[3] for item in parsed]
                 if len(closes) < 20:
                     return
+                returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] > 0]
+                volatility = (sum((value - sum(returns[-20:]) / len(returns[-20:])) ** 2 for value in returns[-20:]) / len(returns[-20:])) ** 0.5 if len(returns) >= 5 else None
                 values = {
                     "rsi6": calc_rsi(closes, 6),
                     "ma5": simple_moving_average(closes, 5),
                     "ma10": simple_moving_average(closes, 10),
                     "ma20": simple_moving_average(closes, 20),
                     "volume_ratio": (volumes[-1] / (sum(volumes[-6:-1]) / 5)) if len(volumes) >= 6 and sum(volumes[-6:-1]) > 0 else None,
+                    "atr14": calc_atr(highs, lows, closes, 14),
+                    "support20": min(lows[-20:]) if len(lows) >= 20 else None,
+                    "resistance20": max(highs[-20:]) if len(highs) >= 20 else None,
+                    "volatility20": volatility,
+                    "history_days": len(closes),
                 }
                 self._indicator_cache[quote.code] = (datetime.now(CHINA_TZ), values)
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
+                quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values["atr14"], values["support20"], values["resistance20"], values["volatility20"], values["history_days"])
             except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
                 return
 

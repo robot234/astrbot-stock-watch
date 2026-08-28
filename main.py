@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -72,6 +74,7 @@ class Main(Star):
                 "last_error_at": None,
             }
         }
+        self._last_screen_run_id: str | None = None
 
     def _minute_signal_text(self, quote, completed) -> str:
         if not completed or not self._bool("minute_trigger_enabled", False):
@@ -219,7 +222,8 @@ class Main(Star):
             self._float("price_max", 80, 0.01, 100000),
         )]
         tradable.sort(key=lambda quote: quote.amount, reverse=True)
-        await self.quotes.enrich_indicators(tradable[: max(40, limit * 2)], self._int("max_concurrency", 5, 1, 20))
+        # 日线历史请求只对流动性靠前的有限集合执行，控制网络和内存开销。
+        await self.quotes.enrich_indicators(tradable[: min(300, max(80, limit * 5))], self._int("max_concurrency", 5, 1, 20))
         candidates = [score_quote(quote) for quote in tradable]
         minimum = self._int("min_score", 15, -100, 100)
         candidates = [item for item in candidates if item.score >= minimum]
@@ -383,6 +387,14 @@ class Main(Star):
                 return await self._score_quotes(cached, limit)
         return await self._scan(self._universe(), limit)
 
+    def _record_screen(self, requested_date: str, actual_date: str, source: str, quotes, candidates, status: str = "completed", quality: str = "good", error: str | None = None) -> str:
+        run_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.store.save_screen_run(run_id, "daily_screen", requested_date, actual_date, source, now, now, len(quotes), len(candidates), status, quality, error)
+        self.store.save_screen_candidates(run_id, candidates)
+        self._last_screen_run_id = run_id
+        return run_id
+
     async def _daily_loop(self):
         while True:
             now = datetime.now(CHINA_TZ)
@@ -390,7 +402,12 @@ class Main(Star):
             retry_ready = self._daily_retry_after is None or now >= self._daily_retry_after
             if now.weekday() < 5 and now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat() and retry_ready:
                 try:
+                    requested_date = now.date().isoformat()
                     candidates = await self._daily_candidates(self._int("candidate_limit", 30, 1, 100))
+                    actual_date = self.store.latest_daily_trade_date(requested_date) or requested_date
+                    cached_for_record = self.store.daily_quotes(actual_date) if actual_date else []
+                    source = next((str(item.source) for item in cached_for_record if getattr(item, "source", "")), "unknown")
+                    self._record_screen(requested_date, actual_date, source, cached_for_record, candidates)
                     lines = [
                         "收盘选股（仅研究/模拟盘）",
                         "筛选口径：价格区间过滤 → 成交额流动性预筛选 → RSI6/均线/量价规则评分 → 人工复核",
@@ -431,6 +448,9 @@ class Main(Star):
                     watch_details = self.store.all_watch_details()
                     active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
+                    if self._bool("auto_watch_candidates", True):
+                        union.extend(item["code"] for item in self.store.latest_screen_candidates(self._int("candidate_limit", 30, 1, 100)) if item.get("code"))
+                        union = list(dict.fromkeys(union))[: self._int("intraday_focus_limit", 200, 10, 500)]
                     if union:
                         health = self._intraday_health
                         health["cycles"] += 1
@@ -604,6 +624,7 @@ class Main(Star):
                 )
                 return
             candidates = await self._score_quotes(quotes, limit)
+            self._record_screen(trade_date, actual_date, "cache/eastmoney/tushare", quotes, candidates)
             lines = [
                 f"{source}：{len(quotes)} 只",
                 "全市场选股结果（仅研究/模拟盘）",
@@ -616,6 +637,35 @@ class Main(Star):
         except Exception:
             logger.exception("[%s] 手动全市场同步失败", PLUGIN_NAME)
             yield event.plain_result("全市场同步失败，请检查行情接口和插件配置。")
+
+    @filter.command("候选池", alias={"候选详情"})
+    async def candidate_pool(self, event: AstrMessageEvent, count: int = 0):
+        rows = self.store.latest_screen_candidates(max(1, min(int(count or self._int("candidate_limit", 30, 1, 100)), 100)))
+        if not rows:
+            yield event.plain_result("暂无已保存候选池，请先执行 /全市场选股。")
+            return
+        lines = ["最近候选池（仅研究）"]
+        for row in rows:
+            flags = "、".join(json.loads(row.get("risk_flags") or "[]")) or "无"
+            lines.append(f"{row['name']}（{row['code']}） 评分{row['score']}/{row['score_max']} 风险{row['risk_level']}（{flags}）")
+        lines.append(f"数据日期：{rows[0].get('actual_trade_date') or '未知'}；来源：{rows[0].get('source') or '未知'}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("研究状态", alias={"数据质量"})
+    async def research_status(self, event: AstrMessageEvent):
+        runs = self.store.recent_screen_runs(5)
+        if not runs:
+            yield event.plain_result("研究状态：尚未运行收盘扫描。\n盘中监听只输出白名单会话，且不会自动下单。")
+            return
+        latest = runs[0]
+        yield event.plain_result(
+            f"研究状态：{latest['status']}\n"
+            f"最近运行：{latest['started_at']}\n"
+            f"请求日期：{latest['requested_date']}；实际交易日：{latest.get('actual_trade_date') or '未知'}\n"
+            f"来源：{latest['source'] or '未知'}；行情{latest['quote_count']}条；候选{latest['candidate_count']}条\n"
+            f"数据质量：{latest['quality']}\n"
+            "边界：模型只做摘要解释，价位由规则计算；仅研究/模拟盘，不提供订单或自动交易。"
+        )
 
     @filter.command("自选")
     async def watch(self, event: AstrMessageEvent, action: str = "", code: str = "", cost: str = ""):

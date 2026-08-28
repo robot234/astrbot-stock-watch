@@ -17,6 +17,9 @@ class StockStore:
     def _connect(self):
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
         try:
             yield connection
             connection.commit()
@@ -58,12 +61,35 @@ class StockStore:
                     last_observed_at TEXT NOT NULL,
                     PRIMARY KEY(origin, code)
                 );
+                CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS screen_runs(
+                    run_id TEXT PRIMARY KEY, job_name TEXT NOT NULL, requested_date TEXT NOT NULL,
+                    actual_trade_date TEXT, source TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL,
+                    finished_at TEXT, quote_count INTEGER NOT NULL DEFAULT 0, candidate_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'running', quality TEXT NOT NULL DEFAULT 'unknown', error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS screen_candidates(
+                    run_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL, score INTEGER NOT NULL,
+                    score_max INTEGER NOT NULL, risk_level TEXT NOT NULL, risk_flags TEXT NOT NULL,
+                    price_plan TEXT NOT NULL, reasons TEXT NOT NULL, PRIMARY KEY(run_id, code)
+                );
+                CREATE TABLE IF NOT EXISTS provider_health(
+                    provider TEXT PRIMARY KEY, last_success_at TEXT, last_error_at TEXT,
+                    success_count INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0,
+                    last_quality TEXT NOT NULL DEFAULT 'unknown'
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
                 db.execute("ALTER TABLE watchlist ADD COLUMN cost_price REAL NULL")
             if "name" not in columns:
                 db.execute("ALTER TABLE watchlist ADD COLUMN name TEXT NULL")
+            quote_columns = {row[1] for row in db.execute("PRAGMA table_info(daily_quotes)")}
+            if "source" not in quote_columns:
+                db.execute("ALTER TABLE daily_quotes ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+            if "provider_ts" not in quote_columns:
+                db.execute("ALTER TABLE daily_quotes ADD COLUMN provider_ts TEXT NULL")
+            db.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '2')")
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
@@ -174,7 +200,7 @@ class StockStore:
     def save_daily_quotes(self, trade_date: str, quotes, keep_days: int = 180) -> int:
         rows = [
             (trade_date, quote.code, quote.name, quote.price, quote.prev_close, quote.amount,
-             quote.pct_change, quote.volume, quote.fetched_at.isoformat())
+             quote.pct_change, quote.volume, quote.fetched_at.isoformat(), getattr(quote, "source", ""), quote.provider_ts.isoformat() if getattr(quote, "provider_ts", None) else None)
             for quote in quotes
         ]
         if not rows:
@@ -182,7 +208,7 @@ class StockStore:
         cutoff = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=keep_days)).strftime("%Y-%m-%d")
         with self._connect() as db:
             db.execute("DELETE FROM daily_quotes WHERE trade_date=?", (trade_date,))
-            db.executemany("INSERT INTO daily_quotes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            db.executemany("INSERT INTO daily_quotes(trade_date,code,name,price,prev_close,amount,pct_change,volume,fetched_at,source,provider_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
             db.execute("DELETE FROM daily_quotes WHERE trade_date < ?", (cutoff,))
         return len(rows)
 
@@ -191,7 +217,7 @@ class StockStore:
 
         with self._connect() as db:
             rows = db.execute(
-                "SELECT code, name, price, prev_close, amount, pct_change, volume, fetched_at FROM daily_quotes WHERE trade_date=? ORDER BY code",
+                "SELECT code, name, price, prev_close, amount, pct_change, volume, fetched_at, source, provider_ts FROM daily_quotes WHERE trade_date=? ORDER BY code",
                 (trade_date,),
             )
             result = []
@@ -200,7 +226,12 @@ class StockStore:
                     fetched_at = datetime.fromisoformat(str(row[7]))
                 except ValueError:
                     fetched_at = datetime.now()
-                result.append(Quote(str(row[0]), str(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), fetched_at=fetched_at))
+                provider_ts = None
+                try:
+                    provider_ts = datetime.fromisoformat(str(row[9])) if row[9] else None
+                except ValueError:
+                    provider_ts = None
+                result.append(Quote(str(row[0]), str(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), source=str(row[8] or ""), provider_ts=provider_ts, fetched_at=fetched_at))
             return result
 
     def latest_daily_trade_date(self, before_or_equal: str) -> str | None:
@@ -212,6 +243,39 @@ class StockStore:
             ).fetchone()
             value = str(row[0] or "").strip() if row else ""
             return value or None
+
+    def save_screen_run(self, run_id: str, job_name: str, requested_date: str, actual_trade_date: str | None,
+                        source: str, started_at: str, finished_at: str | None, quote_count: int,
+                        candidate_count: int, status: str, quality: str, error: str | None = None) -> None:
+        with self._connect() as db:
+            db.execute("""INSERT INTO screen_runs(run_id,job_name,requested_date,actual_trade_date,source,started_at,finished_at,quote_count,candidate_count,status,quality,error)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET finished_at=excluded.finished_at, quote_count=excluded.quote_count,
+                candidate_count=excluded.candidate_count, status=excluded.status, quality=excluded.quality, error=excluded.error,
+                actual_trade_date=excluded.actual_trade_date, source=excluded.source""",
+                (run_id, job_name, requested_date, actual_trade_date, source, started_at, finished_at, int(quote_count), int(candidate_count), status, quality, error))
+
+    def save_screen_candidates(self, run_id: str, candidates) -> int:
+        import json
+        rows = []
+        for candidate in candidates:
+            plan = candidate.price_plan
+            plan_data = {key: getattr(plan, key) for key in plan.__dataclass_fields__} if plan else {}
+            rows.append((run_id, candidate.quote.code, candidate.quote.name, candidate.score, candidate.score_max,
+                         candidate.risk_level, json.dumps(candidate.risk_flags, ensure_ascii=False),
+                         json.dumps(plan_data, ensure_ascii=False, default=str), json.dumps(candidate.reasons, ensure_ascii=False)))
+        if not rows:
+            return 0
+        with self._connect() as db:
+            db.executemany("INSERT OR REPLACE INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+
+    def recent_screen_runs(self, limit: int = 10) -> list[dict]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM screen_runs ORDER BY started_at DESC LIMIT ?", (max(1, min(int(limit), 100)),))]
+
+    def latest_screen_candidates(self, limit: int = 30) -> list[dict]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT c.*, r.actual_trade_date, r.source FROM screen_candidates c JOIN screen_runs r ON r.run_id=c.run_id WHERE r.run_id=(SELECT run_id FROM screen_runs WHERE status='completed' ORDER BY started_at DESC LIMIT 1) ORDER BY c.score DESC LIMIT ?", (max(1, min(int(limit), 100)),))]
 
     def mark_news_seen(self, fingerprint: str, keep_days: int = 14) -> bool:
         cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()

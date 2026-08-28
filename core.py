@@ -23,6 +23,13 @@ class Quote:
     ma10: float | None = None
     ma20: float | None = None
     volume_ratio: float | None = None
+    atr14: float | None = None
+    support20: float | None = None
+    resistance20: float | None = None
+    volatility20: float | None = None
+    history_days: int = 0
+    source: str = ""
+    provider_ts: datetime | None = None
     suspended: bool = False
     limit_up: bool = False
     limit_down: bool = False
@@ -34,6 +41,37 @@ class Candidate:
     quote: Quote
     score: int
     reasons: list[str]
+    score_max: int = 30
+    risk_level: str = "unknown"
+    risk_flags: list[str] = field(default_factory=list)
+    price_plan: "PricePlan | None" = None
+
+
+@dataclass(slots=True)
+class PricePlan:
+    """Reference levels for manual research; never an order or execution instruction."""
+
+    state: str
+    reference_price: float
+    atr: float | None
+    support: float | None
+    resistance: float | None
+    attention_low: float | None
+    attention_high: float | None
+    confirmation: float | None
+    sell_low: float | None
+    sell_high: float | None
+    invalidation: float | None
+    quality: str
+    evidence: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RiskReview:
+    verdict: str
+    severity: str
+    flags: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -158,6 +196,76 @@ def simple_moving_average(values: Iterable[float], period: int) -> float | None:
     return sum(data[-period:]) / period
 
 
+def calc_atr(highs: Iterable[float], lows: Iterable[float], closes: Iterable[float], period: int = 14) -> float | None:
+    high_data, low_data, close_data = list(map(float, highs)), list(map(float, lows)), list(map(float, closes))
+    if period <= 0 or len(high_data) < period + 1 or len(low_data) != len(high_data) or len(close_data) != len(high_data):
+        return None
+    true_ranges = []
+    for index in range(1, len(high_data)):
+        true_ranges.append(max(high_data[index] - low_data[index], abs(high_data[index] - close_data[index - 1]), abs(low_data[index] - close_data[index - 1])))
+    if len(true_ranges) < period:
+        return None
+    return round(sum(true_ranges[-period:]) / period, 4)
+
+
+def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
+    """Derive reference zones from completed data available at the quote timestamp."""
+    def rounded(value: float | None) -> float | None:
+        if value is None or value <= 0:
+            return None
+        return round(round(value / tick) * tick, 2)
+
+    price = float(quote.price or 0)
+    atr = float(quote.atr14) if quote.atr14 and quote.atr14 > 0 else None
+    support = float(quote.support20) if quote.support20 and quote.support20 > 0 else None
+    resistance = float(quote.resistance20) if quote.resistance20 and quote.resistance20 > 0 else None
+    evidence: list[str] = []
+    if atr is None or quote.history_days < 20:
+        return PricePlan("unknown", price, atr, support, resistance, None, None, None, None, None, None, "insufficient", ["历史数据不足20根，暂不计算参考价位"])
+    if support is None:
+        support = max(0.01, price - 1.5 * atr)
+        evidence.append("支撑位使用 ATR 回退估计")
+    else:
+        evidence.append("支撑位取近20日低点")
+    if resistance is None:
+        resistance = price + 2 * atr
+        evidence.append("压力位使用 ATR 回退估计")
+    else:
+        evidence.append("压力位取近20日高点")
+    attention_low = max(0.01, support - 0.25 * atr)
+    attention_high = max(attention_low, support + 0.25 * atr)
+    confirmation = resistance + max(0.2 * atr, 2 * tick)
+    sell_low = max(0.01, resistance - 0.25 * atr)
+    sell_high = max(sell_low, resistance + 0.5 * atr)
+    invalidation = max(0.01, support - atr)
+    state = "in_attention" if attention_low <= price <= attention_high else "near_sell" if sell_low <= price <= sell_high else "confirmed" if price >= confirmation else "between"
+    return PricePlan(state, price, rounded(atr), rounded(support), rounded(resistance), rounded(attention_low), rounded(attention_high), rounded(confirmation), rounded(sell_low), rounded(sell_high), rounded(invalidation), "good", evidence)
+
+
+def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
+    flags: list[str] = []
+    evidence: list[str] = []
+    if quote.suspended:
+        flags.append("停牌")
+    if quote.limit_up or quote.limit_down:
+        flags.append("涨跌停")
+    if quote.price <= 0:
+        flags.append("价格无效")
+    if quote.history_days and quote.history_days < 20:
+        flags.append("历史数据不足")
+    if candidate and any("空头" in reason or "放量下跌" in reason for reason in candidate.reasons):
+        flags.append("技术趋势偏弱")
+    if quote.volatility20 is not None and quote.volatility20 >= 0.08:
+        flags.append("波动率偏高")
+    if flags and any(item in flags for item in ("停牌", "涨跌停", "价格无效")):
+        return RiskReview("blocked", "high", flags, ["触发硬性交易状态过滤"])
+    if not quote.history_days or quote.atr14 is None:
+        return RiskReview("unknown", "unknown", flags + ["技术数据不完整"], ["缺少足够历史行情，不能判定风险"])
+    if flags:
+        return RiskReview("watch_only", "medium", flags, evidence or ["存在需要人工复核的技术风险"])
+    return RiskReview("eligible", "low", [], ["基础行情、状态和历史指标检查通过"])
+
+
 def is_tradable(quote: Quote, price_min: float = 2, price_max: float = 80) -> bool:
     return price_min <= quote.price <= price_max and quote.price > 0 and not quote.suspended and not quote.limit_up and not quote.limit_down
 
@@ -186,7 +294,12 @@ def score_quote(quote: Quote) -> Candidate:
         elif quote.pct_change < 0 and quote.volume_ratio > 1:
             score -= 5
             reasons.append("放量下跌-5")
-    return Candidate(quote, score, reasons)
+    candidate = Candidate(quote, score, reasons)
+    review = review_risk(quote, candidate)
+    candidate.risk_level = review.verdict
+    candidate.risk_flags = review.flags
+    candidate.price_plan = build_price_plan(quote)
+    return candidate
 
 
 def in_trading_session(now: datetime | None = None) -> bool:
@@ -209,7 +322,7 @@ def format_candidate(candidate: Candidate) -> str:
     if quote.volume_ratio is not None:
         metrics.append(f"量比={quote.volume_ratio:.2f}")
     evidence = "、".join(metrics) or "当前可用技术指标不足"
-    risk_items: list[str] = []
+    risk_items: list[str] = list(candidate.risk_flags)
     if any("空头" in reason or "放量下跌" in reason for reason in candidate.reasons):
         risk_items.append("均线偏弱或出现放量下跌")
     if quote.rsi6 is not None and quote.rsi6 >= 70:
@@ -217,12 +330,18 @@ def format_candidate(candidate: Candidate) -> str:
     if not metrics:
         risk_items.append("技术数据不足，评分参考价值有限")
     risk_text = "；".join(risk_items) if risk_items else "暂未触发机械风险项，但指标可能滞后或不完整"
-    conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；这不是买卖指令"
+    plan = candidate.price_plan or build_price_plan(quote)
+    if plan.quality == "good":
+        levels = f"关注区{plan.attention_low:.2f}-{plan.attention_high:.2f}，确认位{plan.confirmation:.2f}，参考卖出区{plan.sell_low:.2f}-{plan.sell_high:.2f}，失效位{plan.invalidation:.2f}"
+    else:
+        levels = "参考价位：历史数据不足，暂不计算"
+    conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；价位仅供人工研究"
     return (
         f"候选：{name or quote.code}（{quote.code}）\n"
         f"行情：现价{quote.price:.2f}，涨跌{quote.pct_change:+.2f}%，成交额{quote.amount:.0f}\n"
-        f"技术评分：{candidate.score}/30（规则加分：{why}）\n"
+        f"技术评分：{candidate.score}/{candidate.score_max}（规则加分：{why}）\n"
         f"技术证据：{evidence}\n"
-        f"风险审核：{risk_text}\n"
+        f"参考价位：{levels}\n"
+        f"风险审核：{candidate.risk_level}；{risk_text}\n"
         f"研究结论：{conclusion}。"
     )
