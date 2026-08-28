@@ -15,6 +15,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .core import CHINA_TZ, MinuteBarAggregator, assess_market_context, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
+from .factors import market_adjustment
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
 
@@ -233,16 +234,12 @@ class Main(Star):
         self._last_screen_diagnostics = {"input": len(quotes), "tradable": len(tradable), "enriched": sum(1 for q in enrich_targets if q.history_days >= 20)}
         scored = [score_quote(quote) for quote in tradable]
         market = assess_market_context(quotes)
-        if market.regime == "risk_on":
+        adjustment = market_adjustment(market.regime)
+        if adjustment:
             for item in scored:
                 if item.score > 0:
-                    item.score += 2
-                    item.reasons.append("市场环境偏强+2")
-        elif market.regime == "risk_off":
-            for item in scored:
-                if item.score > 0:
-                    item.score -= 2
-                    item.reasons.append("市场环境偏弱-2")
+                    item.score += adjustment
+                    item.reasons.append(f"市场环境修正{adjustment:+d}")
         minimum = self._int("min_score", 10, -100, 100)
         scored.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
         qualified = [item for item in scored if item.score >= minimum and item.risk_level != "blocked"]

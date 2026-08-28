@@ -89,7 +89,7 @@ class MarketContext:
 
 def assess_market_context(quotes: Iterable[Quote]) -> MarketContext:
     """Derive a transparent market regime from the same daily snapshot."""
-    rows = [q for q in quotes if math.isfinite(float(q.pct_change)) and q.price > 0]
+    rows = [q for q in quotes if math.isfinite(float(q.pct_change)) and math.isfinite(float(q.price)) and q.price > 0]
     advancing = sum(1 for q in rows if q.pct_change > 0.2)
     declining = sum(1 for q in rows if q.pct_change < -0.2)
     breadth = advancing / len(rows) if rows else 0.0
