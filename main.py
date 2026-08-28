@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from astrbot.api import logger
@@ -45,6 +45,7 @@ class Main(Star):
         self.last_daily_scan: str | None = None
         self._daily_snapshot_lock = asyncio.Lock()
         self._daily_date_alias: dict[str, str] = {}
+        self._daily_retry_after: datetime | None = None
         self._annotation_task: asyncio.Task | None = None
         self._annotation_cache: dict[str, tuple[datetime, dict]] = {}
         self._last_annotation_at: datetime | None = None
@@ -334,6 +335,7 @@ class Main(Star):
             lookup_date = self._daily_date_alias.get(trade_date, trade_date)
             cached = self.store.daily_quotes(lookup_date)
             if cached:
+                self._daily_retry_after = None
                 return cached, False, lookup_date
             try:
                 result = await self.quotes.fetch_market_snapshot_result(
@@ -347,7 +349,7 @@ class Main(Star):
                 if actual_date:
                     fallback = self.store.daily_quotes(actual_date)
                     if fallback:
-                        self._daily_date_alias[trade_date] = actual_date
+                        self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
                         logger.warning("[%s] 当日快照不可用，使用最近缓存交易日：%s", PLUGIN_NAME, actual_date)
                         return fallback, False, actual_date
                 if result is None:
@@ -361,6 +363,7 @@ class Main(Star):
             )
             logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
             self._daily_date_alias[trade_date] = actual_date
+            self._daily_retry_after = None
             return self.store.daily_quotes(actual_date), True, actual_date
 
     async def _daily_candidates(self, limit: int):
@@ -379,7 +382,8 @@ class Main(Star):
         while True:
             now = datetime.now(CHINA_TZ)
             target = str(self.config.get("daily_scan_time", "15:10"))
-            if now.weekday() < 5 and now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat():
+            retry_ready = self._daily_retry_after is None or now >= self._daily_retry_after
+            if now.weekday() < 5 and now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat() and retry_ready:
                 try:
                     candidates = await self._daily_candidates(self._int("candidate_limit", 30, 1, 100))
                     lines = [
@@ -393,7 +397,7 @@ class Main(Star):
                     for origin in self.store.subscriptions():
                         if not await self._push(origin, "\n".join(lines)):
                             push_failed = True
-                    if not push_failed:
+                    if not push_failed and self._daily_retry_after is None:
                         self.last_daily_scan = now.date().isoformat()
                 except Exception:
                     logger.exception("[%s] 收盘扫描失败", PLUGIN_NAME)
