@@ -250,6 +250,16 @@ class Main(Star):
                                 item.reasons.append(f"行业/基本面修正{extra:+d}")
             except Exception:
                 logger.warning("[%s] 自定义因子源不可用，继续技术筛选", PLUGIN_NAME)
+        elif str(self.config.get("factor_source", "auto")) in {"auto", "eastmoney"}:
+            try:
+                raw_factors = await self.quotes.fetch_eastmoney_factors([q.code for q in enrich_targets])
+                for item in scored:
+                    row = raw_factors.get(item.quote.code)
+                    if row:
+                        item.quote.fundamental_score = round(max(-10, min(10, float(row.get("roe") or 0) / 2)), 1) if row.get("roe") is not None else None
+                        item.quote.industry_score = None
+            except Exception:
+                logger.warning("[%s] 东方财富因子源不可用，继续技术筛选", PLUGIN_NAME)
         adjustment = market_adjustment(market.regime) if str(self.config.get("factor_mode", "report_only")) == "score" else 0
         if adjustment:
             for item in scored:

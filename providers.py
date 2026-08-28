@@ -278,6 +278,27 @@ class SinaQuoteProvider:
             result[str(row["code"])[-6:]] = row
         return result
 
+    async def fetch_eastmoney_factors(self, codes: Iterable[str]) -> dict[str, dict]:
+        """Best-effort public fields: industry, PE, PB and ROE."""
+        result = {}
+        async with httpx.AsyncClient(timeout=self.timeout, headers={"Referer": "https://quote.eastmoney.com/"}) as client:
+            for code in list(codes)[:300]:
+                secid = ("1." if str(code).startswith(("6", "68", "9")) else "0.") + str(code)
+                try:
+                    response = await client.get("https://push2.eastmoney.com/api/qt/stock/get", params={"secid": secid, "fields": "f57,f58,f127,f162,f167,f173"})
+                    response.raise_for_status()
+                    data = (response.json().get("data") or {})
+                    def finite(key):
+                        try:
+                            value = float(data.get(key))
+                            return value if math.isfinite(value) else None
+                        except (TypeError, ValueError):
+                            return None
+                    result[str(code)] = {"industry": str(data.get("f127") or ""), "pe": finite("f162"), "pb": finite("f167"), "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
+                except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                    continue
+        return result
+
     async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> None:
         """Fetch a short adjusted daily history for the small candidate set."""
         if not quotes:
