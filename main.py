@@ -41,6 +41,7 @@ class Main(Star):
         self.last_daily_scan: str | None = None
         self.last_alert: dict[tuple[str, str], datetime] = {}
         self._daily_snapshot_lock = asyncio.Lock()
+        self._daily_date_alias: dict[str, str] = {}
 
     async def initialize(self):
         if not self._bool("enabled", True):
@@ -130,32 +131,38 @@ class Main(Star):
     async def _scan(self, codes: list[str], limit: int):
         return await self._score_quotes(await self.quotes.fetch_quotes(codes), limit)
 
-    async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool]:
-        """Return the day's full-market snapshot and whether it was fetched now."""
-        cached = self.store.daily_quotes(trade_date)
+    async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
+        """Return a snapshot, whether it was fetched now, and its actual trade date."""
+        lookup_date = self._daily_date_alias.get(trade_date, trade_date)
+        cached = self.store.daily_quotes(lookup_date)
         if cached:
-            return cached, False
+            return cached, False, lookup_date
         async with self._daily_snapshot_lock:
             # Re-check after waiting so the background loop and manual command do not fetch twice.
-            cached = self.store.daily_quotes(trade_date)
+            lookup_date = self._daily_date_alias.get(trade_date, trade_date)
+            cached = self.store.daily_quotes(lookup_date)
             if cached:
-                return cached, False
-            snapshot = await self.quotes.fetch_market_snapshot(
+                return cached, False, lookup_date
+            result = await self.quotes.fetch_market_snapshot_result(
                 str(self.config.get("daily_market_url", "")), trade_date
             )
+            if not result.quotes:
+                return [], True, trade_date
+            actual_date = result.trade_date or trade_date
             saved = self.store.save_daily_quotes(
-                trade_date,
-                snapshot,
+                actual_date,
+                result.quotes,
                 self._int("daily_cache_keep_days", 180, 7, 730),
             )
             logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
-            return self.store.daily_quotes(trade_date), True
+            self._daily_date_alias[trade_date] = actual_date
+            return self.store.daily_quotes(actual_date), True, actual_date
 
     async def _daily_candidates(self, limit: int):
         if self._bool("daily_cache_enabled", True):
             trade_date = datetime.now(CHINA_TZ).date().isoformat()
             try:
-                cached, _ = await self._daily_snapshot(trade_date)
+                cached, _, _ = await self._daily_snapshot(trade_date)
             except Exception:
                 logger.exception("[%s] 全市场日快照失败，退回股票池扫描", PLUGIN_NAME)
                 cached = []
@@ -236,13 +243,20 @@ class Main(Star):
         trade_date = datetime.now(CHINA_TZ).date().isoformat()
         try:
             if self._bool("daily_cache_enabled", True):
-                quotes, fetched = await self._daily_snapshot(trade_date)
-                source = "已同步今日全市场数据" if fetched else "已使用今日全市场缓存"
+                quotes, fetched, actual_date = await self._daily_snapshot(trade_date)
+                source = ("已同步交易日 " if fetched else "已使用交易日 ") + actual_date + " 全市场数据"
             else:
-                quotes = await self.quotes.fetch_market_snapshot(
+                result = await self.quotes.fetch_market_snapshot_result(
                     str(self.config.get("daily_market_url", "")), trade_date
                 )
-                source = "已抓取今日全市场数据（未启用缓存）"
+                quotes, actual_date = result.quotes, result.trade_date or trade_date
+                source = "已抓取交易日 " + actual_date + " 全市场数据（未启用缓存）"
+            if not quotes:
+                yield event.plain_result(
+                    f"未找到可用的全市场日行情（请求日期：{trade_date}）。\n"
+                    "可能是 Tushare 尚未发布该日期数据，或行情接口暂时不可用。"
+                )
+                return
             candidates = await self._score_quotes(quotes, limit)
             lines = [f"{source}：{len(quotes)} 只", "全市场选股结果（仅研究/模拟盘）"]
             lines.extend(format_candidate(item) for item in candidates)

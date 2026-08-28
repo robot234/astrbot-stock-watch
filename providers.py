@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable
 
@@ -19,6 +20,12 @@ def _sina_symbol(code: str) -> str:
     return ("sh" if value.startswith(("6", "68", "9")) else "sz") + value
 
 
+@dataclass(slots=True)
+class MarketSnapshotResult:
+    quotes: list[Quote]
+    trade_date: str | None
+
+
 class SinaQuoteProvider:
     """Prototype provider; replace it with a licensed/stable source for production."""
 
@@ -30,26 +37,60 @@ class SinaQuoteProvider:
 
     async def fetch_market_snapshot(self, daily_market_url: str = "", trade_date: str = "") -> list[Quote]:
         """Fetch one daily snapshot, preferring Tushare when a token is configured."""
+        return (await self.fetch_market_snapshot_result(daily_market_url, trade_date)).quotes
+
+    async def fetch_market_snapshot_result(self, daily_market_url: str = "", trade_date: str = "") -> MarketSnapshotResult:
+        """Fetch a snapshot and report the actual trading date represented by the data."""
         if self.tushare_token:
             try:
-                return await self._fetch_tushare_snapshot(trade_date)
+                return await self._fetch_tushare_snapshot_result(trade_date)
             except (httpx.HTTPError, ValueError, TypeError, KeyError, RuntimeError):
                 # Tushare permissions, quota, or transient errors should not stop the daily job.
                 pass
-        return await self._fetch_eastmoney_snapshot(daily_market_url)
+        quotes = await self._fetch_eastmoney_snapshot(daily_market_url)
+        return MarketSnapshotResult(quotes, self._normalize_trade_date(trade_date) if trade_date else None)
 
     async def _fetch_tushare_snapshot(self, trade_date: str = "") -> list[Quote]:
-        date_value = str(trade_date or datetime.now(CHINA_TZ).strftime("%Y%m%d")).replace("-", "")
+        return (await self._fetch_tushare_snapshot_result(trade_date)).quotes
+
+    @staticmethod
+    def _normalize_trade_date(value: str) -> str:
+        digits = str(value or "").replace("-", "")
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}" if len(digits) == 8 else str(value)
+
+    async def _fetch_tushare_snapshot_result(self, trade_date: str = "") -> MarketSnapshotResult:
+        requested = str(trade_date or datetime.now(CHINA_TZ).strftime("%Y%m%d")).replace("-", "")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            quotes = await self._fetch_tushare_daily(client, requested)
+            if quotes:
+                return MarketSnapshotResult(quotes, self._normalize_trade_date(requested))
+
+            dates = await self._fetch_tushare_trade_dates(client, requested)
+            if not dates:
+                current = datetime.strptime(requested, "%Y%m%d")
+                dates = [
+                    (current - timedelta(days=offset)).strftime("%Y%m%d")
+                    for offset in range(1, 31)
+                    if (current - timedelta(days=offset)).weekday() < 5
+                ]
+            for date_value in dates[:30]:
+                quotes = await self._fetch_tushare_daily(client, date_value)
+                if quotes:
+                    return MarketSnapshotResult(quotes, self._normalize_trade_date(date_value))
+        return MarketSnapshotResult([], None)
+
+    async def _fetch_tushare_daily(self, client: httpx.AsyncClient, date_value: str) -> list[Quote]:
         payload = {
             "api_name": "daily",
             "token": self.tushare_token,
             "params": {"trade_date": date_value, "limit": 6000},
             "fields": "ts_code,trade_date,close,pre_close,pct_chg,vol,amount",
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(self.tushare_url, json=payload)
-            response.raise_for_status()
-            body = response.json()
+        response = await client.post(self.tushare_url, json=payload)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("Tushare response is not an object")
         if int(body.get("code") or 0) != 0:
             raise RuntimeError(str(body.get("msg") or "Tushare returned an error"))
         data = body.get("data") or {}
@@ -71,6 +112,32 @@ class SinaQuoteProvider:
                 continue
             result.append(Quote(code, code, price, prev_close, amount, pct_change, volume, fetched_at=datetime.now(CHINA_TZ)))
         return result
+
+    async def _fetch_tushare_trade_dates(self, client: httpx.AsyncClient, end_date: str) -> list[str]:
+        payload = {
+            "api_name": "trade_cal",
+            "token": self.tushare_token,
+            "params": {"exchange": "SSE", "is_open": 1, "end_date": end_date, "limit": 1000},
+            "fields": "cal_date,is_open",
+        }
+        response = await client.post(self.tushare_url, json=payload)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("Tushare trade_cal response is not an object")
+        if int(body.get("code") or 0) != 0:
+            raise RuntimeError(str(body.get("msg") or "Tushare returned an error"))
+        data = body.get("data") or {}
+        fields = list(data.get("fields") or [])
+        dates = []
+        for values in data.get("items") or []:
+            row = dict(zip(fields, values))
+            if str(row.get("is_open", "1")) not in {"1", "True", "true"}:
+                continue
+            value = str(row.get("cal_date") or "").replace("-", "")
+            if len(value) == 8 and value < end_date:
+                dates.append(value)
+        return sorted(set(dates), reverse=True)
 
     async def _fetch_eastmoney_snapshot(self, daily_market_url: str = "") -> list[Quote]:
         """Fetch one daily snapshot; a custom URL may expose the same JSON shape."""
