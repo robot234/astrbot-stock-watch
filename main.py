@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -158,20 +159,45 @@ class Main(Star):
         configured = self._configured_whitelist()
         return "*" in configured or origin in configured or self.store.is_whitelisted(origin)
 
+    def _message_chunks(self, text: str) -> list[str]:
+        """Split long reports at line boundaries so chat adapters do not truncate them."""
+        limit = self._int("push_max_chars", 3500, 500, 12000)
+        lines = str(text or "").splitlines() or [""]
+        chunks: list[str] = []
+        current = ""
+        for line in lines:
+            pieces = [line[index:index + limit] for index in range(0, max(1, len(line)), limit)]
+            for piece in pieces:
+                candidate = piece if not current else current + "\n" + piece
+                if current and len(candidate) > limit:
+                    chunks.append(current)
+                    current = piece
+                else:
+                    current = candidate
+        if current or not chunks:
+            chunks.append(current)
+        return chunks
+
+    @staticmethod
+    def _model_text_is_research_safe(text: str) -> bool:
+        """Reject model output that turns a research summary into an action instruction."""
+        return not re.search(r"(?:建议|推荐|应当|适合买|考虑买|买入|卖出|止损|止盈|加仓|减仓|目标价|仓位|下单)", text or "")
+
+    @staticmethod
+    def _clean_external_text(value, limit: int) -> str:
+        return re.sub(r"[\x00-\x1f\x7f]", "", str(value or "")).strip()[:limit]
+
     async def _push(self, origin: str, text: str) -> bool:
         if not self._push_allowed(origin):
             logger.debug("[%s] 已跳过非白名单会话推送：%s", PLUGIN_NAME, origin or "<empty>")
             return False
         try:
-            await self.context.send_message(origin, MessageChain([Plain(text)]))
+            for chunk in self._message_chunks(text):
+                try:
+                    await self.context.send_message(origin, MessageChain([Plain(chunk)]))
+                except TypeError:
+                    await self.context.send_message(origin, chunk)
             return True
-        except TypeError:
-            try:
-                await self.context.send_message(origin, text)
-                return True
-            except Exception:
-                logger.exception("[%s] 推送失败：%s", PLUGIN_NAME, origin or "<empty>")
-                return False
         except Exception:
             logger.exception("[%s] 推送失败：%s", PLUGIN_NAME, origin or "<empty>")
             return False
@@ -224,8 +250,14 @@ class Main(Star):
         if (datetime.now(CHINA_TZ) - created_at).total_seconds() > max_age:
             self._annotation_cache.pop(code, None)
             return ""
-        evidence = "、".join(annotation.get("evidence", [])[:3])
-        return f"模型解读：{annotation.get('summary', '')}；风险{annotation.get('risk_level', 'unknown')}；依据：{evidence}"
+        raw_evidence = annotation.get("evidence", [])
+        if not isinstance(raw_evidence, list):
+            raw_evidence = []
+        evidence = "、".join(self._clean_external_text(item, 80) for item in raw_evidence[:3] if str(item).strip())
+        summary = self._clean_external_text(annotation.get("summary", ""), 300)
+        if not self._model_text_is_research_safe(summary):
+            return ""
+        return f"模型补充（未验证）：{summary}；风险{self._clean_external_text(annotation.get('risk_level', 'unknown'), 20)}；参考：{evidence or '未提供'}"
 
     def _cost_signal(self, quote, cost_price: float | None) -> str:
         if not cost_price or not math.isfinite(cost_price) or not math.isfinite(quote.price) or quote.price <= 0:
@@ -237,16 +269,16 @@ class Main(Star):
         if change >= profit:
             return (
                 f"成本观察：{label} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%\n"
-                f"依据：相对成本达到 +{profit:.2f}% 的止盈观察阈值。\n"
+                f"依据：相对成本达到 +{profit:.2f}% 的收益阈值事件。\n"
                 "风险：成本价只是单点参考，未计手续费和滑点，行情可能继续波动或反转。\n"
-                "研究动作建议：结合 RSI、均线、量价和公告复核，再评估是否分批止盈；仅研究/模拟盘，不自动下单。"
+                "研究动作建议：结合 RSI、均线、量价和公告复核，记录后续观察结论；仅研究/模拟盘，不自动下单。"
             )
         if change <= -risk:
             return (
                 f"成本观察：{label} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%\n"
-                f"依据：相对成本达到 -{risk:.2f}% 的风险观察阈值。\n"
+                f"依据：相对成本达到 -{risk:.2f}% 的亏损阈值事件。\n"
                 "风险：成本价不代表合理价值，未计手续费和滑点，弱势行情可能继续下探。\n"
-                "研究动作建议：先复核日线趋势、基本面和自身风险承受，再制定分批减仓或观望计划；仅研究/模拟盘，不自动下单。"
+                "研究动作建议：先复核日线趋势、基本面和自身风险承受，记录观望或继续研究的理由；仅研究/模拟盘，不自动下单。"
             )
         return ""
 
@@ -332,14 +364,18 @@ class Main(Star):
             now = datetime.now(CHINA_TZ)
             target = str(self.config.get("daily_scan_time", "15:10"))
             if now.weekday() < 5 and now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat():
-                self.last_daily_scan = now.date().isoformat()
                 try:
                     candidates = await self._daily_candidates(self._int("candidate_limit", 30, 1, 100))
-                    lines = ["收盘选股（仅研究/模拟盘）", *[format_candidate(item) for item in candidates]]
+                    lines = [
+                        "收盘选股（仅研究/模拟盘）",
+                        "筛选口径：价格区间过滤 → 成交额流动性预筛选 → RSI6/均线/量价规则评分 → 人工复核",
+                        *[format_candidate(item) for item in candidates],
+                    ]
                     if not candidates:
                         lines.append("暂无候选，或尚未配置股票池/行情接口。")
                     for origin in self.store.subscriptions():
                         await self._push(origin, "\n".join(lines))
+                    self.last_daily_scan = now.date().isoformat()
                 except Exception:
                     logger.exception("[%s] 收盘扫描失败", PLUGIN_NAME)
             await asyncio.sleep(20)
@@ -490,7 +526,9 @@ class Main(Star):
                     summary = ""
                     if self._bool("llm_enabled", False):
                         try:
-                            summary = await self.llm.summarize(fresh)
+                            summary = self._clean_external_text(await self.llm.summarize(fresh), 3000)
+                            if not self._model_text_is_research_safe(summary):
+                                summary = ""
                         except Exception:
                             logger.exception("[%s] 模型摘要失败", PLUGIN_NAME)
                     text = summary or "\n".join(f"资讯：{item.title}\n{item.link}" for item in fresh[:5])
@@ -504,7 +542,11 @@ class Main(Star):
     async def pick(self, event: AstrMessageEvent, count: int = 0):
         try:
             candidates = await self._scan(self._universe(), max(1, min(int(count or self._int("candidate_limit", 30, 1, 100)), 100)))
-            lines = ["选股结果（仅研究/模拟盘）", *[format_candidate(item) for item in candidates]]
+            lines = [
+                "选股结果（仅研究/模拟盘）",
+                "筛选口径：价格区间过滤 → 成交额流动性预筛选 → RSI6/均线/量价规则评分 → 人工复核",
+                *[format_candidate(item) for item in candidates],
+            ]
             if not candidates:
                 lines.append("暂无结果。请先配置 universe_codes 或添加自选股。")
             yield event.plain_result("\n".join(lines))
@@ -534,7 +576,11 @@ class Main(Star):
                 )
                 return
             candidates = await self._score_quotes(quotes, limit)
-            lines = [f"{source}：{len(quotes)} 只", "全市场选股结果（仅研究/模拟盘）"]
+            lines = [
+                f"{source}：{len(quotes)} 只",
+                "全市场选股结果（仅研究/模拟盘）",
+                "筛选口径：价格区间过滤 → 成交额流动性预筛选 → RSI6/均线/量价规则评分 → 人工复核",
+            ]
             lines.extend(format_candidate(item) for item in candidates)
             if not candidates:
                 lines.append("暂无候选，可能是行情接口未返回数据或评分条件较严。")

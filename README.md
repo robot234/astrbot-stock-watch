@@ -60,7 +60,7 @@
 - `minute_trigger_consecutive_up`：连续上涨根数，默认 3 根。
 - `minute_trigger_step_pct`、`minute_trigger_breakout_pct`：每根最小涨幅和突破幅度，默认 0.1% 和 0.5%。
 - `intraday_failure_threshold`：连续行情失败达到该次数后暂缓信号推送；默认 0，仅统计不暂缓。
-- `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送止盈观察，默认 5%；这是观察阈值，不是保证止盈价，未计手续费和滑点。
+- `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送收益阈值事件提醒，默认 5%；仅用于复核，不是交易指令，未计手续费和滑点。
 - `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%；这是风险观察阈值，不是自动止损价。
 - `min_score`：技术评分最低分；分数只是规则筛选结果，不代表收益概率。
 - `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号，确认进度会保存到 SQLite。
@@ -90,6 +90,7 @@
 ### 推送白名单
 
 - `push_whitelist`：填写 `unified_msg_origin`，多个值用逗号或换行分隔。留空时默认不发送后台推送。
+- `push_max_chars`：单次后台推送的最大字符数，超出时按行拆分发送，默认 3500。
 - 也可以在目标群聊或私聊中执行 `/白名单 开启` 动态加入。
 - 执行 `/监听 状态` 可以查看当前会话标识。
 - 只有白名单内且已执行 `/监听 开启` 的会话，才能收到自动推送。

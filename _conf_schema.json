@@ -1,6 +1,7 @@
 {
   "enabled": {"type": "bool", "description": "启用后台监听和收盘扫描", "default": true},
   "push_whitelist": {"type": "string", "description": "后台推送白名单，填写 unified_msg_origin，多个值用逗号或换行分隔；留空时仅允许通过/白名单 开启加入的会话；填写 * 将允许所有会话", "default": ""},
+  "push_max_chars": {"type": "int", "description": "单次推送最大字符数，超出时按行拆分发送", "default": 3500},
   "daily_cache_enabled": {"type": "bool", "description": "是否每天收盘抓取全市场日快照并缓存到本地", "default": true},
   "daily_cache_keep_days": {"type": "int", "description": "全市场日快照保留天数", "default": 180},
   "daily_market_url": {"type": "string", "description": "每日全市场快照接口地址", "default": ""},

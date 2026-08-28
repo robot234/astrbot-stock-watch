@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time
 from typing import Iterable
 from zoneinfo import ZoneInfo
+import re
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -198,6 +199,7 @@ def in_trading_session(now: datetime | None = None) -> bool:
 
 def format_candidate(candidate: Candidate) -> str:
     quote = candidate.quote
+    name = re.sub(r"[\x00-\x1f\x7f]", "", str(quote.name or "")).strip()[:40]
     why = "、".join(candidate.reasons) or "暂无技术加分"
     metrics = []
     if quote.rsi6 is not None:
@@ -207,9 +209,20 @@ def format_candidate(candidate: Candidate) -> str:
     if quote.volume_ratio is not None:
         metrics.append(f"量比={quote.volume_ratio:.2f}")
     evidence = "、".join(metrics) or "当前可用技术指标不足"
-    advice = "列入观察，人工复核日线趋势、基本面、公告和流动性后再决定是否继续研究"
+    risk_items: list[str] = []
+    if any("空头" in reason or "放量下跌" in reason for reason in candidate.reasons):
+        risk_items.append("均线偏弱或出现放量下跌")
+    if quote.rsi6 is not None and quote.rsi6 >= 70:
+        risk_items.append("RSI6处于高位，短线波动风险较高")
+    if not metrics:
+        risk_items.append("技术数据不足，评分参考价值有限")
+    risk_text = "；".join(risk_items) if risk_items else "暂未触发机械风险项，但指标可能滞后或不完整"
+    conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；这不是买卖指令"
     return (
-        f"{quote.code} {quote.name} 现价{quote.price:.2f} 涨跌{quote.pct_change:+.2f}% 成交额{quote.amount:.0f} "
-        f"分数{candidate.score}（{why}）\n"
-        f"依据：{evidence}；风险：技术指标可能滞后，数据可能延迟或不完整，评分不代表收益概率；研究动作建议：{advice}。"
+        f"候选：{name or quote.code}（{quote.code}）\n"
+        f"行情：现价{quote.price:.2f}，涨跌{quote.pct_change:+.2f}%，成交额{quote.amount:.0f}\n"
+        f"技术评分：{candidate.score}/30（规则加分：{why}）\n"
+        f"技术证据：{evidence}\n"
+        f"风险审核：{risk_text}\n"
+        f"研究结论：{conclusion}。"
     )
