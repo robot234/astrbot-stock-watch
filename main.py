@@ -215,7 +215,7 @@ class Main(Star):
             merged.extend(codes)
         return list(dict.fromkeys(merged))
 
-    async def _score_quotes(self, quotes, limit: int):
+    async def _score_quotes(self, quotes, limit: int, as_of: str = ""):
         tradable = [quote for quote in quotes if is_tradable(
             quote,
             self._float("price_min", 2, 0.01, 100000),
@@ -223,7 +223,7 @@ class Main(Star):
         )]
         tradable.sort(key=lambda quote: quote.amount, reverse=True)
         # 日线历史请求只对流动性靠前的有限集合执行，控制网络和内存开销。
-        await self.quotes.enrich_indicators(tradable[: min(300, max(80, limit * 5))], self._int("max_concurrency", 5, 1, 20))
+        await self.quotes.enrich_indicators(tradable[: min(300, max(80, limit * 5))], self._int("max_concurrency", 5, 1, 20), as_of)
         candidates = [score_quote(quote) for quote in tradable]
         minimum = self._int("min_score", 15, -100, 100)
         candidates = [item for item in candidates if item.score >= minimum]
@@ -359,7 +359,15 @@ class Main(Star):
                 if result is None:
                     raise RuntimeError("daily snapshot source unavailable")
                 return [], True, trade_date
-            actual_date = result.trade_date or trade_date
+            actual_date = result.trade_date
+            if not actual_date:
+                cached_date = self.store.latest_daily_trade_date(trade_date)
+                if cached_date:
+                    self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                    return self.store.daily_quotes(cached_date), False, cached_date
+                self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                logger.warning("[%s] 行情源未提供真实交易日，拒绝将快照伪装为请求日期", PLUGIN_NAME)
+                return [], True, trade_date
             saved = self.store.save_daily_quotes(
                 actual_date,
                 result.quotes,
@@ -384,7 +392,7 @@ class Main(Star):
                 logger.exception("[%s] 全市场日快照失败，退回股票池扫描", PLUGIN_NAME)
                 cached = []
             if cached:
-                return await self._score_quotes(cached, limit)
+                return await self._score_quotes(cached, limit, cached[0].fetched_at.date().isoformat() if cached else "")
         return await self._scan(self._universe(), limit)
 
     def _record_screen(self, requested_date: str, actual_date: str, source: str, quotes, candidates, status: str = "completed", quality: str = "good", error: str | None = None) -> str:
@@ -446,10 +454,13 @@ class Main(Star):
                         self._intraday_date = today
                     watch = self.store.all_watch()
                     watch_details = self.store.all_watch_details()
-                    active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
+                    active = {origin: list(codes) for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
                     if self._bool("auto_watch_candidates", True):
-                        union.extend(item["code"] for item in self.store.latest_screen_candidates(self._int("candidate_limit", 30, 1, 100)) if item.get("code"))
+                        candidate_codes = [item["code"] for item in self.store.latest_screen_candidates(self._int("candidate_limit", 30, 1, 100)) if item.get("code")]
+                        union.extend(candidate_codes)
+                        for origin in active:
+                            active[origin] = list(dict.fromkeys(active[origin] + candidate_codes))
                         union = list(dict.fromkeys(union))[: self._int("intraday_focus_limit", 200, 10, 500)]
                     if union:
                         health = self._intraday_health
@@ -615,7 +626,11 @@ class Main(Star):
                 result = await self.quotes.fetch_market_snapshot_result(
                     str(self.config.get("daily_market_url", "")), trade_date
                 )
-                quotes, actual_date = result.quotes, result.trade_date or trade_date
+                actual_date = result.trade_date
+                if not actual_date:
+                    yield event.plain_result("行情源没有返回真实交易日，已拒绝把数据标记为今天；请使用 Tushare 或先同步可验证的缓存。")
+                    return
+                quotes = result.quotes
                 source = "已抓取交易日 " + actual_date + " 全市场数据（未启用缓存）"
             if not quotes:
                 yield event.plain_result(

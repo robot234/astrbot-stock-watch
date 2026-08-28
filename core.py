@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time
 from typing import Iterable
 from zoneinfo import ZoneInfo
+import math
 import re
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -215,7 +216,11 @@ def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
             return None
         return round(round(value / tick) * tick, 2)
 
+    if tick <= 0:
+        tick = 0.01
     price = float(quote.price or 0)
+    if not all(map(math.isfinite, [price])):
+        return PricePlan("unknown", 0.0, None, None, None, None, None, None, None, None, None, "invalid", ["价格数据不是有限数值"])
     atr = float(quote.atr14) if quote.atr14 and quote.atr14 > 0 else None
     support = float(quote.support20) if quote.support20 and quote.support20 > 0 else None
     resistance = float(quote.resistance20) if quote.resistance20 and quote.resistance20 > 0 else None
@@ -238,7 +243,7 @@ def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
     sell_low = max(0.01, resistance - 0.25 * atr)
     sell_high = max(sell_low, resistance + 0.5 * atr)
     invalidation = max(0.01, support - atr)
-    state = "in_attention" if attention_low <= price <= attention_high else "near_sell" if sell_low <= price <= sell_high else "confirmed" if price >= confirmation else "between"
+    state = "invalidated" if price <= invalidation else "near_sell" if sell_low <= price <= sell_high else "confirmed" if price >= confirmation and (quote.volume_ratio is None or quote.volume_ratio >= 1.0) else "in_attention" if attention_low <= price <= attention_high else "between"
     return PricePlan(state, price, rounded(atr), rounded(support), rounded(resistance), rounded(attention_low), rounded(attention_high), rounded(confirmation), rounded(sell_low), rounded(sell_high), rounded(invalidation), "good", evidence)
 
 
@@ -249,7 +254,7 @@ def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
         flags.append("停牌")
     if quote.limit_up or quote.limit_down:
         flags.append("涨跌停")
-    if quote.price <= 0:
+    if not math.isfinite(float(quote.price)) or quote.price <= 0:
         flags.append("价格无效")
     if quote.history_days and quote.history_days < 20:
         flags.append("历史数据不足")

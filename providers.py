@@ -35,6 +35,7 @@ class SinaQuoteProvider:
         self.tushare_url = str(tushare_url or "").strip() or "https://api.tushare.pro"
         self.tushare_token = str(tushare_token or "").strip()
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
+        self._last_tushare_date: str | None = None
 
     async def fetch_market_snapshot(self, daily_market_url: str = "", trade_date: str = "") -> list[Quote]:
         """Fetch one daily snapshot, preferring Tushare when a token is configured."""
@@ -49,7 +50,8 @@ class SinaQuoteProvider:
                 # Tushare permissions, quota, or transient errors should not stop the daily job.
                 pass
         quotes = await self._fetch_eastmoney_snapshot(daily_market_url)
-        return MarketSnapshotResult(quotes, self._normalize_trade_date(trade_date) if trade_date else None)
+        # Eastmoney snapshot contract does not expose a reliable trade date.
+        return MarketSnapshotResult(quotes, None)
 
     async def _fetch_tushare_snapshot(self, trade_date: str = "") -> list[Quote]:
         return (await self._fetch_tushare_snapshot_result(trade_date)).quotes
@@ -62,9 +64,10 @@ class SinaQuoteProvider:
     async def _fetch_tushare_snapshot_result(self, trade_date: str = "") -> MarketSnapshotResult:
         requested = str(trade_date or datetime.now(CHINA_TZ).strftime("%Y%m%d")).replace("-", "")
         async with httpx.AsyncClient(timeout=self.timeout) as client:
+            self._last_tushare_date = None
             quotes = await self._fetch_tushare_daily(client, requested)
             if quotes:
-                return MarketSnapshotResult(quotes, self._normalize_trade_date(requested))
+                return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(requested))
 
             dates = await self._fetch_tushare_trade_dates(client, requested)
             if not dates:
@@ -77,7 +80,7 @@ class SinaQuoteProvider:
             for date_value in dates[:30]:
                 quotes = await self._fetch_tushare_daily(client, date_value)
                 if quotes:
-                    return MarketSnapshotResult(quotes, self._normalize_trade_date(date_value))
+                    return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(date_value))
         return MarketSnapshotResult([], None)
 
     async def _fetch_tushare_daily(self, client: httpx.AsyncClient, date_value: str) -> list[Quote]:
@@ -111,6 +114,7 @@ class SinaQuoteProvider:
                 amount = float(row.get("amount") or 0) * 1000
             except (TypeError, ValueError):
                 continue
+            self._last_tushare_date = self._normalize_trade_date(str(row.get("trade_date") or date_value))
             result.append(Quote(code, code, price, prev_close, amount, pct_change, volume, source="tushare", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
         return result
 
@@ -231,14 +235,15 @@ class SinaQuoteProvider:
             result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, source="sina", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
         return result
 
-    async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5) -> None:
+    async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> None:
         """Fetch a short adjusted daily history for the small candidate set."""
         if not quotes:
             return
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
         async def enrich(quote: Quote) -> None:
-            cached = self._indicator_cache.get(quote.code)
+            cache_key = f"{quote.code}:{as_of or 'latest'}"
+            cached = self._indicator_cache.get(cache_key)
             if cached and datetime.now(CHINA_TZ) - cached[0] < timedelta(minutes=15):
                 values = cached[1]
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
@@ -254,7 +259,7 @@ class SinaQuoteProvider:
                 "klt": "101",
                 "fqt": "1",
                 "beg": "0",
-                "end": "20500101",
+                "end": str(as_of or "20500101").replace("-", ""),
                 "lmt": "60",
             }
             try:
@@ -293,7 +298,7 @@ class SinaQuoteProvider:
                     "volatility20": volatility,
                     "history_days": len(closes),
                 }
-                self._indicator_cache[quote.code] = (datetime.now(CHINA_TZ), values)
+                self._indicator_cache[cache_key] = (datetime.now(CHINA_TZ), values)
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
                 quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values["atr14"], values["support20"], values["resistance20"], values["volatility20"], values["history_days"])
             except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
