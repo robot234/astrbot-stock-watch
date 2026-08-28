@@ -53,6 +53,9 @@
 - `quote_interval_seconds`：盘中自选股行情轮询间隔，默认 30 秒。
 - `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送止盈观察，默认 5%。
 - `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%。
+- `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号。
+- `confirmation_periods`：连续确认次数，默认 2 次。
+- `confirmation_max_gap_seconds`：连续确认最大间隔，默认 90 秒。
 
 自定义快照接口的返回格式示例：
 

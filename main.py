@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.6.1")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.7.0")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -45,6 +46,7 @@ class Main(Star):
         self._annotation_task: asyncio.Task | None = None
         self._annotation_cache: dict[str, tuple[datetime, dict]] = {}
         self._last_annotation_at: datetime | None = None
+        self._signal_observations: dict[tuple[str, str], deque[datetime]] = defaultdict(deque)
 
     async def initialize(self):
         if not self._bool("enabled", True):
@@ -187,6 +189,20 @@ class Main(Star):
             return f"成本观察：{quote.code} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%，达到风险观察阈值（仅研究/模拟盘，不自动下单）"
         return ""
 
+    def _confirmed_candidate(self, origin: str, code: str) -> bool:
+        key = (origin, code)
+        now = datetime.now(CHINA_TZ)
+        history = self._signal_observations[key]
+        max_gap = self._int("confirmation_max_gap_seconds", 90, 30, 600)
+        while history and (now - history[0]).total_seconds() > max_gap:
+            history.popleft()
+        history.append(now)
+        required = self._int("confirmation_periods", 2, 1, 5)
+        if len(history) >= required:
+            history.clear()
+            return True
+        return False
+
     def _fresh_quotes(self, quotes):
         now = datetime.now(CHINA_TZ)
         max_age = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
@@ -313,6 +329,8 @@ class Main(Star):
                                     if cost_signal:
                                         text = cost_signal
                                     else:
+                                        if self._bool("confirmation_enabled", False) and not self._confirmed_candidate(origin, code):
+                                            continue
                                         text = "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate)
                                         annotation = self._annotation_text(code)
                                         if annotation:
