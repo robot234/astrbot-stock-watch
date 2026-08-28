@@ -345,7 +345,9 @@ class Main(Star):
                 result = await self.quotes.fetch_market_snapshot_result(
                     str(self.config.get("daily_market_url", "")), trade_date
                 )
+                self.store.update_provider_health(result.source or "unknown", bool(result.quotes), result.quality)
             except Exception:
+                self.store.update_provider_health("unknown", False, "unknown", "fetch failed")
                 result = None
             if result is None or not result.quotes:
                 # A transient source failure should not discard a usable prior snapshot.
@@ -398,8 +400,7 @@ class Main(Star):
     def _record_screen(self, requested_date: str, actual_date: str, source: str, quotes, candidates, status: str = "completed", quality: str = "good", error: str | None = None) -> str:
         run_id = uuid.uuid4().hex
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        self.store.save_screen_run(run_id, "daily_screen", requested_date, actual_date, source, now, now, len(quotes), len(candidates), status, quality, error)
-        self.store.save_screen_candidates(run_id, candidates)
+        self.store.save_screen_bundle((run_id, "daily_screen", requested_date, actual_date, source, now, now, len(quotes), len(candidates), status, quality, error), candidates)
         self._last_screen_run_id = run_id
         return run_id
 

@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
@@ -25,6 +25,9 @@ def _sina_symbol(code: str) -> str:
 class MarketSnapshotResult:
     quotes: list[Quote]
     trade_date: str | None
+    source: str = ""
+    quality: str = "unknown"
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(CHINA_TZ))
 
 
 class SinaQuoteProvider:
@@ -51,7 +54,7 @@ class SinaQuoteProvider:
                 pass
         quotes = await self._fetch_eastmoney_snapshot(daily_market_url)
         # Eastmoney snapshot contract does not expose a reliable trade date.
-        return MarketSnapshotResult(quotes, None)
+        return MarketSnapshotResult(quotes, None, "eastmoney", "degraded" if quotes else "unknown")
 
     async def _fetch_tushare_snapshot(self, trade_date: str = "") -> list[Quote]:
         return (await self._fetch_tushare_snapshot_result(trade_date)).quotes
@@ -67,7 +70,7 @@ class SinaQuoteProvider:
             self._last_tushare_date = None
             quotes = await self._fetch_tushare_daily(client, requested)
             if quotes:
-                return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(requested))
+                return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(requested), "tushare", "good")
 
             dates = await self._fetch_tushare_trade_dates(client, requested)
             if not dates:
@@ -80,8 +83,8 @@ class SinaQuoteProvider:
             for date_value in dates[:30]:
                 quotes = await self._fetch_tushare_daily(client, date_value)
                 if quotes:
-                    return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(date_value))
-        return MarketSnapshotResult([], None)
+                    return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(date_value), "tushare", "good")
+        return MarketSnapshotResult([], None, "tushare", "unknown")
 
     async def _fetch_tushare_daily(self, client: httpx.AsyncClient, date_value: str) -> list[Quote]:
         payload = {

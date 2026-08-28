@@ -319,6 +319,24 @@ class StockStore:
             db.executemany("INSERT OR REPLACE INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons) VALUES(?,?,?,?,?,?,?,?,?)", rows)
         return len(rows)
 
+    def save_screen_bundle(self, run_args: tuple, candidates) -> str:
+        run_id = str(run_args[0])
+        with self._connect() as db:
+            db.execute("INSERT INTO screen_runs(run_id,job_name,requested_date,actual_trade_date,source,started_at,finished_at,quote_count,candidate_count,status,quality,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", run_args)
+            import json
+            rows=[]
+            for c in candidates:
+                plan=c.price_plan; pdata={k:getattr(plan,k) for k in plan.__dataclass_fields__} if plan else {}
+                rows.append((run_id,c.quote.code,c.quote.name,c.score,c.score_max,c.risk_level,json.dumps(c.risk_flags,ensure_ascii=False),json.dumps(pdata,ensure_ascii=False,default=str),json.dumps(c.reasons,ensure_ascii=False)))
+            if rows:
+                db.executemany("INSERT INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+        return run_id
+
+    def update_provider_health(self, provider: str, success: bool, quality: str, error: str | None = None) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as db:
+            db.execute("INSERT INTO provider_health(provider,last_success_at,last_error_at,success_count,error_count,last_quality) VALUES(?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET last_success_at=CASE WHEN ? THEN excluded.last_success_at ELSE provider_health.last_success_at END,last_error_at=CASE WHEN ? THEN provider_health.last_error_at ELSE excluded.last_error_at END,success_count=provider_health.success_count+CASE WHEN ? THEN 1 ELSE 0 END,error_count=provider_health.error_count+CASE WHEN ? THEN 0 ELSE 1 END,last_quality=excluded.last_quality", (provider, now if success else None, None if success else now, int(success), int(not success), quality, int(success), int(success), int(success), int(success)))
+
     def recent_screen_runs(self, limit: int = 10) -> list[dict]:
         with self._connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM screen_runs ORDER BY started_at DESC LIMIT ?", (max(1, min(int(limit), 100)),))]
