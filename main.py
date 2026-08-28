@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,7 +78,8 @@ class Main(Star):
 
     def _float(self, key: str, default: float, minimum: float, maximum: float) -> float:
         try:
-            return max(minimum, min(float(self.config.get(key, default)), maximum))
+            value = float(self.config.get(key, default))
+            return default if not math.isfinite(value) else max(minimum, min(value, maximum))
         except (TypeError, ValueError):
             return default
 
@@ -174,7 +176,7 @@ class Main(Star):
         return f"模型解读：{annotation.get('summary', '')}；风险{annotation.get('risk_level', 'unknown')}；依据：{evidence}"
 
     def _cost_signal(self, quote, cost_price: float | None) -> str:
-        if not cost_price or quote.price <= 0:
+        if not cost_price or not math.isfinite(cost_price) or not math.isfinite(quote.price) or quote.price <= 0:
             return ""
         change = (quote.price - cost_price) / cost_price * 100
         profit = self._float("cost_profit_threshold_pct", 5.0, 0.1, 1000)
@@ -393,7 +395,7 @@ class Main(Star):
         if len(raw_parts) > 1:
             try:
                 parsed = float(raw_parts[1])
-                if parsed > 0:
+                if math.isfinite(parsed) and parsed > 0:
                     cost_price = parsed
             except (TypeError, ValueError):
                 cost_price = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import math
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,6 +57,8 @@ class StockStore:
                 db.execute("ALTER TABLE watchlist ADD COLUMN cost_price REAL NULL")
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None) -> bool:
+        if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
+            cost_price = None
         with self._connect() as db:
             exists = db.execute("SELECT 1 FROM watchlist WHERE scope=? AND code=?", (scope, code)).fetchone()
             count = db.execute("SELECT COUNT(*) FROM watchlist WHERE scope=?", (scope,)).fetchone()[0]
@@ -77,7 +80,7 @@ class StockStore:
             row = db.execute("SELECT cost_price FROM watchlist WHERE scope=? AND code=?", (scope, code)).fetchone()
             try:
                 value = float(row[0]) if row and row[0] is not None else 0.0
-                return value if value > 0 else None
+                return value if math.isfinite(value) and value > 0 else None
             except (TypeError, ValueError):
                 return None
 
@@ -87,7 +90,7 @@ class StockStore:
             result = []
             for code, cost in rows:
                 try:
-                    value = float(cost) if cost is not None and float(cost) > 0 else None
+                    value = float(cost) if cost is not None and math.isfinite(float(cost)) and float(cost) > 0 else None
                 except (TypeError, ValueError):
                     value = None
                 result.append((str(code), value))
