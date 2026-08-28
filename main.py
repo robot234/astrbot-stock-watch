@@ -40,6 +40,7 @@ class Main(Star):
         self.tasks: list[asyncio.Task] = []
         self.last_daily_scan: str | None = None
         self.last_alert: dict[tuple[str, str], datetime] = {}
+        self._daily_snapshot_lock = asyncio.Lock()
 
     async def initialize(self):
         if not self._bool("enabled", True):
@@ -129,22 +130,35 @@ class Main(Star):
     async def _scan(self, codes: list[str], limit: int):
         return await self._score_quotes(await self.quotes.fetch_quotes(codes), limit)
 
+    async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool]:
+        """Return the day's full-market snapshot and whether it was fetched now."""
+        cached = self.store.daily_quotes(trade_date)
+        if cached:
+            return cached, False
+        async with self._daily_snapshot_lock:
+            # Re-check after waiting so the background loop and manual command do not fetch twice.
+            cached = self.store.daily_quotes(trade_date)
+            if cached:
+                return cached, False
+            snapshot = await self.quotes.fetch_market_snapshot(
+                str(self.config.get("daily_market_url", "")), trade_date
+            )
+            saved = self.store.save_daily_quotes(
+                trade_date,
+                snapshot,
+                self._int("daily_cache_keep_days", 180, 7, 730),
+            )
+            logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
+            return self.store.daily_quotes(trade_date), True
+
     async def _daily_candidates(self, limit: int):
         if self._bool("daily_cache_enabled", True):
             trade_date = datetime.now(CHINA_TZ).date().isoformat()
-            cached = self.store.daily_quotes(trade_date)
-            if not cached:
-                try:
-                    snapshot = await self.quotes.fetch_market_snapshot(str(self.config.get("daily_market_url", "")))
-                    saved = self.store.save_daily_quotes(
-                        trade_date,
-                        snapshot,
-                        self._int("daily_cache_keep_days", 180, 7, 730),
-                    )
-                    logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
-                    cached = self.store.daily_quotes(trade_date)
-                except Exception:
-                    logger.exception("[%s] 全市场日快照失败，退回股票池扫描", PLUGIN_NAME)
+            try:
+                cached, _ = await self._daily_snapshot(trade_date)
+            except Exception:
+                logger.exception("[%s] 全市场日快照失败，退回股票池扫描", PLUGIN_NAME)
+                cached = []
             if cached:
                 return await self._score_quotes(cached, limit)
         return await self._scan(self._universe(), limit)
@@ -214,6 +228,30 @@ class Main(Star):
         except Exception:
             logger.exception("[%s] 手动选股失败", PLUGIN_NAME)
             yield event.plain_result("选股暂时失败，请检查行情接口和插件配置。")
+
+    @filter.command("全市场选股", alias={"全市场同步", "全市场股票同步", "股票同步"})
+    async def market_sync(self, event: AstrMessageEvent, count: int = 0):
+        """Manually fetch/cache today's full-market snapshot and score it immediately."""
+        limit = max(1, min(int(count or self._int("candidate_limit", 30, 1, 100)), 100))
+        trade_date = datetime.now(CHINA_TZ).date().isoformat()
+        try:
+            if self._bool("daily_cache_enabled", True):
+                quotes, fetched = await self._daily_snapshot(trade_date)
+                source = "已同步今日全市场数据" if fetched else "已使用今日全市场缓存"
+            else:
+                quotes = await self.quotes.fetch_market_snapshot(
+                    str(self.config.get("daily_market_url", "")), trade_date
+                )
+                source = "已抓取今日全市场数据（未启用缓存）"
+            candidates = await self._score_quotes(quotes, limit)
+            lines = [f"{source}：{len(quotes)} 只", "全市场选股结果（仅研究/模拟盘）"]
+            lines.extend(format_candidate(item) for item in candidates)
+            if not candidates:
+                lines.append("暂无候选，可能是行情接口未返回数据或评分条件较严。")
+            yield event.plain_result("\n".join(lines))
+        except Exception:
+            logger.exception("[%s] 手动全市场同步失败", PLUGIN_NAME)
+            yield event.plain_result("全市场同步失败，请检查行情接口和插件配置。")
 
     @filter.command("自选")
     async def watch(self, event: AstrMessageEvent, action: str = "", code: str = ""):
