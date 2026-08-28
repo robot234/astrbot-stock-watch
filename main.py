@@ -224,6 +224,10 @@ class Main(Star):
         tradable.sort(key=lambda quote: quote.amount, reverse=True)
         # 日线历史请求只对流动性靠前的有限集合执行，控制网络和内存开销。
         await self.quotes.enrich_indicators(tradable[: min(300, max(80, limit * 5))], self._int("max_concurrency", 5, 1, 20), as_of)
+        for quote in tradable[: min(300, max(80, limit * 5))]:
+            bars = self.quotes.history_bars.get(quote.code, [])
+            if bars:
+                self.store.save_daily_bars(quote.code, bars, quote.source or "eastmoney")
         candidates = [score_quote(quote) for quote in tradable]
         minimum = self._int("min_score", 15, -100, 100)
         candidates = [item for item in candidates if item.score >= minimum]
@@ -328,6 +332,21 @@ class Main(Star):
             f"最近错误：{display(sina['last_error_at'])}"
         )
 
+    async def _calendar_open(self, trade_date: str) -> bool:
+        cached = self.store.calendar_status(trade_date)
+        if cached is not None:
+            return cached
+        try:
+            online = await self.quotes.fetch_trade_calendar(trade_date)
+        except Exception:
+            online = None
+        if online is not None:
+            self.store.save_calendar(trade_date, online, "tushare")
+            return online
+        approximate = datetime.strptime(trade_date, "%Y-%m-%d").weekday() < 5
+        self.store.save_calendar(trade_date, approximate, "weekday_approximate")
+        return approximate
+
     async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
         """Return a snapshot, whether it was fetched now, and its actual trade date."""
         lookup_date = self._daily_date_alias.get(trade_date, trade_date)
@@ -409,7 +428,7 @@ class Main(Star):
             now = datetime.now(CHINA_TZ)
             target = str(self.config.get("daily_scan_time", "15:10"))
             retry_ready = self._daily_retry_after is None or now >= self._daily_retry_after
-            if now.weekday() < 5 and now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat() and retry_ready:
+            if now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat() and retry_ready and await self._calendar_open(now.date().isoformat()):
                 job_key = f"daily_screen:{now.date().isoformat()}"
                 if not self.store.begin_job(job_key, "daily_screen", now.date().isoformat()):
                     await asyncio.sleep(20)
@@ -709,14 +728,15 @@ class Main(Star):
         for row in rows:
             base = self.store.daily_quotes(as_of)
             base_quote = next((q for q in base if q.code == row["code"]), None)
-            future = [next((q for q in self.store.daily_quotes(date) if q.code == row["code"]), None) for date in future_dates[:horizon]]
-            if not base_quote or any(item is None for item in future):
+            future_bars = self.store.daily_bars(row["code"], after=as_of)[:horizon]
+            future = [item for item in future_bars]
+            if not base_quote or len(future) < horizon:
                 continue
             last = future[-1]
-            ret = (last.price - base_quote.price) / base_quote.price * 100 if base_quote.price else None
-            highs = [(item.price - base_quote.price) / base_quote.price * 100 for item in future]
-            lows = highs
-            self.store.save_result_evaluation(uuid.uuid4().hex, run_id, row["code"], as_of, horizon, "complete", last.price, ret, max(highs), min(lows), None, True)
+            ret = (last["close"] - base_quote.price) / base_quote.price * 100 if base_quote.price else None
+            highs = [(item["high"] - base_quote.price) / base_quote.price * 100 for item in future]
+            lows = [(item["low"] - base_quote.price) / base_quote.price * 100 for item in future]
+            self.store.save_result_evaluation(uuid.uuid4().hex, run_id, row["code"], as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), None, True)
             evaluated += 1
         yield event.plain_result(f"回放验证（仅研究）：基准日 {as_of}，周期 {horizon} 日，完成 {evaluated} 条。结果已写入本地历史；不代表未来收益。")
 

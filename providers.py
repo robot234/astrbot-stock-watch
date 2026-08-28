@@ -38,6 +38,7 @@ class SinaQuoteProvider:
         self.tushare_url = str(tushare_url or "").strip() or "https://api.tushare.pro"
         self.tushare_token = str(tushare_token or "").strip()
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
+        self.history_bars: dict[str, list[dict[str, float | str]]] = {}
         self._last_tushare_date: str | None = None
 
     async def fetch_market_snapshot(self, daily_market_url: str = "", trade_date: str = "") -> list[Quote]:
@@ -153,6 +154,20 @@ class SinaQuoteProvider:
             if len(value) == 8 and value < end_date:
                 dates.append(value)
         return sorted(set(dates), reverse=True)
+
+    async def fetch_trade_calendar(self, trade_date: str) -> bool | None:
+        if not self.tushare_token:
+            return None
+        value = str(trade_date or datetime.now(CHINA_TZ).date().isoformat()).replace("-", "")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            payload = {"api_name": "trade_cal", "token": self.tushare_token, "params": {"exchange": "SSE", "start_date": value, "end_date": value}, "fields": "cal_date,is_open"}
+            response = await client.post(self.tushare_url, json=payload); response.raise_for_status()
+            body = response.json(); data = body.get("data") or {}; fields = list(data.get("fields") or [])
+            for values in data.get("items") or []:
+                row = dict(zip(fields, values))
+                if str(row.get("cal_date") or "").replace("-", "") == value:
+                    return str(row.get("is_open", "0")) in {"1", "True", "true"}
+        return None
 
     async def _fetch_eastmoney_snapshot(self, daily_market_url: str = "") -> list[Quote]:
         """Fetch one daily snapshot; a custom URL may expose the same JSON shape."""
@@ -289,13 +304,14 @@ class SinaQuoteProvider:
                     if cutoff and len(row_date) == 8 and row_date > cutoff:
                         continue
                     try:
-                        parsed.append((float(fields[2]), float(fields[3]), float(fields[4]), float(fields[5])))
+                        parsed.append((row_date, float(fields[1]), float(fields[3]), float(fields[4]), float(fields[2]), float(fields[5]), float(fields[6]) if len(fields) > 6 else 0.0))
                     except (TypeError, ValueError):
                         continue
-                closes = [item[0] for item in parsed]
-                highs = [item[1] for item in parsed]
-                lows = [item[2] for item in parsed]
-                volumes = [item[3] for item in parsed]
+                closes = [item[4] for item in parsed]
+                highs = [item[2] for item in parsed]
+                lows = [item[3] for item in parsed]
+                volumes = [item[5] for item in parsed]
+                self.history_bars[quote.code] = [{"trade_date": item[0], "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6]} for item in parsed]
                 if len(closes) < 20:
                     return
                 returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] > 0]

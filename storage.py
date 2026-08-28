@@ -107,6 +107,13 @@ class StockStore:
                     first_touch TEXT, sample_complete INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS daily_bars(
+                    code TEXT NOT NULL, trade_date TEXT NOT NULL, open REAL NOT NULL,
+                    high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
+                    volume REAL NOT NULL DEFAULT 0, amount REAL NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL,
+                    PRIMARY KEY(code, trade_date)
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
@@ -256,6 +263,24 @@ class StockStore:
             db.executemany("INSERT INTO daily_quotes(trade_date,code,name,price,prev_close,amount,pct_change,volume,fetched_at,source,provider_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
             db.execute("DELETE FROM daily_quotes WHERE trade_date < ?", (cutoff,))
         return len(rows)
+
+    def save_daily_bars(self, code: str, bars, source: str = "eastmoney") -> int:
+        rows = [(str(code), str(item.get("trade_date")), float(item.get("open") or 0), float(item.get("high") or 0), float(item.get("low") or 0), float(item.get("close") or 0), float(item.get("volume") or 0), float(item.get("amount") or 0), source, datetime.utcnow().isoformat()) for item in bars if item.get("trade_date")]
+        if not rows:
+            return 0
+        with self._connect() as db:
+            db.executemany("INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+
+    def daily_bars(self, code: str, after: str = "", before_or_equal: str = "") -> list[dict]:
+        with self._connect() as db:
+            sql = "SELECT * FROM daily_bars WHERE code=?"; args = [code]
+            if after:
+                sql += " AND trade_date>?"; args.append(after)
+            if before_or_equal:
+                sql += " AND trade_date<=?"; args.append(before_or_equal)
+            sql += " ORDER BY trade_date"
+            return [dict(row) for row in db.execute(sql, args)]
 
     def daily_quotes(self, trade_date: str) -> list:
         from .core import Quote
