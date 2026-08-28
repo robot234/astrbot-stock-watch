@@ -17,7 +17,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.5.2")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.6.1")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -173,6 +173,18 @@ class Main(Star):
         evidence = "、".join(annotation.get("evidence", [])[:3])
         return f"模型解读：{annotation.get('summary', '')}；风险{annotation.get('risk_level', 'unknown')}；依据：{evidence}"
 
+    def _cost_signal(self, quote, cost_price: float | None) -> str:
+        if not cost_price or quote.price <= 0:
+            return ""
+        change = (quote.price - cost_price) / cost_price * 100
+        profit = self._float("cost_profit_threshold_pct", 5.0, 0.1, 1000)
+        risk = self._float("cost_risk_threshold_pct", 5.0, 0.1, 1000)
+        if change >= profit:
+            return f"成本观察：{quote.code} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%，达到止盈观察阈值（仅研究/模拟盘，不自动下单）"
+        if change <= -risk:
+            return f"成本观察：{quote.code} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%，达到风险观察阈值（仅研究/模拟盘，不自动下单）"
+        return ""
+
     def _fresh_quotes(self, quotes):
         now = datetime.now(CHINA_TZ)
         max_age = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
@@ -257,6 +269,7 @@ class Main(Star):
                         logger.exception("[%s] 模型盘中解释失败", PLUGIN_NAME)
                 if in_trading_session():
                     watch = self.store.all_watch()
+                    watch_details = self.store.all_watch_details()
                     active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
                     if union:
@@ -268,6 +281,7 @@ class Main(Star):
                                 logger.exception("[%s] 盘中行情分批抓取失败：批次 %s", PLUGIN_NAME, start // 100 + 1)
                         quotes = self._fresh_quotes(raw_quotes)
                         if quotes:
+                            quotes_by_code = {quote.code: quote for quote in quotes}
                             candidates = await self._score_quotes(quotes, len(quotes))
                             by_code = {candidate.quote.code: candidate for candidate in candidates}
                             if self._bool("llm_annotation_enabled", False) and by_code and not self._annotation_task:
@@ -286,16 +300,21 @@ class Main(Star):
                                         self._annotation_task = asyncio.create_task(self._annotate_batches(batches))
                             for origin, codes in active.items():
                                 for code in codes:
+                                    quote = quotes_by_code.get(code)
                                     candidate = by_code.get(code)
-                                    if not candidate:
+                                    cost_signal = self._cost_signal(quote, watch_details.get(origin, {}).get(code)) if quote else ""
+                                    if not candidate and not cost_signal:
                                         continue
                                     claim_time = datetime.now(timezone.utc)
                                     if not self.store.claim_signal(origin, code, 600, now=claim_time):
                                         continue
-                                    text = "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate)
-                                    annotation = self._annotation_text(code)
-                                    if annotation:
-                                        text += "\n" + annotation
+                                    if cost_signal:
+                                        text = cost_signal
+                                    else:
+                                        text = "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate)
+                                        annotation = self._annotation_text(code)
+                                        if annotation:
+                                            text += "\n" + annotation
                                     sent = await self._push(origin, text)
                                     if not sent:
                                         self.store.release_signal(origin, code, claimed_at=claim_time)
@@ -366,16 +385,31 @@ class Main(Star):
             yield event.plain_result("全市场同步失败，请检查行情接口和插件配置。")
 
     @filter.command("自选")
-    async def watch(self, event: AstrMessageEvent, action: str = "", code: str = ""):
-        origin, action, codes = self._origin(event), str(action or "").strip().lower(), parse_codes(code)
+    async def watch(self, event: AstrMessageEvent, action: str = "", code: str = "", cost: str = ""):
+        origin, action = self._origin(event), str(action or "").strip().lower()
+        raw_parts = (str(code or "") + " " + str(cost or "")).replace("，", " ").replace(",", " ").split()
+        codes = parse_codes(raw_parts[:1])
+        cost_price = None
+        if len(raw_parts) > 1:
+            try:
+                parsed = float(raw_parts[1])
+                if parsed > 0:
+                    cost_price = parsed
+            except (TypeError, ValueError):
+                cost_price = None
         if action in {"添加", "add"} and codes:
-            ok = self.store.add_watch(origin, codes[0], self._int("watchlist_limit", 100, 1, 1000))
-            yield event.plain_result(("已加入自选：" if ok else "添加失败，可能已达到数量上限：") + codes[0])
+            if len(raw_parts) > 1 and cost_price is None:
+                yield event.plain_result("用法：/自选 添加 600000 [成本价]")
+                return
+            ok = self.store.add_watch(origin, codes[0], self._int("watchlist_limit", 100, 1, 1000), cost_price)
+            suffix = f"，成本价 {cost_price:.2f}" if cost_price else ""
+            yield event.plain_result(("已加入自选：" if ok else "添加失败，可能已达到数量上限：") + codes[0] + suffix)
         elif action in {"删除", "移除", "del", "remove"} and codes:
             yield event.plain_result(("已移除：" if self.store.remove_watch(origin, codes[0]) else "自选中没有：") + codes[0])
         else:
-            current = self.store.list_watch(origin)
-            yield event.plain_result("自选股：" + ("、".join(current) if current else "暂无。用 /自选 添加 600000"))
+            current = self.store.list_watch_details(origin)
+            values = [f"{code}(成本{cost:.2f})" if cost else code for code, cost in current]
+            yield event.plain_result("自选股：" + ("、".join(values) if values else "暂无。用 /自选 添加 600000 [成本价]"))
 
     @filter.command("监听")
     async def listen(self, event: AstrMessageEvent, action: str = "状态"):

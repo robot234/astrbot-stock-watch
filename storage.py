@@ -51,18 +51,47 @@ class StockStore:
                     PRIMARY KEY(origin, code)
                 );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
+            if "cost_price" not in columns:
+                db.execute("ALTER TABLE watchlist ADD COLUMN cost_price REAL NULL")
 
-    def add_watch(self, scope: str, code: str, limit: int) -> bool:
+    def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None) -> bool:
         with self._connect() as db:
+            exists = db.execute("SELECT 1 FROM watchlist WHERE scope=? AND code=?", (scope, code)).fetchone()
             count = db.execute("SELECT COUNT(*) FROM watchlist WHERE scope=?", (scope,)).fetchone()[0]
-            if count >= limit:
+            if not exists and count >= limit:
                 return False
-            db.execute("INSERT OR IGNORE INTO watchlist VALUES (?, ?, ?)", (scope, code, datetime.utcnow().isoformat()))
+            db.execute(
+                "INSERT INTO watchlist(scope, code, created_at, cost_price) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(scope, code) DO UPDATE SET cost_price=COALESCE(excluded.cost_price, watchlist.cost_price)",
+                (scope, code, datetime.utcnow().isoformat(), cost_price),
+            )
             return True
 
     def remove_watch(self, scope: str, code: str) -> bool:
         with self._connect() as db:
             return db.execute("DELETE FROM watchlist WHERE scope=? AND code=?", (scope, code)).rowcount > 0
+
+    def watch_cost(self, scope: str, code: str) -> float | None:
+        with self._connect() as db:
+            row = db.execute("SELECT cost_price FROM watchlist WHERE scope=? AND code=?", (scope, code)).fetchone()
+            try:
+                value = float(row[0]) if row and row[0] is not None else 0.0
+                return value if value > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+    def list_watch_details(self, scope: str) -> list[tuple[str, float | None]]:
+        with self._connect() as db:
+            rows = db.execute("SELECT code, cost_price FROM watchlist WHERE scope=? ORDER BY code", (scope,))
+            result = []
+            for code, cost in rows:
+                try:
+                    value = float(cost) if cost is not None and float(cost) > 0 else None
+                except (TypeError, ValueError):
+                    value = None
+                result.append((str(code), value))
+            return result
 
     def list_watch(self, scope: str) -> list[str]:
         with self._connect() as db:
@@ -73,6 +102,17 @@ class StockStore:
             result: dict[str, list[str]] = {}
             for row in db.execute("SELECT scope, code FROM watchlist ORDER BY scope, code"):
                 result.setdefault(str(row[0]), []).append(str(row[1]))
+            return result
+
+    def all_watch_details(self) -> dict[str, dict[str, float | None]]:
+        with self._connect() as db:
+            result: dict[str, dict[str, float | None]] = {}
+            for scope, code, cost in db.execute("SELECT scope, code, cost_price FROM watchlist ORDER BY scope, code"):
+                try:
+                    value = float(cost) if cost is not None and float(cost) > 0 else None
+                except (TypeError, ValueError):
+                    value = None
+                result.setdefault(str(scope), {})[str(code)] = value
             return result
 
     def set_subscription(self, origin: str, enabled: bool) -> None:
