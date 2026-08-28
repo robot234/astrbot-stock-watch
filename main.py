@@ -57,10 +57,12 @@ class Main(Star):
         logger.info("[%s] 已加载，研究/模拟盘模式=%s", PLUGIN_NAME, self._bool("paper_trading_only", True))
 
     async def terminate(self):
-        if self._annotation_task and not self._annotation_task.done():
-            self._annotation_task.cancel()
-            await asyncio.gather(self._annotation_task, return_exceptions=True)
-        self._annotation_task = None
+        if self._annotation_task:
+            task = self._annotation_task
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._annotation_task = None
         for task in self.tasks:
             task.cancel()
         if self.tasks:
@@ -155,6 +157,10 @@ class Main(Star):
         for code, annotation in annotations.items():
             self._annotation_cache[code] = (now, annotation)
 
+    async def _annotate_batches(self, batches):
+        for candidates in batches:
+            await self._annotate_batch(candidates)
+
     def _annotation_text(self, code: str) -> str:
         cached = self._annotation_cache.get(code)
         if not cached:
@@ -240,13 +246,16 @@ class Main(Star):
     async def _intraday_loop(self):
         while True:
             try:
+                if self._annotation_task and self._annotation_task.done():
+                    task = self._annotation_task
+                    self._annotation_task = None
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        logger.info("[%s] 模型盘中解释任务已取消", PLUGIN_NAME)
+                    except Exception:
+                        logger.exception("[%s] 模型盘中解释失败", PLUGIN_NAME)
                 if in_trading_session():
-                    if self._annotation_task and self._annotation_task.done():
-                        try:
-                            await self._annotation_task
-                        except Exception:
-                            logger.exception("[%s] 模型盘中解释失败", PLUGIN_NAME)
-                        self._annotation_task = None
                     watch = self.store.all_watch()
                     active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
@@ -265,10 +274,16 @@ class Main(Star):
                                 now = datetime.now(CHINA_TZ)
                                 interval = self._int("llm_annotation_interval_seconds", 180, 30, 3600)
                                 if not self._last_annotation_at or (now - self._last_annotation_at).total_seconds() >= interval:
-                                    top = sorted(by_code.values(), key=lambda item: (item.score, item.quote.amount), reverse=True)
-                                    top = top[: self._int("llm_annotation_limit", 10, 5, 20)]
+                                    limit = self._int("llm_annotation_limit", 10, 5, 20)
+                                    batches = []
+                                    for codes in active.values():
+                                        top = [by_code[code] for code in codes if code in by_code]
+                                        top.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
+                                        if top:
+                                            batches.append(top[:limit])
                                     self._last_annotation_at = now
-                                    self._annotation_task = asyncio.create_task(self._annotate_batch(top))
+                                    if batches:
+                                        self._annotation_task = asyncio.create_task(self._annotate_batches(batches))
                             for origin, codes in active.items():
                                 for code in codes:
                                     candidate = by_code.get(code)

@@ -364,28 +364,34 @@ class OpenAICompatibleClient:
             if content.startswith("```"):
                 content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S).strip()
             data = json.loads(content)
-            raw_items = data.get("items") if isinstance(data, dict) else None
+            raw_items = data.get("items") if isinstance(data, dict) and set(data) == {"items"} else None
             if not isinstance(raw_items, list):
                 return {}
             result: dict[str, dict] = {}
             for item in raw_items:
                 if not isinstance(item, dict):
                     return {}
-                code = str(item.get("code") or "")
-                risk = str(item.get("risk_level") or "unknown")
-                summary = str(item.get("summary") or "").strip()
+                required = {"code", "risk_level", "summary", "evidence", "confidence"}
+                if set(item) != required or not isinstance(item["code"], str) or not re.fullmatch(r"\d{6}", item["code"]):
+                    return {}
+                code = item["code"]
+                risk = item["risk_level"]
+                summary = item["summary"].strip() if isinstance(item["summary"], str) else ""
                 evidence = item.get("evidence")
                 confidence = item.get("confidence", 0.0)
-                if code not in allowed or code in result or risk not in {"low", "medium", "high", "unknown"}:
+                if code not in allowed or code in result or not isinstance(risk, str) or risk not in {"low", "medium", "high", "unknown"}:
                     return {}
                 if not summary or len(summary) > 240 or not isinstance(evidence, list) or len(evidence) > 5:
                     return {}
-                if not all(isinstance(value, str) and value.strip() for value in evidence):
+                if not all(isinstance(value, str) and value.strip() and len(value) <= 120 for value in evidence):
+                    return {}
+                if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
                     return {}
                 confidence = float(confidence)
                 if not 0 <= confidence <= 1:
                     return {}
-                result[code] = {"risk_level": risk, "summary": summary, "evidence": evidence[:5], "confidence": confidence}
+                safe_evidence = [re.sub(r"[\x00-\x1f\x7f]", " ", value).strip() for value in evidence[:5]]
+                result[code] = {"risk_level": risk, "summary": summary, "evidence": safe_evidence, "confidence": confidence}
             return result
         except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return {}
