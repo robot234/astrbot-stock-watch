@@ -26,6 +26,8 @@
   "llm_annotation_interval_seconds": {"type": "int", "description": "盘中模型解释间隔秒数", "default": 180},
   "llm_annotation_limit": {"type": "int", "description": "每批模型解释候选数量", "default": 10},
   "llm_annotation_max_tokens": {"type": "int", "description": "每批模型解释最大 Token 数", "default": 800},
+  "llm_min_interval_seconds": {"type": "int", "description": "模型请求最小间隔秒数", "default": 10},
+  "llm_daily_request_limit": {"type": "int", "description": "模型每日最大请求次数", "default": 100},
   "llm_base_url": {"type": "string", "description": "OpenAI 兼容接口地址", "default": "https://api.openai.com/v1"},
   "llm_api_key": {"type": "string", "description": "模型 API Key", "default": "", "obvious_hint": true},
   "llm_model": {"type": "string", "description": "模型名称", "default": "gpt-4o-mini"},

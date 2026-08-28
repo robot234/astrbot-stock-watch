@@ -6,7 +6,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import httpx
@@ -305,8 +305,10 @@ class RssNewsProvider:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 30):
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 30, min_interval: float = 10, daily_limit: int = 100):
         self.base_url, self.api_key, self.model, self.timeout = base_url.rstrip("/"), api_key, model, timeout
+        self.min_interval, self.daily_limit = max(0, min_interval), max(1, daily_limit)
+        self._annotation_times: list[datetime] = []
 
     async def summarize(self, items: list[NewsItem]) -> str:
         if not items or not self.api_key:
@@ -325,6 +327,13 @@ class OpenAICompatibleClient:
     async def annotate_candidates(self, candidates: list[Candidate], max_tokens: int = 800) -> dict[str, dict]:
         if not candidates or not self.api_key:
             return {}
+        now = datetime.now(timezone.utc)
+        self._annotation_times = [value for value in self._annotation_times if (now - value).total_seconds() < 86400]
+        if len(self._annotation_times) >= self.daily_limit:
+            return {}
+        if self._annotation_times and (now - self._annotation_times[-1]).total_seconds() < self.min_interval:
+            return {}
+        self._annotation_times.append(now)
         items = []
         for candidate in candidates[:20]:
             quote = candidate.quote

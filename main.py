@@ -38,6 +38,8 @@ class Main(Star):
             str(self.config.get("llm_api_key", "")),
             str(self.config.get("llm_model", "gpt-4o-mini")),
             max(timeout, 15),
+            self._float("llm_min_interval_seconds", 10, 0, 3600),
+            self._int("llm_daily_request_limit", 100, 1, 10000),
         )
         self.tasks: list[asyncio.Task] = []
         self.last_daily_scan: str | None = None
