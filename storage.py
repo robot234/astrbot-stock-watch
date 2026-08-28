@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -11,10 +12,18 @@ class StockStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    @contextmanager
     def _connect(self):
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _init_db(self):
         with self._connect() as db:
@@ -35,6 +44,12 @@ class StockStore:
                     PRIMARY KEY(trade_date, code)
                 );
                 CREATE TABLE IF NOT EXISTS seen_news(fingerprint TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS signal_events(
+                    origin TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    last_sent_at TEXT NOT NULL,
+                    PRIMARY KEY(origin, code)
+                );
             """)
 
     def add_watch(self, scope: str, code: str, limit: int) -> bool:
@@ -128,4 +143,32 @@ class StockStore:
             if db.execute("SELECT 1 FROM seen_news WHERE fingerprint=?", (fingerprint,)).fetchone():
                 return False
             db.execute("INSERT INTO seen_news VALUES (?, ?)", (fingerprint, datetime.utcnow().isoformat()))
+            return True
+
+    def claim_signal(self, origin: str, code: str, cooldown_seconds: int = 600, now: datetime | None = None) -> bool:
+        """Atomically claim a signal slot so cooldown survives restarts and concurrent loops."""
+        current = now or datetime.utcnow()
+        if current.tzinfo is not None:
+            current = current.astimezone(timezone.utc).replace(tzinfo=None)
+        current_iso = current.isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT last_sent_at FROM signal_events WHERE origin=? AND code=?",
+                (origin, code),
+            ).fetchone()
+            if row:
+                try:
+                    previous = datetime.fromisoformat(str(row[0]))
+                    if previous.tzinfo is not None:
+                        previous = previous.astimezone(timezone.utc).replace(tzinfo=None)
+                    if (current - previous).total_seconds() < max(0, cooldown_seconds):
+                        return False
+                except ValueError:
+                    pass
+            db.execute(
+                "INSERT INTO signal_events(origin, code, last_sent_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(origin, code) DO UPDATE SET last_sent_at=excluded.last_sent_at",
+                (origin, code, current_iso),
+            )
             return True

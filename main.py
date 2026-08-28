@@ -39,7 +39,6 @@ class Main(Star):
         )
         self.tasks: list[asyncio.Task] = []
         self.last_daily_scan: str | None = None
-        self.last_alert: dict[tuple[str, str], datetime] = {}
         self._daily_snapshot_lock = asyncio.Lock()
         self._daily_date_alias: dict[str, str] = {}
 
@@ -131,6 +130,18 @@ class Main(Star):
     async def _scan(self, codes: list[str], limit: int):
         return await self._score_quotes(await self.quotes.fetch_quotes(codes), limit)
 
+    def _fresh_quotes(self, quotes):
+        now = datetime.now(CHINA_TZ)
+        max_age = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
+        fresh = []
+        for quote in quotes:
+            fetched_at = quote.fetched_at
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=CHINA_TZ)
+            if 0 <= (now - fetched_at).total_seconds() <= max_age:
+                fresh.append(quote)
+        return fresh
+
     async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
         """Return a snapshot, whether it was fetched now, and its actual trade date."""
         lookup_date = self._daily_date_alias.get(trade_date, trade_date)
@@ -191,16 +202,20 @@ class Main(Star):
         while True:
             try:
                 if in_trading_session():
-                    for origin, codes in self.store.all_watch().items():
-                        if self.store.is_subscribed(origin) and codes:
-                            candidates = await self._scan(codes, min(len(codes), 20))
-                            for candidate in candidates:
-                                key = (origin, candidate.quote.code)
-                                previous = self.last_alert.get(key)
-                                if previous and (datetime.now(CHINA_TZ) - previous).total_seconds() < 600:
-                                    continue
-                                self.last_alert[key] = datetime.now(CHINA_TZ)
-                                await self._push(origin, "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate))
+                    watch = self.store.all_watch()
+                    active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
+                    union = list(dict.fromkeys(code for codes in active.values() for code in codes))
+                    if union:
+                        quotes = self._fresh_quotes(await self.quotes.fetch_quotes(union))
+                        if quotes:
+                            candidates = await self._score_quotes(quotes, len(quotes))
+                            by_code = {candidate.quote.code: candidate for candidate in candidates}
+                            for origin, codes in active.items():
+                                for code in codes:
+                                    candidate = by_code.get(code)
+                                    if not candidate or not self.store.claim_signal(origin, code, 600):
+                                        continue
+                                    await self._push(origin, "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate))
             except Exception:
                 logger.exception("[%s] 盘中监听失败", PLUGIN_NAME)
             await asyncio.sleep(self._int("quote_interval_seconds", 30, 10, 600))

@@ -108,7 +108,7 @@ def score_quote(quote: Quote) -> Candidate:
         if quote.pct_change > 0 and quote.volume_ratio > 1:
             score += 5
             reasons.append("价涨量增+5")
-        elif quote.pct_change < 0 and quote.volume_ratio < 1:
+        elif quote.pct_change < 0 and quote.volume_ratio > 1:
             score -= 5
             reasons.append("放量下跌-5")
     return Candidate(quote, score, reasons)
