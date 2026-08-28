@@ -12,7 +12,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
+from .core import CHINA_TZ, MinuteBarAggregator, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
 
@@ -49,6 +49,20 @@ class Main(Star):
         self._annotation_cache: dict[str, tuple[datetime, dict]] = {}
         self._last_annotation_at: datetime | None = None
         self._signal_observations: dict[tuple[str, str], deque[datetime]] = defaultdict(deque)
+        self.minute_bars = MinuteBarAggregator(self._int("minute_bar_history", 120, 10, 2000))
+        self._intraday_date: str | None = None
+        self._intraday_health = {
+            "last_cycle_at": None,
+            "last_success_at": None,
+            "last_error_at": None,
+            "cycles": 0,
+            "successful_cycles": 0,
+            "failed_cycles": 0,
+            "stale_quotes": 0,
+            "accepted_quotes": 0,
+            "completed_bars": 0,
+            "consecutive_failures": 0,
+        }
 
     async def initialize(self):
         if not self._bool("enabled", True):
@@ -219,6 +233,27 @@ class Main(Star):
                 fresh.append(quote)
         return fresh
 
+    def _health_text(self) -> str:
+        health = self._intraday_health
+        def display(value):
+            if not value:
+                return "暂无"
+            try:
+                return datetime.fromisoformat(value).astimezone(CHINA_TZ).strftime("%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                return str(value)
+        threshold = self._int("intraday_failure_threshold", 0, 0, 100)
+        suppressed = threshold > 0 and health["consecutive_failures"] >= threshold
+        state = "信号推送暂缓（行情源连续失败）" if suppressed else "正常"
+        return (
+            f"行情健康：{state}\n"
+            f"最近成功：{display(health['last_success_at'])}；最近轮询：{display(health['last_cycle_at'])}\n"
+            f"轮询 {health['cycles']} 次，成功 {health['successful_cycles']} 次，失败 {health['failed_cycles']} 次，"
+            f"连续失败 {health['consecutive_failures']} 次\n"
+            f"最近累计接收 {health['accepted_quotes']} 条有效行情，过期/丢弃 {health['stale_quotes']} 条；"
+            f"分钟线 {self.minute_bars.symbol_count()} 只股票/{self.minute_bars.bar_count()} 根已完成"
+        )
+
     async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
         """Return a snapshot, whether it was fetched now, and its actual trade date."""
         lookup_date = self._daily_date_alias.get(trade_date, trade_date)
@@ -277,6 +312,8 @@ class Main(Star):
 
     async def _intraday_loop(self):
         while True:
+            cycle_failed = False
+            health_counted = False
             try:
                 if self._annotation_task and self._annotation_task.done():
                     task = self._annotation_task
@@ -288,22 +325,46 @@ class Main(Star):
                     except Exception:
                         logger.exception("[%s] 模型盘中解释失败", PLUGIN_NAME)
                 if in_trading_session():
+                    today = datetime.now(CHINA_TZ).date().isoformat()
+                    if self._intraday_date != today:
+                        self.minute_bars.reset()
+                        self._intraday_date = today
                     watch = self.store.all_watch()
                     watch_details = self.store.all_watch_details()
                     active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
                     if union:
+                        health = self._intraday_health
+                        health["cycles"] += 1
+                        health["last_cycle_at"] = datetime.now(CHINA_TZ).isoformat()
                         raw_quotes = []
                         for start in range(0, len(union), 100):
                             try:
                                 raw_quotes.extend(await self.quotes.fetch_quotes(union[start:start + 100]))
                             except Exception:
+                                cycle_failed = True
                                 logger.exception("[%s] 盘中行情分批抓取失败：批次 %s", PLUGIN_NAME, start // 100 + 1)
                         quotes = self._fresh_quotes(raw_quotes)
+                        health["stale_quotes"] += max(0, len(raw_quotes) - len(quotes))
+                        health["accepted_quotes"] += len(quotes)
+                        if self._bool("minute_enabled", True):
+                            for quote in quotes:
+                                if self.minute_bars.update(quote) is not None:
+                                    health["completed_bars"] += 1
                         if quotes:
+                            if cycle_failed:
+                                health["failed_cycles"] += 1
+                                health["consecutive_failures"] += 1
+                                health["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
+                                health_counted = True
                             quotes_by_code = {quote.code: quote for quote in quotes}
                             candidates = await self._score_quotes(quotes, len(quotes))
                             by_code = {candidate.quote.code: candidate for candidate in candidates}
+                            if not cycle_failed:
+                                health["successful_cycles"] += 1
+                                health["last_success_at"] = datetime.now(CHINA_TZ).isoformat()
+                                health["consecutive_failures"] = 0
+                                health_counted = True
                             if self._bool("llm_annotation_enabled", False) and by_code and not self._annotation_task:
                                 now = datetime.now(CHINA_TZ)
                                 interval = self._int("llm_annotation_interval_seconds", 180, 30, 3600)
@@ -325,14 +386,17 @@ class Main(Star):
                                     cost_signal = self._cost_signal(quote, watch_details.get(origin, {}).get(code)) if quote else ""
                                     if not candidate and not cost_signal:
                                         continue
+                                    threshold = self._int("intraday_failure_threshold", 0, 0, 100)
+                                    if threshold > 0 and health["consecutive_failures"] >= threshold:
+                                        continue
+                                    if not cost_signal and self._bool("confirmation_enabled", False) and not self._confirmed_candidate(origin, code):
+                                        continue
                                     claim_time = datetime.now(timezone.utc)
                                     if not self.store.claim_signal(origin, code, 600, now=claim_time):
                                         continue
                                     if cost_signal:
                                         text = cost_signal
                                     else:
-                                        if self._bool("confirmation_enabled", False) and not self._confirmed_candidate(origin, code):
-                                            continue
                                         text = "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate)
                                         annotation = self._annotation_text(code)
                                         if annotation:
@@ -340,7 +404,17 @@ class Main(Star):
                                     sent = await self._push(origin, text)
                                     if not sent:
                                         self.store.release_signal(origin, code, claimed_at=claim_time)
+                        else:
+                            health["failed_cycles"] += 1
+                            health["consecutive_failures"] += 1
+                            health["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
+                            health_counted = True
             except Exception:
+                health = self._intraday_health
+                if not health_counted:
+                    health["failed_cycles"] += 1
+                    health["consecutive_failures"] += 1
+                    health["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
                 logger.exception("[%s] 盘中监听失败", PLUGIN_NAME)
             await asyncio.sleep(self._int("quote_interval_seconds", 30, 10, 600))
 
@@ -452,7 +526,17 @@ class Main(Star):
                     "已加入" if self._push_allowed(origin) else "未加入",
                     origin or "无法读取",
                 )
+                + "\n" + self._health_text()
             )
+
+    @filter.command("状态", alias={"行情状态"})
+    async def status(self, event: AstrMessageEvent):
+        origin = self._origin(event)
+        yield event.plain_result(
+            f"监听状态：{'开启' if self.store.is_subscribed(origin) else '关闭'}\n"
+            f"白名单：{'已加入' if self._push_allowed(origin) else '未加入'}\n"
+            + self._health_text()
+        )
 
     @filter.command("白名单")
     async def whitelist(self, event: AstrMessageEvent, action: str = "状态"):

@@ -44,6 +44,61 @@ class NewsItem:
     source: str = ""
 
 
+@dataclass(slots=True)
+class MinuteBar:
+    code: str
+    start: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    amount: float
+
+
+class MinuteBarAggregator:
+    def __init__(self, max_bars_per_code: int = 120):
+        self.max_bars_per_code = max(10, max_bars_per_code)
+        self.current: dict[str, MinuteBar] = {}
+        self.history: dict[str, list[MinuteBar]] = {}
+
+    def update(self, quote: Quote) -> MinuteBar | None:
+        if not isinstance(quote.fetched_at, datetime):
+            return None
+        timestamp = quote.fetched_at.astimezone(CHINA_TZ) if quote.fetched_at.tzinfo else quote.fetched_at.replace(tzinfo=CHINA_TZ)
+        start = timestamp.replace(second=0, microsecond=0)
+        previous = self.current.get(quote.code)
+        if previous and start < previous.start:
+            return None
+        if previous and previous.start == start:
+            previous.high = max(previous.high, quote.price)
+            previous.low = min(previous.low, quote.price)
+            previous.close = quote.price
+            previous.volume = quote.volume
+            previous.amount = quote.amount
+            return None
+        completed = previous
+        self.current[quote.code] = MinuteBar(quote.code, start, quote.price, quote.price, quote.price, quote.price, quote.volume, quote.amount)
+        if completed:
+            bars = self.history.setdefault(quote.code, [])
+            bars.append(completed)
+            del bars[:-self.max_bars_per_code]
+        return completed
+
+    def bars(self, code: str) -> list[MinuteBar]:
+        return list(self.history.get(code, []))
+
+    def reset(self) -> None:
+        self.current.clear()
+        self.history.clear()
+
+    def symbol_count(self) -> int:
+        return len(set(self.current) | set(self.history))
+
+    def bar_count(self) -> int:
+        return sum(len(values) for values in self.history.values())
+
+
 def normalize_code(code: str) -> str:
     value = str(code or "").strip().lower()
     for prefix in ("sh", "sz", "bj"):

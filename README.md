@@ -32,6 +32,7 @@
 /监听 开启
 /监听 关闭
 /监听 状态
+/状态
 /白名单 开启
 /白名单 关闭
 /白名单 列表
@@ -51,6 +52,9 @@
 - `tushare_url`：Tushare Pro 接口地址，通常留空即可，默认使用 `https://api.tushare.pro`。
 - `tushare_token`：Tushare Pro Token。填写后每日快照优先调用 Tushare `daily` 接口；留空则不调用 Tushare，使用东方财富。
 - `quote_interval_seconds`：盘中自选股行情轮询间隔，默认 30 秒。
+- `minute_enabled`：是否记录盘中一分钟聚合行情，默认开启；只用于观测和后续指标，不改变现有评分。
+- `minute_bar_history`：每只股票保留的已完成分钟线数量，默认 120 根。
+- `intraday_failure_threshold`：连续行情失败达到该次数后暂缓信号推送；默认 0，仅统计不暂缓。
 - `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送止盈观察，默认 5%。
 - `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%。
 - `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号。
