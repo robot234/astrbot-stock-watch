@@ -9,6 +9,10 @@ from pathlib import Path
 
 
 class StockStore:
+    @staticmethod
+    def _date_norm(value: str) -> str:
+        digits = str(value or "").replace("-", "")
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}" if len(digits) == 8 else str(value or "")
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,7 +269,7 @@ class StockStore:
         return len(rows)
 
     def save_daily_bars(self, code: str, bars, source: str = "eastmoney") -> int:
-        rows = [(str(code), str(item.get("trade_date")), float(item.get("open") or 0), float(item.get("high") or 0), float(item.get("low") or 0), float(item.get("close") or 0), float(item.get("volume") or 0), float(item.get("amount") or 0), source, datetime.utcnow().isoformat()) for item in bars if item.get("trade_date")]
+        rows = [(str(code), self._date_norm(str(item.get("trade_date"))), float(item.get("open") or 0), float(item.get("high") or 0), float(item.get("low") or 0), float(item.get("close") or 0), float(item.get("volume") or 0), float(item.get("amount") or 0), source, datetime.utcnow().isoformat()) for item in bars if item.get("trade_date")]
         if not rows:
             return 0
         with self._connect() as db:
@@ -273,6 +277,8 @@ class StockStore:
         return len(rows)
 
     def daily_bars(self, code: str, after: str = "", before_or_equal: str = "") -> list[dict]:
+        after = self._date_norm(after) if after else ""
+        before_or_equal = self._date_norm(before_or_equal) if before_or_equal else ""
         with self._connect() as db:
             sql = "SELECT * FROM daily_bars WHERE code=?"; args = [code]
             if after:

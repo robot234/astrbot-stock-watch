@@ -311,7 +311,7 @@ class SinaQuoteProvider:
                 highs = [item[2] for item in parsed]
                 lows = [item[3] for item in parsed]
                 volumes = [item[5] for item in parsed]
-                self.history_bars[quote.code] = [{"trade_date": item[0], "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6]} for item in parsed]
+                self.history_bars[quote.code] = [{"trade_date": f"{item[0][:4]}-{item[0][4:6]}-{item[0][6:8]}", "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6]} for item in parsed]
                 if len(closes) < 20:
                     return
                 returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] > 0]

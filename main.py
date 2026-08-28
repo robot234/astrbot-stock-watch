@@ -642,6 +642,24 @@ class Main(Star):
             logger.exception("[%s] 手动选股失败", PLUGIN_NAME)
             yield event.plain_result("选股暂时失败，请检查行情接口和插件配置。")
 
+    @filter.command("股票帮助", alias={"选股帮助", "股票指令"})
+    async def stock_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "A股研究助手指令\n"
+            "/全市场选股 或 /股票同步：同步全市场并生成候选\n"
+            "/选股 [数量]：按配置股票池选股\n"
+            "/候选池：查看最近保存的候选和风险状态\n"
+            "/行情 600000：查看单只股票指标和参考价位\n"
+            "/自选 添加 600000 [成本价]：加入自选\n"
+            "/自选 删除 600000：移除自选\n"
+            "/监听 开启|关闭|状态：控制盘中和故事提醒\n"
+            "/白名单 开启|关闭|列表：管理推送会话\n"
+            "/研究状态 或 /数据质量：查看运行、来源和质量\n"
+            "/验证 [天数] 或 /回放 [天数]：回放候选后续行情\n"
+            "/故事 [关键词]：查看新闻故事\n"
+            "所有结果仅供研究和模拟盘，不自动下单。"
+        )
+
     @filter.command("全市场选股", alias={"全市场同步", "全市场股票同步", "股票同步"})
     async def market_sync(self, event: AstrMessageEvent, count: int = 0):
         """Manually fetch/cache today's full-market snapshot and score it immediately."""

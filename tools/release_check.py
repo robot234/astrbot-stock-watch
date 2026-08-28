@@ -10,7 +10,7 @@ def main() -> int:
     if run("git", "status", "--short"):
         print("FAIL dirty worktree"); return 1
     json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-    forbidden = re.compile(r"(password|secret|api[_-]?key)\\s*[:=]\\s*['\"][^'\"]+", re.I)
+    forbidden = re.compile(r"(password|secret|api[_-]?key)\s*[:=]\s*['\"][^'\"]+", re.I)
     for path in ROOT.glob("*.py"):
         if forbidden.search(path.read_text(encoding="utf-8")):
             print("FAIL possible secret", path); return 1
