@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from astrbot.api import logger
@@ -230,11 +230,14 @@ class Main(Star):
                             for origin, codes in active.items():
                                 for code in codes:
                                     candidate = by_code.get(code)
-                                    if not candidate or not self.store.claim_signal(origin, code, 600):
+                                    if not candidate:
+                                        continue
+                                    claim_time = datetime.now(timezone.utc)
+                                    if not self.store.claim_signal(origin, code, 600, now=claim_time):
                                         continue
                                     sent = await self._push(origin, "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate))
                                     if not sent:
-                                        self.store.release_signal(origin, code)
+                                        self.store.release_signal(origin, code, claimed_at=claim_time)
             except Exception:
                 logger.exception("[%s] 盘中监听失败", PLUGIN_NAME)
             await asyncio.sleep(self._int("quote_interval_seconds", 30, 10, 600))

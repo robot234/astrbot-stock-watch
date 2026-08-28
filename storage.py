@@ -173,6 +173,15 @@ class StockStore:
             )
             return True
 
-    def release_signal(self, origin: str, code: str) -> None:
+    def release_signal(self, origin: str, code: str, claimed_at: datetime | None = None) -> None:
         with self._connect() as db:
-            db.execute("DELETE FROM signal_events WHERE origin=? AND code=?", (origin, code))
+            if claimed_at is None:
+                db.execute("DELETE FROM signal_events WHERE origin=? AND code=?", (origin, code))
+                return
+            current = claimed_at
+            if current.tzinfo is not None:
+                current = current.astimezone(timezone.utc).replace(tzinfo=None)
+            db.execute(
+                "DELETE FROM signal_events WHERE origin=? AND code=? AND last_sent_at=?",
+                (origin, code, current.isoformat()),
+            )
