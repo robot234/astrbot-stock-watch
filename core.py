@@ -61,6 +61,7 @@ class MinuteBarAggregator:
         self.max_bars_per_code = max(10, max_bars_per_code)
         self.current: dict[str, MinuteBar] = {}
         self.history: dict[str, list[MinuteBar]] = {}
+        self._baseline: dict[str, tuple[object, float, float]] = {}
 
     def update(self, quote: Quote) -> MinuteBar | None:
         if not isinstance(quote.fetched_at, datetime):
@@ -70,15 +71,32 @@ class MinuteBarAggregator:
         previous = self.current.get(quote.code)
         if previous and start < previous.start:
             return None
+        day = start.date()
+        try:
+            volume = max(0.0, float(quote.volume))
+            amount = max(0.0, float(quote.amount))
+        except (TypeError, ValueError):
+            return None
+        baseline = self._baseline.get(quote.code)
+        day_changed = baseline is not None and baseline[0] != day
+        if day_changed:
+            previous = None
+            self.current.pop(quote.code, None)
+        if baseline is None or day_changed:
+            delta_volume = delta_amount = 0.0
+        else:
+            delta_volume = volume - baseline[1] if volume >= baseline[1] else volume
+            delta_amount = amount - baseline[2] if amount >= baseline[2] else amount
+        self._baseline[quote.code] = (day, volume, amount)
         if previous and previous.start == start:
             previous.high = max(previous.high, quote.price)
             previous.low = min(previous.low, quote.price)
             previous.close = quote.price
-            previous.volume = quote.volume
-            previous.amount = quote.amount
+            previous.volume += delta_volume
+            previous.amount += delta_amount
             return None
         completed = previous
-        self.current[quote.code] = MinuteBar(quote.code, start, quote.price, quote.price, quote.price, quote.price, quote.volume, quote.amount)
+        self.current[quote.code] = MinuteBar(quote.code, start, quote.price, quote.price, quote.price, quote.price, delta_volume, delta_amount)
         if completed:
             bars = self.history.setdefault(quote.code, [])
             bars.append(completed)
@@ -91,6 +109,7 @@ class MinuteBarAggregator:
     def reset(self) -> None:
         self.current.clear()
         self.history.clear()
+        self._baseline.clear()
 
     def symbol_count(self) -> int:
         return len(set(self.current) | set(self.history))

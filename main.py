@@ -63,6 +63,15 @@ class Main(Star):
             "completed_bars": 0,
             "consecutive_failures": 0,
         }
+        self._source_health = {
+            "sina": {
+                "batches": 0,
+                "successes": 0,
+                "failures": 0,
+                "last_success_at": None,
+                "last_error_at": None,
+            }
+        }
 
     async def initialize(self):
         if not self._bool("enabled", True):
@@ -245,13 +254,16 @@ class Main(Star):
         threshold = self._int("intraday_failure_threshold", 0, 0, 100)
         suppressed = threshold > 0 and health["consecutive_failures"] >= threshold
         state = "信号推送暂缓（行情源连续失败）" if suppressed else "正常"
+        sina = self._source_health["sina"]
         return (
             f"行情健康：{state}\n"
-            f"最近成功：{display(health['last_success_at'])}；最近轮询：{display(health['last_cycle_at'])}\n"
+            f"最近成功：{display(health['last_success_at'])}；最近错误：{display(health['last_error_at'])}；最近轮询：{display(health['last_cycle_at'])}\n"
             f"轮询 {health['cycles']} 次，成功 {health['successful_cycles']} 次，失败 {health['failed_cycles']} 次，"
             f"连续失败 {health['consecutive_failures']} 次\n"
             f"最近累计接收 {health['accepted_quotes']} 条有效行情，过期/丢弃 {health['stale_quotes']} 条；"
-            f"分钟线 {self.minute_bars.symbol_count()} 只股票/{self.minute_bars.bar_count()} 根已完成"
+            f"分钟线 {self.minute_bars.symbol_count()} 只股票/{self.minute_bars.bar_count()} 根已完成\n"
+            f"新浪行情批次：{sina['successes']}/{sina['batches']} 成功，失败 {sina['failures']} 次；"
+            f"最近错误：{display(sina['last_error_at'])}"
         )
 
     async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
@@ -339,10 +351,16 @@ class Main(Star):
                         health["last_cycle_at"] = datetime.now(CHINA_TZ).isoformat()
                         raw_quotes = []
                         for start in range(0, len(union), 100):
+                            source = self._source_health["sina"]
+                            source["batches"] += 1
                             try:
                                 raw_quotes.extend(await self.quotes.fetch_quotes(union[start:start + 100]))
+                                source["successes"] += 1
+                                source["last_success_at"] = datetime.now(CHINA_TZ).isoformat()
                             except Exception:
                                 cycle_failed = True
+                                source["failures"] += 1
+                                source["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
                                 logger.exception("[%s] 盘中行情分批抓取失败：批次 %s", PLUGIN_NAME, start // 100 + 1)
                         quotes = self._fresh_quotes(raw_quotes)
                         health["stale_quotes"] += max(0, len(raw_quotes) - len(quotes))
