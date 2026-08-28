@@ -534,6 +534,8 @@ class Main(Star):
                                         self.store.reset_confirmation(origin, "minute:" + code)
                                     if not candidate and not cost_signal and not minute_signal:
                                         continue
+                                    if candidate and candidate.risk_level in {"blocked", "unknown"} and not cost_signal and not minute_signal:
+                                        continue
                                     threshold = self._int("intraday_failure_threshold", 0, 0, 100)
                                     if threshold > 0 and health["consecutive_failures"] >= threshold:
                                         continue
@@ -555,7 +557,8 @@ class Main(Star):
                                     elif is_minute:
                                         text = minute_signal
                                     else:
-                                        text = "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate)
+                                        prefix = "盘中观察信号（需人工复核）" if candidate.risk_level == "watch_only" else "盘中信号"
+                                        text = prefix + "（仅研究/模拟盘）\n" + format_candidate(candidate)
                                         annotation = self._annotation_text(code)
                                         if annotation:
                                             text += "\n" + annotation
