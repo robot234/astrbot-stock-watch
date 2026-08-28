@@ -199,4 +199,17 @@ def in_trading_session(now: datetime | None = None) -> bool:
 def format_candidate(candidate: Candidate) -> str:
     quote = candidate.quote
     why = "、".join(candidate.reasons) or "暂无技术加分"
-    return f"{quote.code} {quote.name} 现价{quote.price:.2f} 涨跌{quote.pct_change:+.2f}% 成交额{quote.amount:.0f} 分数{candidate.score}（{why}）"
+    metrics = []
+    if quote.rsi6 is not None:
+        metrics.append(f"RSI6={quote.rsi6:.1f}")
+    if quote.ma5 is not None and quote.ma10 is not None and quote.ma20 is not None:
+        metrics.append(f"MA5/10/20={quote.ma5:.2f}/{quote.ma10:.2f}/{quote.ma20:.2f}")
+    if quote.volume_ratio is not None:
+        metrics.append(f"量比={quote.volume_ratio:.2f}")
+    evidence = "、".join(metrics) or "当前可用技术指标不足"
+    advice = "列入观察，人工复核日线趋势、基本面、公告和流动性后再决定是否继续研究"
+    return (
+        f"{quote.code} {quote.name} 现价{quote.price:.2f} 涨跌{quote.pct_change:+.2f}% 成交额{quote.amount:.0f} "
+        f"分数{candidate.score}（{why}）\n"
+        f"依据：{evidence}；风险：技术指标可能滞后，数据可能延迟或不完整，评分不代表收益概率；研究动作建议：{advice}。"
+    )

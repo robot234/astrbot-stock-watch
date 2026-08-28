@@ -60,8 +60,9 @@
 - `minute_trigger_consecutive_up`：连续上涨根数，默认 3 根。
 - `minute_trigger_step_pct`、`minute_trigger_breakout_pct`：每根最小涨幅和突破幅度，默认 0.1% 和 0.5%。
 - `intraday_failure_threshold`：连续行情失败达到该次数后暂缓信号推送；默认 0，仅统计不暂缓。
-- `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送止盈观察，默认 5%。
-- `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%。
+- `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送止盈观察，默认 5%；这是观察阈值，不是保证止盈价，未计手续费和滑点。
+- `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%；这是风险观察阈值，不是自动止损价。
+- `min_score`：技术评分最低分；分数只是规则筛选结果，不代表收益概率。
 - `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号，确认进度会保存到 SQLite。
 - `confirmation_periods`：连续确认次数，默认 2 次。
 - `confirmation_max_gap_seconds`：连续确认最大间隔，默认 90 秒。

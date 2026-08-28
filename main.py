@@ -90,9 +90,12 @@ class Main(Star):
         if completed.close < reference * (1 + breakout_pct / 100):
             return ""
         return (
-            "分钟触发（仅研究/模拟盘）\n"
+            "分钟触发\n"
             f"{quote.code} {quote.name} {completed.start:%H:%M} 收盘{completed.close:.2f}："
-            f"连续上涨{consecutive}根，突破近{lookback}根高点+{breakout_pct:.2f}%（仅提醒，不自动下单）"
+            f"连续上涨{consecutive}根，突破近{lookback}根高点+{breakout_pct:.2f}%\n"
+            f"依据：每根涨幅至少{step_pct:.2f}%，最新收盘高于参考高点{breakout_pct:.2f}%。\n"
+            "风险：分钟级波动和假突破较多，当前规则未确认后续成交量。\n"
+            "研究动作建议：复核日线趋势、量价和公告后再决定观望或跟踪；仅研究/模拟盘，不自动下单。"
         )
 
     async def initialize(self):
@@ -230,10 +233,21 @@ class Main(Star):
         change = (quote.price - cost_price) / cost_price * 100
         profit = self._float("cost_profit_threshold_pct", 5.0, 0.1, 1000)
         risk = self._float("cost_risk_threshold_pct", 5.0, 0.1, 1000)
+        label = f"{quote.name or quote.code}（{quote.code}）"
         if change >= profit:
-            return f"成本观察：{quote.code} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%，达到止盈观察阈值（仅研究/模拟盘，不自动下单）"
+            return (
+                f"成本观察：{label} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%\n"
+                f"依据：相对成本达到 +{profit:.2f}% 的止盈观察阈值。\n"
+                "风险：成本价只是单点参考，未计手续费和滑点，行情可能继续波动或反转。\n"
+                "研究动作建议：结合 RSI、均线、量价和公告复核，再评估是否分批止盈；仅研究/模拟盘，不自动下单。"
+            )
         if change <= -risk:
-            return f"成本观察：{quote.code} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%，达到风险观察阈值（仅研究/模拟盘，不自动下单）"
+            return (
+                f"成本观察：{label} 现价{quote.price:.2f}，成本{cost_price:.2f}，相对成本{change:+.2f}%\n"
+                f"依据：相对成本达到 -{risk:.2f}% 的风险观察阈值。\n"
+                "风险：成本价不代表合理价值，未计手续费和滑点，弱势行情可能继续下探。\n"
+                "研究动作建议：先复核日线趋势、基本面和自身风险承受，再制定分批减仓或观望计划；仅研究/模拟盘，不自动下单。"
+            )
         return ""
 
     def _fresh_quotes(self, quotes):
