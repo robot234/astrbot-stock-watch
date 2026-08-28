@@ -84,6 +84,10 @@
 
 - `news_rss_url`：RSS 或公告聚合地址；留空则关闭故事监听。
 - `llm_enabled`：是否调用模型 API 总结新闻，默认 `false`。
+- `llm_annotation_enabled`：是否调用模型 API 解释盘中候选，默认 `false`。模型只补充解释，不改变规则信号。
+- `llm_annotation_interval_seconds`：盘中模型解释间隔，默认 180 秒。
+- `llm_annotation_limit`：每批模型解释候选数量，默认 10 只。
+- `llm_annotation_max_tokens`：每批模型解释最大 Token 数，默认 800。
 - `llm_base_url`、`llm_api_key`、`llm_model`：OpenAI 兼容接口配置。
 - `paper_trading_only`：保持为 `true`。本项目没有下单接口。
 

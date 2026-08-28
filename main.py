@@ -41,6 +41,9 @@ class Main(Star):
         self.last_daily_scan: str | None = None
         self._daily_snapshot_lock = asyncio.Lock()
         self._daily_date_alias: dict[str, str] = {}
+        self._annotation_task: asyncio.Task | None = None
+        self._annotation_cache: dict[str, tuple[datetime, dict]] = {}
+        self._last_annotation_at: datetime | None = None
 
     async def initialize(self):
         if not self._bool("enabled", True):
@@ -54,6 +57,10 @@ class Main(Star):
         logger.info("[%s] 已加载，研究/模拟盘模式=%s", PLUGIN_NAME, self._bool("paper_trading_only", True))
 
     async def terminate(self):
+        if self._annotation_task and not self._annotation_task.done():
+            self._annotation_task.cancel()
+            await asyncio.gather(self._annotation_task, return_exceptions=True)
+        self._annotation_task = None
         for task in self.tasks:
             task.cancel()
         if self.tasks:
@@ -139,6 +146,27 @@ class Main(Star):
     async def _scan(self, codes: list[str], limit: int):
         return await self._score_quotes(await self.quotes.fetch_quotes(codes), limit)
 
+    async def _annotate_batch(self, candidates):
+        annotations = await self.llm.annotate_candidates(
+            candidates,
+            self._int("llm_annotation_max_tokens", 800, 200, 2000),
+        )
+        now = datetime.now(CHINA_TZ)
+        for code, annotation in annotations.items():
+            self._annotation_cache[code] = (now, annotation)
+
+    def _annotation_text(self, code: str) -> str:
+        cached = self._annotation_cache.get(code)
+        if not cached:
+            return ""
+        created_at, annotation = cached
+        max_age = max(60, self._int("llm_annotation_interval_seconds", 180, 30, 3600) * 2)
+        if (datetime.now(CHINA_TZ) - created_at).total_seconds() > max_age:
+            self._annotation_cache.pop(code, None)
+            return ""
+        evidence = "、".join(annotation.get("evidence", [])[:3])
+        return f"模型解读：{annotation.get('summary', '')}；风险{annotation.get('risk_level', 'unknown')}；依据：{evidence}"
+
     def _fresh_quotes(self, quotes):
         now = datetime.now(CHINA_TZ)
         max_age = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
@@ -213,6 +241,12 @@ class Main(Star):
         while True:
             try:
                 if in_trading_session():
+                    if self._annotation_task and self._annotation_task.done():
+                        try:
+                            await self._annotation_task
+                        except Exception:
+                            logger.exception("[%s] 模型盘中解释失败", PLUGIN_NAME)
+                        self._annotation_task = None
                     watch = self.store.all_watch()
                     active = {origin: codes for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
@@ -227,6 +261,14 @@ class Main(Star):
                         if quotes:
                             candidates = await self._score_quotes(quotes, len(quotes))
                             by_code = {candidate.quote.code: candidate for candidate in candidates}
+                            if self._bool("llm_annotation_enabled", False) and by_code and not self._annotation_task:
+                                now = datetime.now(CHINA_TZ)
+                                interval = self._int("llm_annotation_interval_seconds", 180, 30, 3600)
+                                if not self._last_annotation_at or (now - self._last_annotation_at).total_seconds() >= interval:
+                                    top = sorted(by_code.values(), key=lambda item: (item.score, item.quote.amount), reverse=True)
+                                    top = top[: self._int("llm_annotation_limit", 10, 5, 20)]
+                                    self._last_annotation_at = now
+                                    self._annotation_task = asyncio.create_task(self._annotate_batch(top))
                             for origin, codes in active.items():
                                 for code in codes:
                                     candidate = by_code.get(code)
@@ -235,7 +277,11 @@ class Main(Star):
                                     claim_time = datetime.now(timezone.utc)
                                     if not self.store.claim_signal(origin, code, 600, now=claim_time):
                                         continue
-                                    sent = await self._push(origin, "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate))
+                                    text = "盘中信号（仅研究/模拟盘）\n" + format_candidate(candidate)
+                                    annotation = self._annotation_text(code)
+                                    if annotation:
+                                        text += "\n" + annotation
+                                    sent = await self._push(origin, text)
                                     if not sent:
                                         self.store.release_signal(origin, code, claimed_at=claim_time)
             except Exception:

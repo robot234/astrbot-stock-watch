@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import Iterable
 
 import httpx
 
-from .core import CHINA_TZ, NewsItem, Quote, calc_rsi, normalize_code, simple_moving_average
+from .core import CHINA_TZ, Candidate, NewsItem, Quote, calc_rsi, normalize_code, simple_moving_average
 
 
 def _sina_symbol(code: str) -> str:
@@ -320,6 +321,74 @@ class OpenAICompatibleClient:
             response.raise_for_status()
             data = response.json()
         return str(data["choices"][0]["message"]["content"]).strip()
+
+    async def annotate_candidates(self, candidates: list[Candidate], max_tokens: int = 800) -> dict[str, dict]:
+        if not candidates or not self.api_key:
+            return {}
+        items = []
+        for candidate in candidates[:20]:
+            quote = candidate.quote
+            items.append({
+                "code": quote.code,
+                "name": quote.name[:64],
+                "price": quote.price,
+                "pct_change": quote.pct_change,
+                "amount": quote.amount,
+                "volume": quote.volume,
+                "score": candidate.score,
+                "reasons": candidate.reasons[:6],
+                "rsi6": quote.rsi6,
+                "ma5": quote.ma5,
+                "ma10": quote.ma10,
+                "ma20": quote.ma20,
+                "volume_ratio": quote.volume_ratio,
+                "fetched_at": quote.fetched_at.isoformat(),
+            })
+        allowed = {item["code"] for item in items}
+        payload = {
+            "model": self.model,
+            "temperature": 0.1,
+            "max_tokens": max(200, min(int(max_tokens), 2000)),
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "你是A股盘中信号解释助手。只能依据输入JSON，不得补造行情或新闻。只输出JSON，不给出买入、卖出、目标价或仓位建议。每项必须引用输入中的理由或指标作为evidence。"},
+                {"role": "user", "content": json.dumps({"schema_version": "1", "items": items}, ensure_ascii=False)},
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=min(self.timeout, 15)) as client:
+                response = await client.post(self.base_url + "/chat/completions", json=payload, headers={"Authorization": "Bearer " + self.api_key})
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+            content = str(content).strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S).strip()
+            data = json.loads(content)
+            raw_items = data.get("items") if isinstance(data, dict) else None
+            if not isinstance(raw_items, list):
+                return {}
+            result: dict[str, dict] = {}
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    return {}
+                code = str(item.get("code") or "")
+                risk = str(item.get("risk_level") or "unknown")
+                summary = str(item.get("summary") or "").strip()
+                evidence = item.get("evidence")
+                confidence = item.get("confidence", 0.0)
+                if code not in allowed or code in result or risk not in {"low", "medium", "high", "unknown"}:
+                    return {}
+                if not summary or len(summary) > 240 or not isinstance(evidence, list) or len(evidence) > 5:
+                    return {}
+                if not all(isinstance(value, str) and value.strip() for value in evidence):
+                    return {}
+                confidence = float(confidence)
+                if not 0 <= confidence <= 1:
+                    return {}
+                result[code] = {"risk_level": risk, "summary": summary, "evidence": evidence[:5], "confidence": confidence}
+            return result
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
+            return {}
 
 
 def news_fingerprint(item: NewsItem) -> str:
