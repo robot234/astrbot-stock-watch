@@ -260,6 +260,24 @@ class SinaQuoteProvider:
             result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, source="sina", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
         return result
 
+    async def fetch_custom_factors(self, url: str, codes: Iterable[str], as_of: str = "") -> dict[str, dict]:
+        """Optional JSON factor source: {data:[{code,industry_score,fundamental_score}]}.
+        Values are annotations only; unknown/malformed rows are ignored.
+        """
+        if not str(url or "").strip():
+            return {}
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            response = await client.get(url, params={"codes": ",".join(codes), "as_of": as_of})
+            response.raise_for_status()
+            payload = response.json()
+        rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+        result = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not row.get("code"):
+                continue
+            result[str(row["code"])[-6:]] = row
+        return result
+
     async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> None:
         """Fetch a short adjusted daily history for the small candidate set."""
         if not quotes:

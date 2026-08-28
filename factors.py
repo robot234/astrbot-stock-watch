@@ -15,7 +15,9 @@ def percentile_centered(values, value):
     current = _finite(value)
     if current is None or len(data) < 5:
         return None
-    rank = sum(item <= current for item in data) / len(data)
+    less = sum(item < current for item in data)
+    equal = sum(item == current for item in data)
+    rank = (less + 0.5 * equal) / len(data)
     return round(2 * rank - 1, 4)
 
 def industry_strength(industry_return5, benchmark_return5, breadth, amount_ratio):

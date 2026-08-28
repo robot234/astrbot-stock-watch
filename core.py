@@ -30,6 +30,8 @@ class Quote:
     volatility20: float | None = None
     momentum5: float | None = None
     momentum20: float | None = None
+    industry_score: float | None = None
+    fundamental_score: float | None = None
     history_days: int = 0
     source: str = ""
     provider_ts: datetime | None = None
@@ -393,6 +395,9 @@ def format_candidate(candidate: Candidate) -> str:
     if quote.momentum5 is not None and quote.momentum20 is not None:
         metrics.append(f"5/20日动量={quote.momentum5:+.1f}%/{quote.momentum20:+.1f}%")
     evidence = "、".join(metrics) or "当前可用技术指标不足"
+    factor_line = ""
+    if quote.industry_score is not None or quote.fundamental_score is not None:
+        factor_line = f"因子参考：行业{quote.industry_score if quote.industry_score is not None else '未知'}，基本面{quote.fundamental_score if quote.fundamental_score is not None else '未知'}\n"
     risk_items: list[str] = list(candidate.risk_flags)
     if any("空头" in reason or "放量下跌" in reason for reason in candidate.reasons):
         risk_items.append("均线偏弱或出现放量下跌")
@@ -412,6 +417,7 @@ def format_candidate(candidate: Candidate) -> str:
         f"行情：现价{quote.price:.2f}，涨跌{quote.pct_change:+.2f}%，成交额{quote.amount:.0f}\n"
         f"技术评分：{candidate.score}/{candidate.score_max}（规则加分：{why}）\n"
         f"技术证据：{evidence}\n"
+        f"{factor_line}"
         f"参考价位：{levels}\n"
         f"风险审核：{candidate.risk_level}；{risk_text}\n"
         f"研究结论：{conclusion}。"

@@ -234,7 +234,23 @@ class Main(Star):
         self._last_screen_diagnostics = {"input": len(quotes), "tradable": len(tradable), "enriched": sum(1 for q in enrich_targets if q.history_days >= 20)}
         scored = [score_quote(quote) for quote in tradable]
         market = assess_market_context(quotes)
-        adjustment = market_adjustment(market.regime)
+        factor_url = str(self.config.get("factor_data_url", "")).strip()
+        if factor_url:
+            try:
+                raw_factors = await self.quotes.fetch_custom_factors(factor_url, [q.code for q in enrich_targets], as_of)
+                for item in scored:
+                    row = raw_factors.get(item.quote.code)
+                    if row:
+                        item.quote.industry_score = float(row.get("industry_score")) if row.get("industry_score") is not None else None
+                        item.quote.fundamental_score = float(row.get("fundamental_score")) if row.get("fundamental_score") is not None else None
+                        if str(self.config.get("factor_mode", "report_only")) == "score":
+                            extra = int(round((item.quote.industry_score or 0) + (item.quote.fundamental_score or 0)))
+                            item.score += max(-20, min(20, extra))
+                            if extra:
+                                item.reasons.append(f"行业/基本面修正{extra:+d}")
+            except Exception:
+                logger.warning("[%s] 自定义因子源不可用，继续技术筛选", PLUGIN_NAME)
+        adjustment = market_adjustment(market.regime) if str(self.config.get("factor_mode", "report_only")) == "score" else 0
         if adjustment:
             for item in scored:
                 if item.score > 0:
