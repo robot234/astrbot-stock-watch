@@ -63,6 +63,9 @@
 - `cost_profit_threshold_pct`：相对成本达到该盈利幅度时发送收益阈值事件提醒，默认 5%；仅用于复核，不是交易指令，未计手续费和滑点。
 - `cost_risk_threshold_pct`：相对成本达到该亏损幅度时发送风险观察，默认 5%；仅用于复核，不是交易指令。
 - `min_score`：技术评分最低分；分数只是规则筛选结果，不代表收益概率。
+- `factor_mode`：`report_only` 只展示行业、基本面和大盘因子；`score` 才把它们加入综合排序。建议先使用 `report_only`。
+- `factor_source`：因子来源。`auto`/`eastmoney` 使用东方财富公开字段；`tushare` 使用已配置 Token 的估值字段；`custom` 使用自定义 JSON 接口。
+- `factor_data_url`：可选自定义因子接口。留空时使用 `factor_source` 指定的内置来源。接口返回 `data` 数组，每项至少包含 `code`，可选 `industry`、`industry_score`、`fundamental_score`、`quality`。
 - `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号，确认进度会保存到 SQLite。
 - `confirmation_periods`：连续确认次数，默认 2 次。
 - `confirmation_max_gap_seconds`：连续确认最大间隔，默认 90 秒。
@@ -115,6 +118,8 @@
 - 配置 `tushare_token` 后，每日全市场快照优先使用 Tushare Pro；Tushare 请求失败会退回东方财富。
 - 盘中自选股默认使用新浪批量行情接口，适合少量自选股轮询。
 - 历史日线和技术指标使用东方财富接口。
+- 东方财富因子字段仅用于当前研究报告，包含行业标签和部分估值/ROE，质量会标为 `partial`；它不作为历史回放的完整基本面真值。
+- 行业强弱由同批已补齐日线的股票计算行业 5 日相对动量、上涨占比和成交活跃度；样本不足会标为未知，不强行加分。
 - Tushare Pro 更适合每日和历史数据，不建议用于高频盘中监听。Token 只填入 AstrBot 配置或环境变量，不要放进 URL 或提交到 GitHub。
 
 公开接口可能出现限流、延迟或临时不可用。快照失败时插件会退回 `universe_codes` 或自选股扫描。

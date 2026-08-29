@@ -47,9 +47,33 @@ class Candidate:
     score: int
     reasons: list[str]
     score_max: int = 50
+    base_score: int = 0
+    composite_score: int | None = None
     risk_level: str = "unknown"
     risk_flags: list[str] = field(default_factory=list)
     price_plan: "PricePlan | None" = None
+    factor_overlay: "FactorOverlay | None" = None
+
+
+@dataclass(slots=True)
+class FactorOverlay:
+    industry_name: str = ""
+    industry_score: float | None = None
+    fundamental_score: float | None = None
+    market_regime: str = "unknown"
+    market_adjustment: int = 0
+    source: str = ""
+    as_of: str = ""
+    quality: str = "unknown"
+
+    @property
+    def adjustment(self) -> int:
+        values = (self.industry_score, self.fundamental_score)
+        return int(round(sum(value for value in values if value is not None))) + self.market_adjustment
+
+    @property
+    def composite_score(self) -> int | None:
+        return None
 
 
 @dataclass(slots=True)
@@ -371,7 +395,7 @@ def score_quote(quote: Quote) -> Candidate:
     if quote.volatility20 is not None and math.isfinite(float(quote.volatility20)) and quote.volatility20 >= 0.08:
         score -= 5
         reasons.append("波动率偏高-5")
-    candidate = Candidate(quote, score, reasons)
+    candidate = Candidate(quote, score, reasons, base_score=score)
     review = review_risk(quote, candidate)
     candidate.risk_level = review.verdict
     candidate.risk_flags = review.flags
@@ -402,8 +426,10 @@ def format_candidate(candidate: Candidate) -> str:
         metrics.append(f"5/20日动量={quote.momentum5:+.1f}%/{quote.momentum20:+.1f}%")
     evidence = "、".join(metrics) or "当前可用技术指标不足"
     factor_line = ""
-    if quote.industry_score is not None or quote.fundamental_score is not None:
-        factor_line = f"因子参考：行业{quote.industry_score if quote.industry_score is not None else '未知'}，基本面{quote.fundamental_score if quote.fundamental_score is not None else '未知'}\n"
+    overlay = candidate.factor_overlay
+    if overlay:
+        pieces = [f"行业{overlay.industry_score if overlay.industry_score is not None else '未知'}", f"基本面{overlay.fundamental_score if overlay.fundamental_score is not None else '未知'}", f"大盘{overlay.market_regime}{overlay.market_adjustment:+d}"]
+        factor_line = f"因子参考：{'，'.join(pieces)}；来源{overlay.source or '未知'}；质量{overlay.quality}\n"
     risk_items: list[str] = list(candidate.risk_flags)
     if any("空头" in reason or "放量下跌" in reason for reason in candidate.reasons):
         risk_items.append("均线偏弱或出现放量下跌")
@@ -418,10 +444,12 @@ def format_candidate(candidate: Candidate) -> str:
     else:
         levels = "参考价位：历史数据不足，暂不计算"
     conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；价位仅供人工研究"
+    composite_line = f"综合评分：{candidate.composite_score}/73\n" if candidate.composite_score is not None else ""
     return (
         f"候选：{name or quote.code}（{quote.code}）\n"
         f"行情：现价{quote.price:.2f}，涨跌{quote.pct_change:+.2f}%，成交额{quote.amount:.0f}\n"
-        f"技术评分：{candidate.score}/{candidate.score_max}（规则加分：{why}）\n"
+        f"技术评分：{candidate.base_score}/{candidate.score_max}（规则加分：{why}）\n"
+        f"{composite_line}"
         f"技术证据：{evidence}\n"
         f"{factor_line}"
         f"参考价位：{levels}\n"

@@ -118,6 +118,15 @@ class StockStore:
                     source TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL,
                     PRIMARY KEY(code, trade_date)
                 );
+                CREATE TABLE IF NOT EXISTS factor_snapshots(
+                    as_of TEXT NOT NULL, code TEXT NOT NULL, payload TEXT NOT NULL,
+                    source TEXT NOT NULL, quality TEXT NOT NULL, fetched_at TEXT NOT NULL,
+                    PRIMARY KEY(as_of, code, source)
+                );
+                CREATE TABLE IF NOT EXISTS market_contexts(
+                    as_of TEXT PRIMARY KEY, payload TEXT NOT NULL, source TEXT NOT NULL,
+                    quality TEXT NOT NULL, fetched_at TEXT NOT NULL
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
@@ -145,7 +154,10 @@ class StockStore:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
-            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
+            candidate_columns = {row[1] for row in db.execute("PRAGMA table_info(screen_candidates)")}
+            if "factor_payload" not in candidate_columns:
+                db.execute("ALTER TABLE screen_candidates ADD COLUMN factor_payload TEXT NOT NULL DEFAULT '{}'")
+            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5')")
             # Normalize dates written by pre-v4 releases (YYYYMMDD) so range
             # queries cannot mistake legacy rows for future data.
             legacy = db.execute("SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at FROM daily_bars WHERE length(trade_date)=8").fetchall()
@@ -153,6 +165,22 @@ class StockStore:
                 normalized = self._date_norm(str(row[1]))
                 db.execute("INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (row[0], normalized, row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9]))
                 db.execute("DELETE FROM daily_bars WHERE code=? AND trade_date=?", (row[0], row[1]))
+
+    def save_factor_snapshots(self, as_of: str, rows: dict[str, dict], source: str, quality: str) -> None:
+        import json
+        if not as_of or not rows:
+            return
+        now = datetime.utcnow().isoformat()
+        values = [(as_of, code, json.dumps(payload, ensure_ascii=False, default=str), source, str(payload.get("quality") or quality), now) for code, payload in rows.items()]
+        with self._connect() as db:
+            db.executemany("INSERT OR REPLACE INTO factor_snapshots(as_of,code,payload,source,quality,fetched_at) VALUES(?,?,?,?,?,?)", values)
+
+    def save_market_context(self, as_of: str, payload: dict, source: str, quality: str) -> None:
+        import json
+        if not as_of:
+            return
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO market_contexts(as_of,payload,source,quality,fetched_at) VALUES(?,?,?,?,?)", (as_of, json.dumps(payload, ensure_ascii=False), source, quality, datetime.utcnow().isoformat()))
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
@@ -348,13 +376,15 @@ class StockStore:
         for candidate in candidates:
             plan = candidate.price_plan
             plan_data = {key: getattr(plan, key) for key in plan.__dataclass_fields__} if plan else {}
+            overlay = candidate.factor_overlay
+            overlay_data = {key: getattr(overlay, key) for key in overlay.__dataclass_fields__} if overlay else {}
             rows.append((run_id, candidate.quote.code, candidate.quote.name, candidate.score, candidate.score_max,
                          candidate.risk_level, json.dumps(candidate.risk_flags, ensure_ascii=False),
-                         json.dumps(plan_data, ensure_ascii=False, default=str), json.dumps(candidate.reasons, ensure_ascii=False)))
+                         json.dumps(plan_data, ensure_ascii=False, default=str), json.dumps(candidate.reasons, ensure_ascii=False), json.dumps(overlay_data, ensure_ascii=False, default=str)))
         if not rows:
             return 0
         with self._connect() as db:
-            db.executemany("INSERT OR REPLACE INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            db.executemany("INSERT OR REPLACE INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons,factor_payload) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
         return len(rows)
 
     def save_screen_bundle(self, run_args: tuple, candidates) -> str:
@@ -365,9 +395,10 @@ class StockStore:
             rows=[]
             for c in candidates:
                 plan=c.price_plan; pdata={k:getattr(plan,k) for k in plan.__dataclass_fields__} if plan else {}
-                rows.append((run_id,c.quote.code,c.quote.name,c.score,c.score_max,c.risk_level,json.dumps(c.risk_flags,ensure_ascii=False),json.dumps(pdata,ensure_ascii=False,default=str),json.dumps(c.reasons,ensure_ascii=False)))
+                overlay=c.factor_overlay; odata={k:getattr(overlay,k) for k in overlay.__dataclass_fields__} if overlay else {}
+                rows.append((run_id,c.quote.code,c.quote.name,c.score,c.score_max,c.risk_level,json.dumps(c.risk_flags,ensure_ascii=False),json.dumps(pdata,ensure_ascii=False,default=str),json.dumps(c.reasons,ensure_ascii=False),json.dumps(odata,ensure_ascii=False,default=str)))
             if rows:
-                db.executemany("INSERT INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+                db.executemany("INSERT INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons,factor_payload) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
         return run_id
 
     def update_provider_health(self, provider: str, success: bool, quality: str, error: str | None = None) -> None:

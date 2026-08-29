@@ -14,15 +14,15 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, MinuteBarAggregator, assess_market_context, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
-from .factors import market_adjustment
+from .core import CHINA_TZ, FactorOverlay, MinuteBarAggregator, assess_market_context, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
+from .factors import industry_strength, market_adjustment
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
 
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.8.0")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.9.0")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -233,55 +233,82 @@ class Main(Star):
                 self.store.save_daily_bars(quote.code, bars, quote.source or "eastmoney")
         self._last_screen_diagnostics = {"input": len(quotes), "tradable": len(tradable), "enriched": sum(1 for q in enrich_targets if q.history_days >= 20)}
         scored = [score_quote(quote) for quote in tradable]
-        market = assess_market_context(quotes)
+        full_market = self.store.daily_quotes(as_of) if as_of else []
+        market_quotes = full_market if len(full_market) >= 1000 else quotes
+        market = assess_market_context(market_quotes)
+        if as_of:
+            self.store.save_market_context(as_of, {
+                "regime": market.regime, "breadth": market.breadth, "advancing": market.advancing,
+                "declining": market.declining, "total_amount": market.total_amount, "evidence": market.evidence,
+            }, "daily_snapshot" if full_market else "input_subset", "good" if len(full_market) >= 1000 else "partial")
         factor_url = str(self.config.get("factor_data_url", "")).strip()
+        factor_source = str(self.config.get("factor_source", "auto")).strip().lower()
+        factor_mode = str(self.config.get("factor_mode", "report_only")).strip().lower()
+        raw_factors: dict[str, dict] = {}
+        factor_name, factor_quality = "", "unknown"
         if factor_url:
             try:
                 raw_factors = await self.quotes.fetch_custom_factors(factor_url, [q.code for q in enrich_targets], as_of)
-                for item in scored:
-                    row = raw_factors.get(item.quote.code)
-                    if row:
-                        item.quote.industry_score = float(row.get("industry_score")) if row.get("industry_score") is not None else None
-                        item.quote.fundamental_score = float(row.get("fundamental_score")) if row.get("fundamental_score") is not None else None
-                        if str(self.config.get("factor_mode", "report_only")) == "score":
-                            extra = int(round((item.quote.industry_score or 0) + (item.quote.fundamental_score or 0)))
-                            item.score += max(-20, min(20, extra))
-                            if extra:
-                                item.reasons.append(f"行业/基本面修正{extra:+d}")
+                factor_name, factor_quality = "custom", "good" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] 自定义因子源不可用，继续技术筛选", PLUGIN_NAME)
-        elif str(self.config.get("factor_source", "auto")) == "tushare":
+        elif factor_source == "tushare":
             try:
                 raw_factors = await self.quotes.fetch_tushare_factors([q.code for q in enrich_targets], as_of)
-                for item in scored:
-                    row = raw_factors.get(item.quote.code)
-                    if row and row.get("pe") is not None:
-                        item.quote.fundamental_score = max(-3, min(3, round(2 - float(row.get("pe")) / 20, 1)))
+                factor_name, factor_quality = "tushare", "partial" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] Tushare 因子源不可用，继续技术筛选", PLUGIN_NAME)
-        elif str(self.config.get("factor_source", "auto")) in {"auto", "eastmoney"}:
+        elif factor_source in {"auto", "eastmoney"}:
             try:
                 raw_factors = await self.quotes.fetch_eastmoney_factors([q.code for q in enrich_targets])
-                for item in scored:
-                    row = raw_factors.get(item.quote.code)
-                    if row:
-                        item.quote.fundamental_score = round(max(-10, min(10, float(row.get("roe") or 0) / 2)), 1) if row.get("roe") is not None else None
-                        item.quote.industry_score = None
+                factor_name, factor_quality = "eastmoney", "partial" if raw_factors else "unknown"
+                if not raw_factors and factor_source == "auto" and self.quotes.tushare_token:
+                    raw_factors = await self.quotes.fetch_tushare_factors([q.code for q in enrich_targets], as_of)
+                    factor_name, factor_quality = "tushare", "partial" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] 东方财富因子源不可用，继续技术筛选", PLUGIN_NAME)
-        if str(self.config.get("factor_mode", "report_only")) == "score":
-            for item in scored:
-                if item.quote.fundamental_score is not None and not any("行业/基本面修正" in r for r in item.reasons):
-                    extra = max(-10, min(10, int(round(item.quote.fundamental_score))))
-                    item.score += extra
-                    if extra:
-                        item.reasons.append(f"基本面修正{extra:+d}")
-        adjustment = market_adjustment(market.regime) if str(self.config.get("factor_mode", "report_only")) == "score" else 0
-        if adjustment:
-            for item in scored:
-                if item.score > 0:
-                    item.score += adjustment
-                    item.reasons.append(f"市场环境修正{adjustment:+d}")
+        if as_of and raw_factors:
+            self.store.save_factor_snapshots(as_of, raw_factors, factor_name or factor_source, factor_quality)
+        adjustment = market_adjustment(market.regime)
+        momentum_values = [q.momentum5 for q in enrich_targets if q.momentum5 is not None and math.isfinite(q.momentum5)]
+        benchmark_momentum = sum(momentum_values) / len(momentum_values) if momentum_values else None
+        industry_rows: dict[str, list] = {}
+        for quote in enrich_targets:
+            industry = str((raw_factors.get(quote.code) or {}).get("industry") or "").strip()
+            if industry and quote.momentum5 is not None and math.isfinite(quote.momentum5):
+                industry_rows.setdefault(industry, []).append(quote)
+        for item in scored:
+            row = raw_factors.get(item.quote.code) or {}
+            def number(key):
+                try:
+                    value = float(row.get(key))
+                    return value if math.isfinite(value) else None
+                except (TypeError, ValueError):
+                    return None
+            industry = number("industry_score")
+            industry_name = str(row.get("industry") or "").strip()
+            members = industry_rows.get(industry_name, [])
+            if industry is None and benchmark_momentum is not None and len(members) >= 5:
+                avg_momentum = sum(member.momentum5 for member in members if member.momentum5 is not None) / len(members)
+                breadth = sum(1 for member in members if member.momentum5 is not None and member.momentum5 > 0) / len(members)
+                mean_amount = sum(member.amount for member in enrich_targets) / max(1, len(enrich_targets))
+                amount_ratio = (sum(member.amount for member in members) / len(members)) / mean_amount if mean_amount > 0 else 1.0
+                industry = industry_strength(avg_momentum, benchmark_momentum, breadth, amount_ratio)
+            fundamental = number("fundamental_score")
+            if fundamental is None and row.get("roe") is not None:
+                roe = number("roe")
+                fundamental = max(-10, min(10, round(roe / 2, 1))) if roe is not None else None
+            if fundamental is None and row.get("pe") is not None:
+                pe = number("pe")
+                fundamental = max(-3, min(3, round(2 - pe / 20, 1))) if pe is not None else None
+            item.quote.industry_score, item.quote.fundamental_score = industry, fundamental
+            item.factor_overlay = FactorOverlay(industry_name, industry, fundamental, market.regime, adjustment, str(row.get("source") or factor_name), as_of, str(row.get("quality") or factor_quality))
+            if factor_mode == "score" and item.risk_level != "blocked":
+                extra = max(-20, min(20, item.factor_overlay.adjustment))
+                item.composite_score = item.base_score + extra
+                item.score = item.composite_score
+                if extra:
+                    item.reasons.append(f"因子综合修正{extra:+d}")
         minimum = self._int("min_score", 10, -100, 100)
         scored.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
         qualified = [item for item in scored if item.score >= minimum and item.risk_level != "blocked"]
@@ -295,7 +322,7 @@ class Main(Star):
         self._last_screen_diagnostics.update({
             "qualified": len(qualified), "fallback": len(fallback),
             "max_score": max((item.score for item in scored), default=0), "min_score": minimum,
-            "market_regime": market.regime, "market_breadth": round(market.breadth, 4),
+            "market_regime": market.regime, "market_breadth": round(market.breadth, 4), "factor_source": factor_name or "unknown", "factor_quality": factor_quality,
         })
         return (qualified or fallback)[:limit]
 
@@ -508,7 +535,9 @@ class Main(Star):
                     self._record_screen(requested_date, actual_date, source, cached_for_record, candidates)
                     lines = [
                         "收盘选股（仅研究/模拟盘）",
-                        "筛选口径：价格区间过滤 → 成交额流动性预筛选 → RSI6/均线/量价规则评分 → 人工复核",
+                        f"市场环境：{self._last_screen_diagnostics.get('market_regime', 'unknown')}（上涨占比{self._last_screen_diagnostics.get('market_breadth', 0):.1%}）",
+                        f"因子数据：{self._last_screen_diagnostics.get('factor_source', 'unknown')}，质量{self._last_screen_diagnostics.get('factor_quality', 'unknown')}，模式{self.config.get('factor_mode', 'report_only')}",
+                        "筛选口径：硬过滤 → 趋势/动量/量价/波动评分 → 因子复核 → 人工复核",
                         *[format_candidate(item) for item in candidates],
                     ]
                     if not candidates:
@@ -796,6 +825,7 @@ class Main(Star):
             f"请求日期：{latest['requested_date']}；实际交易日：{latest.get('actual_trade_date') or '未知'}\n"
             f"来源：{latest['source'] or '未知'}；行情{latest['quote_count']}条；候选{latest['candidate_count']}条\n"
             f"数据质量：{latest['quality']}\n"
+            f"因子模式：{self.config.get('factor_mode', 'report_only')}；因子来源：{self._last_screen_diagnostics.get('factor_source', '未知')}；因子质量：{self._last_screen_diagnostics.get('factor_quality', '未知')}\n"
             "边界：模型只做摘要解释，价位由规则计算；仅研究/模拟盘，不提供订单或自动交易。"
         )
 

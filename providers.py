@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -282,10 +283,12 @@ class SinaQuoteProvider:
         """Best-effort public fields: industry, PE, PB and ROE."""
         result = {}
         async with httpx.AsyncClient(timeout=self.timeout, headers={"Referer": "https://quote.eastmoney.com/"}) as client:
-            for code in list(codes)[:300]:
+            semaphore = asyncio.Semaphore(8)
+            async def fetch_one(code):
                 secid = ("1." if str(code).startswith(("6", "68", "9")) else "0.") + str(code)
                 try:
-                    response = await client.get("https://push2.eastmoney.com/api/qt/stock/get", params={"secid": secid, "fields": "f57,f58,f127,f162,f167,f173"})
+                    async with semaphore:
+                        response = await client.get("https://push2.eastmoney.com/api/qt/stock/get", params={"secid": secid, "fields": "f57,f58,f127,f162,f167,f173"})
                     response.raise_for_status()
                     data = (response.json().get("data") or {})
                     def finite(key):
@@ -296,7 +299,8 @@ class SinaQuoteProvider:
                             return None
                     result[str(code)] = {"industry": str(data.get("f127") or ""), "pe": finite("f162"), "pb": finite("f167"), "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
                 except (httpx.HTTPError, ValueError, TypeError, KeyError):
-                    continue
+                    return
+            await asyncio.gather(*(fetch_one(code) for code in list(codes)[:300]))
         return result
 
     async def fetch_tushare_factors(self, codes: Iterable[str], trade_date: str = "") -> dict[str, dict]:
@@ -468,6 +472,7 @@ class OpenAICompatibleClient:
                 "ma20": quote.ma20,
                 "volume_ratio": quote.volume_ratio,
                 "fetched_at": quote.fetched_at.isoformat(),
+                "factor_overlay": ({key: getattr(candidate.factor_overlay, key) for key in candidate.factor_overlay.__dataclass_fields__} if candidate.factor_overlay else None),
             })
         allowed = {item["code"] for item in items}
         payload = {
