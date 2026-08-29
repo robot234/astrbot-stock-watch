@@ -127,6 +127,10 @@ class StockStore:
                     as_of TEXT PRIMARY KEY, payload TEXT NOT NULL, source TEXT NOT NULL,
                     quality TEXT NOT NULL, fetched_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS price_states(
+                    origin TEXT NOT NULL, code TEXT NOT NULL, state TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, PRIMARY KEY(origin, code)
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
@@ -181,6 +185,14 @@ class StockStore:
             return
         with self._connect() as db:
             db.execute("INSERT OR REPLACE INTO market_contexts(as_of,payload,source,quality,fetched_at) VALUES(?,?,?,?,?)", (as_of, json.dumps(payload, ensure_ascii=False), source, quality, datetime.utcnow().isoformat()))
+
+    def transition_price_state(self, origin: str, code: str, state: str) -> bool:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as db:
+            row = db.execute("SELECT state FROM price_states WHERE origin=? AND code=?", (origin, code)).fetchone()
+            changed = not row or str(row[0]) != state
+            db.execute("INSERT INTO price_states(origin,code,state,updated_at) VALUES(?,?,?,?) ON CONFLICT(origin,code) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", (origin, code, state, now))
+            return changed
 
     def factor_snapshots(self, as_of: str) -> dict[str, dict]:
         import json
@@ -446,6 +458,10 @@ class StockStore:
                 db.execute("INSERT INTO job_runs(job_key,job_name,trade_date,started_at,status) VALUES(?,?,?,?,?)", (job_key, job_name, trade_date, now, "running"))
                 return True
             except sqlite3.IntegrityError:
+                row = db.execute("SELECT status FROM job_runs WHERE job_key=?", (job_key,)).fetchone()
+                if row and str(row[0]) == "failed":
+                    db.execute("UPDATE job_runs SET started_at=?,finished_at=NULL,status='running',error=NULL WHERE job_key=?", (now, job_key))
+                    return True
                 return False
 
     def finish_job(self, job_key: str, status: str = "completed", error: str | None = None) -> None:

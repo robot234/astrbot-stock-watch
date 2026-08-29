@@ -319,7 +319,8 @@ class Main(Star):
             roe, pe, pb = number("roe"), number("pe"), number("pb")
             profit_growth, cash_quality = number("profit_growth"), number("cash_quality")
             valuation = (2 - pe / 20 - (pb / 10 if pb is not None and pb > 0 else 0)) if pe is not None and pe > 0 else None
-            calculated_fundamental = fundamental_score(roe, profit_growth, cash_quality, valuation, bool(row.get("st_flag")), bool(row.get("audit_flag")))
+            flag = lambda value: str(value).strip().lower() in {"1", "true", "yes", "on", "是"}
+            calculated_fundamental = fundamental_score(roe, profit_growth, cash_quality, valuation, flag(row.get("st_flag")), flag(row.get("audit_flag")))
             if fundamental is None and calculated_fundamental is not None:
                 fundamental = calculated_fundamental
             if fundamental is None and roe is not None:
@@ -661,8 +662,10 @@ class Main(Star):
                                 health["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
                                 health_counted = True
                             quotes_by_code = {quote.code: quote for quote in quotes}
-                            candidates = await self._score_quotes(quotes, len(quotes), include_factors=False)
-                            by_code = {candidate.quote.code: candidate for candidate in candidates}
+                            await self._score_quotes(quotes, len(quotes), include_factors=False)
+                            # Monitoring evaluates every watched quote so risk states are not
+                            # lost merely because the stock is not a screening candidate.
+                            by_code = {quote.code: score_quote(quote) for quote in quotes}
                             if not cycle_failed:
                                 health["successful_cycles"] += 1
                                 health["last_success_at"] = datetime.now(CHINA_TZ).isoformat()
@@ -695,10 +698,15 @@ class Main(Star):
                                         self.store.reset_confirmation(origin, "minute:" + code)
                                     if not candidate and not cost_signal and not minute_signal:
                                         continue
-                                    if candidate and candidate.risk_level in {"blocked", "unknown"} and not cost_signal and not minute_signal:
-                                        continue
                                     plan_state = candidate.price_plan.state if candidate and candidate.price_plan else "unknown"
+                                    state_changed = self.store.transition_price_state(origin, code, plan_state) if candidate else False
+                                    if candidate and candidate.risk_level == "unknown" and not cost_signal and not minute_signal:
+                                        continue
+                                    if candidate and candidate.risk_level == "blocked" and plan_state != "invalidated" and not cost_signal and not minute_signal:
+                                        continue
                                     if candidate and not cost_signal and not minute_signal and plan_state not in {"in_attention", "confirmed", "near_sell", "invalidated"}:
+                                        continue
+                                    if candidate and not cost_signal and not minute_signal and not state_changed:
                                         continue
                                     threshold = self._int("intraday_failure_threshold", 0, 0, 100)
                                     if threshold > 0 and health["consecutive_failures"] >= threshold:
@@ -714,7 +722,8 @@ class Main(Star):
                                         if not confirmed:
                                             continue
                                     claim_time = datetime.now(timezone.utc)
-                                    if not self.store.claim_signal(origin, code, 600, now=claim_time):
+                                    signal_key = f"{code}:{plan_state}" if candidate and not cost_signal and not minute_signal else code
+                                    if not self.store.claim_signal(origin, signal_key, 600, now=claim_time):
                                         continue
                                     if cost_signal:
                                         text = cost_signal
@@ -731,7 +740,7 @@ class Main(Star):
                                             self.store.save_risk_event(f"{today}:{code}:{plan_state}", self._last_screen_run_id, code, plan_state, candidate.risk_level, json.dumps({"price": quote.price, "state": plan_state}, ensure_ascii=False), datetime.now(timezone.utc).isoformat())
                                     sent = await self._push(origin, text)
                                     if not sent:
-                                        self.store.release_signal(origin, code, claimed_at=claim_time)
+                                        self.store.release_signal(origin, signal_key, claimed_at=claim_time)
                         else:
                             health["failed_cycles"] += 1
                             health["consecutive_failures"] += 1
