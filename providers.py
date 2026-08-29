@@ -13,7 +13,7 @@ from typing import Iterable
 
 import httpx
 
-from .core import CHINA_TZ, Candidate, NewsItem, Quote, apply_daily_indicators, calculate_daily_indicators, normalize_code
+from .core import CHINA_TZ, Candidate, NewsItem, Quote, _finite_positive, _normalize_plan_date, _source_is_trusted, apply_daily_indicators, calculate_daily_indicators, normalize_code
 
 
 def _sina_symbol(code: str) -> str:
@@ -127,7 +127,7 @@ class HttpRuntime:
 class SinaQuoteProvider:
     """Prototype provider; replace it with a licensed/stable source for production."""
 
-    def __init__(self, timeout: float = 10, tushare_url: str = "", tushare_token: str = "", max_concurrency: int = 8, http_runtime: HttpRuntime | None = None):
+    def __init__(self, timeout: float = 10, tushare_url: str = "", tushare_token: str = "", max_concurrency: int = 8, http_runtime: HttpRuntime | None = None, symbol_store=None):
         self.timeout = timeout
         self.tushare_url = str(tushare_url or "").strip() or "https://api.tushare.pro"
         self.tushare_token = str(tushare_token or "").strip()
@@ -136,6 +136,7 @@ class SinaQuoteProvider:
         self.history_bars: dict[str, list[dict[str, float | str]]] = {}
         self._last_tushare_date: str | None = None
         self._tushare_names: dict[str, str] = {}
+        self.symbol_store = symbol_store
         # Current industry labels are display annotations, not historical
         # factor snapshots.  Cache both successful lookups and short-lived
         # failures so a large candidate report cannot hammer the endpoint.
@@ -144,6 +145,27 @@ class SinaQuoteProvider:
         # caller awaits one so providers remain safe across short-lived test
         # loops and AstrBot's long-lived event loop.
         self._industry_inflight: dict[str, asyncio.Future] = {}
+
+    def _remember_symbol(self, code: str, name: str, source: str) -> None:
+        if not self.symbol_store:
+            return
+        try:
+            self.symbol_store.upsert_stock_symbol(code, name, source)
+        except Exception:
+            # A lookup cache must never turn an otherwise usable quote into a
+            # failed provider response.
+            pass
+
+    @staticmethod
+    def _clear_indicator_state(quote: Quote) -> None:
+        quote.rsi6 = quote.ma5 = quote.ma10 = quote.ma20 = quote.volume_ratio = None
+        quote.atr14 = quote.support20 = quote.resistance20 = quote.volatility20 = None
+        quote.momentum5 = quote.momentum20 = None
+        quote.history_days = 0
+        quote.indicator_last_date = ""
+        quote.indicator_last_close = None
+        quote.indicator_price_basis = "unknown"
+        quote.indicator_source = ""
 
     async def close(self) -> None:
         await self.http.close()
@@ -244,7 +266,24 @@ class SinaQuoteProvider:
             if len(row_date) != 8:
                 raise ValueError("Tushare row missing trade_date")
             row_dates.add(row_date)
-            result.append(Quote(code, code, price, prev_close, amount, pct_change, volume, source="tushare", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
+            result.append(
+                Quote(
+                    code,
+                    code,
+                    price,
+                    prev_close,
+                    amount,
+                    pct_change,
+                    volume,
+                    source="tushare",
+                    provider_ts=datetime.now(CHINA_TZ),
+                    fetched_at=datetime.now(CHINA_TZ),
+                    indicator_last_date=self._normalize_trade_date(row_date),
+                    indicator_last_close=price,
+                    indicator_price_basis="unadjusted",
+                    indicator_source="tushare",
+                )
+            )
         if len(row_dates) != 1:
             raise ValueError("Tushare response contains mixed or missing trade_date")
         self._last_tushare_date = self._normalize_trade_date(next(iter(row_dates)))
@@ -272,9 +311,11 @@ class SinaQuoteProvider:
         updated = 0
         for quote in quotes:
             name = self._tushare_names.get(quote.code)
-            if name and quote.name != name:
-                quote.name = name
-                updated += 1
+            if name:
+                if quote.name != name:
+                    quote.name = name
+                    updated += 1
+                self._remember_symbol(quote.code, name, "tushare")
         return updated
 
     async def enrich_names(self, quotes: list[Quote]) -> int:
@@ -416,7 +457,11 @@ class SinaQuoteProvider:
                 quote_time = datetime.fromisoformat(f"{fields[30].strip()}T{fields[31].strip()}").replace(tzinfo=CHINA_TZ)
             except (TypeError, ValueError):
                 continue
-            result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, source="sina", provider_ts=quote_time, fetched_at=quote_time))
+            code = normalize_code(symbol[2:])
+            name = fields[0].strip() or code
+            result.append(Quote(code, name, price, prev_close, amount, pct, volume, source="sina", provider_ts=quote_time, fetched_at=quote_time))
+            if name and name != code:
+                self._remember_symbol(code, name, "sina")
         return result
 
     async def fetch_custom_factors(self, url: str, codes: Iterable[str], as_of: str = "") -> dict[str, dict]:
@@ -736,13 +781,29 @@ class SinaQuoteProvider:
         async def enrich(quote: Quote, client: httpx.AsyncClient) -> None:
             cache_key = f"{quote.code}:{as_of or 'latest'}"
             cached = self._indicator_cache.get(cache_key)
-            if cached and datetime.now(CHINA_TZ) - cached[0] < timedelta(minutes=15):
+            if (
+                cached
+                and datetime.now(CHINA_TZ) - cached[0] < timedelta(minutes=15)
+                and str(cached[1].get("indicator_price_basis") or "unknown").lower() == "unadjusted"
+                and bool(_normalize_plan_date(cached[1].get("indicator_last_date")))
+                and _finite_positive(cached[1].get("indicator_last_close")) is not None
+                and _finite_positive(cached[1].get("atr14")) is not None
+                and int(cached[1].get("history_days") or 0) >= 20
+                and _source_is_trusted(cached[1].get("indicator_source"))
+            ):
                 values = cached[1]
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
                 quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values.get("atr14"), values.get("support20"), values.get("resistance20"), values.get("volatility20"), int(values.get("history_days") or 0))
                 quote.momentum5, quote.momentum20 = values.get("momentum5"), values.get("momentum20")
-                results[quote.code] = "memory_cache" if quote.history_days >= 20 and quote.atr14 is not None else "failed"
+                quote.indicator_last_date = str(values.get("indicator_last_date") or "")
+                quote.indicator_last_close = values.get("indicator_last_close")
+                quote.indicator_price_basis = str(values.get("indicator_price_basis") or "unknown")
+                quote.indicator_source = str(values.get("indicator_source") or "")
+                results[quote.code] = "memory_cache"
                 return
+            # A rejected/expired cache must not leave a caller's Quote carrying
+            # stale indicators if the replacement request fails.
+            self._clear_indicator_state(quote)
             self.history_bars.pop(quote.code, None)
             secid = ("1." if quote.code.startswith(("6", "68", "9")) else "0.") + quote.code
             url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -752,7 +813,8 @@ class SinaQuoteProvider:
                 "fields1": "f1,f2,f3,f4,f5,f6",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
                 "klt": "101",
-                "fqt": "1",
+                # Technical history and replay are strictly unadjusted.
+                "fqt": "0",
                 "beg": "0",
                 "end": str(as_of or "20500101").replace("-", ""),
                 "lmt": "60",
@@ -776,9 +838,13 @@ class SinaQuoteProvider:
                         parsed.append((row_date, float(fields[1]), float(fields[3]), float(fields[4]), float(fields[2]), float(fields[5]), float(fields[6]) if len(fields) > 6 else 0.0))
                     except (TypeError, ValueError):
                         continue
-                history = [{"trade_date": f"{item[0][:4]}-{item[0][4:6]}-{item[0][6:8]}", "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6]} for item in parsed]
+                history = [{"trade_date": f"{item[0][:4]}-{item[0][4:6]}-{item[0][6:8]}", "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6], "price_basis": "unadjusted", "source": "eastmoney"} for item in parsed]
                 self.history_bars[quote.code] = history
                 values = calculate_daily_indicators(history)
+                quote.indicator_last_date = str(values.get("indicator_last_date") or "")
+                quote.indicator_last_close = values.get("indicator_last_close")
+                quote.indicator_price_basis = str(values.get("indicator_price_basis") or "unknown")
+                quote.indicator_source = str(values.get("indicator_source") or "")
                 if apply_daily_indicators(quote, history):
                     self._indicator_cache[cache_key] = (datetime.now(CHINA_TZ), values)
                     results[quote.code] = "network"

@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import json
 import math
 import re
+import unicodedata
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -54,6 +55,37 @@ class Quote:
     limit_up: bool | None = None
     limit_down: bool | None = None
     fetched_at: datetime = field(default_factory=lambda: datetime.now(CHINA_TZ))
+    # Indicator provenance is deliberately appended after the legacy fields so
+    # positional construction from pre-v0.12 callers remains compatible.
+    indicator_last_date: str = ""
+    indicator_last_close: float | None = None
+    indicator_price_basis: str = "unknown"
+    indicator_source: str = ""
+
+    @property
+    def last_indicator_date(self) -> str:
+        """Compatibility spelling used by older integrations."""
+        return self.indicator_last_date
+
+    @last_indicator_date.setter
+    def last_indicator_date(self, value: str) -> None:
+        self.indicator_last_date = str(value or "")
+
+    @property
+    def last_indicator_close(self) -> float | None:
+        return self.indicator_last_close
+
+    @last_indicator_close.setter
+    def last_indicator_close(self, value: float | None) -> None:
+        self.indicator_last_close = value
+
+    @property
+    def price_basis(self) -> str:
+        return self.indicator_price_basis
+
+    @price_basis.setter
+    def price_basis(self, value: str) -> None:
+        self.indicator_price_basis = str(value or "unknown")
 
 
 @dataclass(slots=True)
@@ -109,6 +141,9 @@ class PricePlan:
     invalidation: float | None
     quality: str
     evidence: list[str] = field(default_factory=list)
+    # Appended defaults keep all pre-v0.12 positional constructors valid.
+    provenance: dict[str, object] = field(default_factory=dict)
+    validated: bool = False
 
 
 @dataclass(slots=True)
@@ -279,6 +314,13 @@ def normalize_code(code: str) -> str:
     return value
 
 
+def normalize_stock_name(name: str) -> str:
+    """Return a bounded, control/whitespace-free key for stock-name lookup."""
+    value = unicodedata.normalize("NFKC", str(name or ""))
+    value = "".join(char for char in value if not unicodedata.category(char).startswith("C") and not char.isspace())
+    return value.casefold()[:64]
+
+
 def parse_codes(raw: str | Iterable[str]) -> list[str]:
     values = raw.replace("，", ",").replace("\n", ",").replace(" ", ",").split(",") if isinstance(raw, str) else list(raw)
     result: list[str] = []
@@ -332,24 +374,48 @@ def calc_atr(highs: Iterable[float], lows: Iterable[float], closes: Iterable[flo
     return round(sum(true_ranges[-period:]) / period, 4)
 
 
-def calculate_daily_indicators(bars: Iterable[dict]) -> dict[str, float | int | None]:
-    """Calculate one consistent indicator set from persisted or freshly fetched OHLCV bars."""
-    normalized: list[tuple[str, float, float, float, float, float]] = []
-    for row in bars:
+def calculate_daily_indicators(bars: Iterable[dict]) -> dict[str, object]:
+    """Calculate indicators from point-in-time, unadjusted daily bars only."""
+    normalized: list[tuple[str, float, float, float, float, float, str, str]] = []
+    provenance_ok = True
+    saw_rows = False
+    sources: set[str] = set()
+    for row in bars or []:
+        saw_rows = True
+        if not isinstance(row, dict):
+            provenance_ok = False
+            continue
+        raw_basis = row.get("price_basis")
+        basis = str(raw_basis or "unknown").strip().casefold() or "unknown"
+        raw_source = row.get("source")
+        source = raw_source.strip() if isinstance(raw_source, str) else ""
+        source_key = source.casefold()
+        if basis != "unadjusted" or not _source_is_trusted(source):
+            provenance_ok = False
+        sources.add(source_key)
+        if len(sources) > 1:
+            provenance_ok = False
         try:
-            trade_date = str(row.get("trade_date") or "").strip()
+            raw_trade_date = str(row.get("trade_date") or "").strip().replace("-", "")
+            if not re.fullmatch(r"\d{8}", raw_trade_date):
+                continue
+            trade_date = datetime.strptime(raw_trade_date, "%Y%m%d").date().isoformat()
             open_price = float(row.get("open"))
             high = float(row.get("high"))
             low = float(row.get("low"))
             close = float(row.get("close"))
             volume = float(row.get("volume") or 0)
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError, OverflowError):
             continue
         if not trade_date or not all(math.isfinite(value) for value in (open_price, high, low, close, volume)):
             continue
         if min(open_price, high, low, close) <= 0 or high < low or high < max(open_price, close) or low > min(open_price, close):
             continue
-        normalized.append((trade_date, open_price, high, low, close, max(0.0, volume)))
+        normalized.append((trade_date, open_price, high, low, close, max(0.0, volume), basis, source))
+    if not saw_rows or not provenance_ok:
+        # Do not calculate from a seemingly valid subset when the batch's
+        # price basis or source cannot be established consistently.
+        normalized.clear()
     normalized.sort(key=lambda row: row[0])
     closes = [row[4] for row in normalized]
     highs = [row[2] for row in normalized]
@@ -374,6 +440,10 @@ def calculate_daily_indicators(bars: Iterable[dict]) -> dict[str, float | int | 
         "history_days": len(closes),
         "momentum5": ((closes[-1] / closes[-6] - 1) * 100) if len(closes) >= 6 and closes[-6] > 0 else None,
         "momentum20": ((closes[-1] / closes[-21] - 1) * 100) if len(closes) >= 21 and closes[-21] > 0 else None,
+        "indicator_last_date": normalized[-1][0] if normalized else "",
+        "indicator_last_close": normalized[-1][4] if normalized else None,
+        "indicator_price_basis": normalized[-1][6] if normalized else "unknown",
+        "indicator_source": normalized[-1][7] if normalized else "",
     }
 
 
@@ -388,27 +458,294 @@ def apply_daily_indicators(quote: Quote, bars: Iterable[dict]) -> bool:
     )
     quote.history_days = int(values["history_days"] or 0)
     quote.momentum5, quote.momentum20 = values["momentum5"], values["momentum20"]
-    return quote.history_days >= 20 and quote.atr14 is not None
+    quote.indicator_last_date = str(values.get("indicator_last_date") or "")
+    quote.indicator_last_close = values.get("indicator_last_close")
+    quote.indicator_price_basis = str(values.get("indicator_price_basis") or "unknown")
+    quote.indicator_source = str(values.get("indicator_source") or "")
+    return (
+        quote.history_days >= 20
+        and _finite_positive(quote.atr14) is not None
+        and bool(_normalize_plan_date(quote.indicator_last_date))
+        and _finite_positive(quote.indicator_last_close) is not None
+        and str(quote.indicator_price_basis or "").strip().casefold() == "unadjusted"
+        and _source_is_trusted(quote.indicator_source)
+    )
 
 
-def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
-    """Derive reference zones from completed data available at the quote timestamp."""
+def _finite_positive(value) -> float | None:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _strict_positive_number(value) -> float | None:
+    """Accept persisted numeric values without coercing arbitrary strings."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return _finite_positive(value)
+
+
+_MAX_PRICE_PLAN_TOLERANCE_PCT = 20.0
+_UNTRUSTED_SOURCE_VALUES = {"", "unknown", "none", "null", "n/a", "na", "-", "--"}
+
+
+def _source_is_trusted(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.strip().casefold() not in _UNTRUSTED_SOURCE_VALUES
+
+
+def _strict_nonnegative_number(value) -> float | None:
+    """Accept persisted non-negative numbers without coercing arbitrary strings."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _normalize_plan_date(value) -> str:
+    text = str(value or "").strip().replace("-", "")
+    if not re.fullmatch(r"\d{8}", text):
+        return ""
+    try:
+        parsed = datetime.strptime(text, "%Y%m%d")
+    except ValueError:
+        return ""
+    return parsed.date().isoformat()
+
+
+def _plan_provenance(
+    quote: Quote,
+    actual_date: str = "",
+    context: str = "",
+    reason: str = "",
+    *,
+    tolerance_pct=None,
+    reference_price=None,
+    deviation_pct=None,
+) -> dict[str, object]:
+    """Build the stable provenance shape persisted with every plan."""
+    anchor = _finite_positive(reference_price)
+    last_close = _finite_positive(getattr(quote, "indicator_last_close", None))
+    if deviation_pct is None and anchor is not None and last_close is not None:
+        deviation_pct = abs(last_close - anchor) / anchor * 100
+    return {
+        "context": str(context or "unscoped"),
+        "actual_date": _normalize_plan_date(actual_date),
+        "last_date": _normalize_plan_date(getattr(quote, "indicator_last_date", "")),
+        "last_close": last_close,
+        "basis": str(getattr(quote, "indicator_price_basis", "unknown") or "unknown").strip().lower(),
+        "source": (
+            getattr(quote, "indicator_source", "").strip()
+            if isinstance(getattr(quote, "indicator_source", ""), str)
+            else ""
+        ),
+        "tolerance_pct": _strict_nonnegative_number(tolerance_pct),
+        "deviation_pct": _strict_nonnegative_number(deviation_pct),
+        "anchor_price": anchor,
+        "reference_price": anchor,
+        "anchor": anchor,
+        "reason": str(reason or ""),
+    }
+
+
+def _hidden_price_plan(
+    quote: Quote,
+    actual_date: str = "",
+    context: str = "",
+    reason: str = "",
+    *,
+    provenance: dict[str, object] | None = None,
+    tolerance_pct=None,
+    reference_price=None,
+) -> PricePlan:
+    provenance = (
+        dict(provenance)
+        if isinstance(provenance, dict)
+        else _plan_provenance(
+            quote,
+            actual_date,
+            context,
+            reason,
+            tolerance_pct=tolerance_pct,
+            reference_price=reference_price,
+        )
+    )
+    provenance["reason"] = str(reason or "")
+    evidence = [reason] if reason else []
+    return PricePlan("unknown", 0.0, None, None, None, None, None, None, None, None, None, "invalid", evidence, provenance, False)
+
+
+def price_plan_levels_valid(plan: PricePlan | None) -> bool:
+    """Return whether every persisted level has a finite, safe ordering."""
+    if not isinstance(plan, PricePlan):
+        return False
+    names = ("reference_price", "atr", "support", "resistance", "attention_low", "attention_high", "confirmation", "sell_low", "sell_high", "invalidation")
+    values: dict[str, float] = {}
+    for name in names:
+        value = _strict_positive_number(getattr(plan, name, None))
+        if value is None:
+            return False
+        values[name] = value
+    # Keep the semantic order explicit.  Reference price is the close anchor,
+    # while support/invalidation and confirmation/sell zones must not overlap.
+    return (
+        values["invalidation"] < values["attention_low"] <= values["attention_high"]
+        < values["confirmation"] <= values["sell_low"] <= values["sell_high"]
+        and values["invalidation"] < values["support"] <= values["resistance"] <= values["confirmation"]
+    )
+
+
+def price_plan_is_validated(plan: PricePlan | None) -> bool:
+    """Require the explicit v0.12 validation marker and fixed provenance."""
+    if not isinstance(plan, PricePlan) or plan.validated is not True or plan.quality != "good":
+        return False
+    provenance = plan.provenance if isinstance(plan.provenance, dict) else {}
+    actual_date = _normalize_plan_date(provenance.get("actual_date"))
+    last_date = _normalize_plan_date(provenance.get("last_date"))
+    reference = _strict_positive_number(plan.reference_price)
+    last_close = _strict_positive_number(provenance.get("last_close"))
+    tolerance = _strict_nonnegative_number(provenance.get("tolerance_pct"))
+    if (
+        provenance.get("context") != "daily_close"
+        or str(provenance.get("basis") or "").strip().casefold() != "unadjusted"
+        or not _source_is_trusted(provenance.get("source"))
+        or not actual_date
+        or last_date != actual_date
+        or reference is None
+        or last_close is None
+        or tolerance is None
+        or tolerance > _MAX_PRICE_PLAN_TOLERANCE_PCT
+        or not price_plan_levels_valid(plan)
+    ):
+        return False
+
+    # New plans must carry an explicit close tolerance and anchor.  The
+    # optional legacy alias is checked when present, but old plans lacking the
+    # new provenance contract remain hidden and unverified.
+    required_anchor_fields = ("anchor_price", "reference_price")
+    if any(field not in provenance for field in required_anchor_fields):
+        return False
+    for field in ("anchor_price", "reference_price", "anchor"):
+        if field not in provenance:
+            continue
+        anchor = _strict_positive_number(provenance.get(field))
+        if anchor is None or not math.isclose(anchor, reference, rel_tol=1e-9, abs_tol=1e-9):
+            return False
+
+    deviation = abs(last_close - reference) / reference * 100
+    if not math.isfinite(deviation) or deviation > tolerance + 1e-9:
+        return False
+    if "deviation_pct" in provenance and provenance.get("deviation_pct") is not None:
+        recorded = _strict_nonnegative_number(provenance.get("deviation_pct"))
+        if recorded is None or not math.isclose(recorded, deviation, rel_tol=1e-7, abs_tol=1e-7):
+            return False
+    return True
+
+
+def validate_price_plan(
+    plan: PricePlan | None,
+    quote: Quote,
+    actual_date: str = "",
+    tolerance_pct: float = 1.0,
+    *,
+    context: str = "daily_close",
+) -> PricePlan:
+    """Validate a plan only against a matching unadjusted daily close."""
+    actual = _normalize_plan_date(actual_date)
+    reference = _strict_positive_number(getattr(plan, "reference_price", None)) if plan else None
+    last_close = _strict_positive_number(getattr(quote, "indicator_last_close", None))
+    tolerance = _strict_nonnegative_number(tolerance_pct)
+    provenance = _plan_provenance(
+        quote,
+        actual,
+        context,
+        tolerance_pct=tolerance,
+        reference_price=reference,
+    )
+    failures: list[str] = []
+    if context != "daily_close":
+        failures.append("仅收盘日线计划可验证")
+    if not actual:
+        failures.append("缺少有效实际交易日")
+    if provenance["basis"] != "unadjusted":
+        failures.append("日线价格不是未复权口径")
+    if not _source_is_trusted(provenance.get("source")):
+        failures.append("日线来源不可信或缺失")
+    last_date = _normalize_plan_date(provenance.get("last_date"))
+    if not last_date or last_date != actual:
+        failures.append("指标最后日期与实际交易日不一致")
+    if reference is None or last_close is None:
+        failures.append("收盘价或计划参考价不是有限正数")
+    if tolerance is None or tolerance > _MAX_PRICE_PLAN_TOLERANCE_PCT:
+        failures.append("容差不是0到20之间的有限非负数")
+    deviation = None
+    if reference is not None and last_close is not None:
+        deviation = abs(last_close - reference) / reference * 100
+        provenance["deviation_pct"] = deviation
+        if tolerance is not None and tolerance <= _MAX_PRICE_PLAN_TOLERANCE_PCT and deviation > tolerance + 1e-9:
+            failures.append(f"收盘价与参考价偏差{deviation:.4f}%超过{tolerance:.4f}%")
+    if not price_plan_levels_valid(plan):
+        failures.append("价位顺序或数值无效")
+    if failures:
+        provenance["reason"] = "；".join(failures)
+        return _hidden_price_plan(quote, actual, context, provenance["reason"], provenance=provenance)
+    provenance["reason"] = ""
+    return PricePlan(
+        plan.state,
+        reference,
+        _finite_positive(plan.atr),
+        _finite_positive(plan.support),
+        _finite_positive(plan.resistance),
+        _finite_positive(plan.attention_low),
+        _finite_positive(plan.attention_high),
+        _finite_positive(plan.confirmation),
+        _finite_positive(plan.sell_low),
+        _finite_positive(plan.sell_high),
+        _finite_positive(plan.invalidation),
+        "good",
+        list(plan.evidence or []),
+        provenance,
+        True,
+    )
+
+
+def build_price_plan(
+    quote: Quote,
+    tick: float = 0.01,
+    *,
+    context: str = "",
+    actual_date: str = "",
+    tolerance_pct: float = 1.0,
+) -> PricePlan:
+    """Derive reference zones, validating only when context is daily_close."""
+    try:
+        tick = float(tick)
+    except (TypeError, ValueError, OverflowError):
+        tick = 0.01
+    if not math.isfinite(tick) or tick <= 0:
+        tick = 0.01
+
     def rounded(value: float | None) -> float | None:
         if value is None or value <= 0:
             return None
         return round(round(value / tick) * tick, 2)
 
-    if tick <= 0:
-        tick = 0.01
-    price = float(quote.price or 0)
-    if not all(map(math.isfinite, [price])):
-        return PricePlan("unknown", 0.0, None, None, None, None, None, None, None, None, None, "invalid", ["价格数据不是有限数值"])
-    atr = float(quote.atr14) if quote.atr14 and quote.atr14 > 0 else None
-    support = float(quote.support20) if quote.support20 and quote.support20 > 0 else None
-    resistance = float(quote.resistance20) if quote.resistance20 and quote.resistance20 > 0 else None
+    price = _finite_positive(getattr(quote, "price", None))
+    if price is None:
+        return _hidden_price_plan(quote, actual_date, context, "价格数据不是有限正数", tolerance_pct=tolerance_pct)
+    atr = _finite_positive(getattr(quote, "atr14", None))
+    support = _finite_positive(getattr(quote, "support20", None))
+    resistance = _finite_positive(getattr(quote, "resistance20", None))
     evidence: list[str] = []
-    if atr is None or not math.isfinite(atr) or quote.history_days < 20:
-        return PricePlan("unknown", price, atr, support, resistance, None, None, None, None, None, None, "insufficient", ["历史数据不足20根，暂不计算参考价位"])
+    if atr is None or int(getattr(quote, "history_days", 0) or 0) < 20:
+        plan = PricePlan("unknown", price, atr, support, resistance, None, None, None, None, None, None, "insufficient", ["历史数据不足20根，暂不计算参考价位"], _plan_provenance(quote, actual_date, context, tolerance_pct=tolerance_pct, reference_price=price), False)
+        return validate_price_plan(plan, quote, actual_date, tolerance_pct, context=context) if context == "daily_close" else plan
     if support is None:
         support = max(0.01, price - 1.5 * atr)
         evidence.append("支撑位使用 ATR 回退估计")
@@ -425,8 +762,67 @@ def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
     sell_low = confirmation + atr
     sell_high = sell_low + atr
     invalidation = max(0.01, support - atr)
-    state = "invalidated" if price <= invalidation else "near_sell" if price >= sell_low else "confirmed" if price >= confirmation and quote.volume_ratio is not None and quote.volume_ratio >= 1.0 else "in_attention" if attention_low <= price <= attention_high else "between"
-    return PricePlan(state, price, rounded(atr), rounded(support), rounded(resistance), rounded(attention_low), rounded(attention_high), rounded(confirmation), rounded(sell_low), rounded(sell_high), rounded(invalidation), "good", evidence)
+    state = "invalidated" if price <= invalidation else "near_sell" if price >= sell_low else "confirmed" if price >= confirmation else "in_attention" if attention_low <= price <= attention_high else "between"
+    plan = PricePlan(state, price, rounded(atr), rounded(support), rounded(resistance), rounded(attention_low), rounded(attention_high), rounded(confirmation), rounded(sell_low), rounded(sell_high), rounded(invalidation), "good", evidence, _plan_provenance(quote, actual_date, context, tolerance_pct=tolerance_pct, reference_price=price), False)
+    return validate_price_plan(plan, quote, actual_date, tolerance_pct, context=context) if context == "daily_close" else plan
+
+
+def build_price_plan_for_context(quote: Quote, actual_date: str = "", *, context: str = "", tolerance_pct: float = 1.0, tick: float = 0.01) -> PricePlan:
+    """Named wrapper for callers that need to make context explicit."""
+    return build_price_plan(quote, tick, context=context, actual_date=actual_date, tolerance_pct=tolerance_pct)
+
+
+def price_plan_distance(plan: PricePlan | None, current_price) -> tuple[float, float] | None:
+    """Return (absolute, percentage) distance from a validated plan anchor."""
+    if not price_plan_is_validated(plan):
+        return None
+    reference = _finite_positive(plan.reference_price)
+    current = _finite_positive(current_price)
+    if reference is None or current is None:
+        return None
+    absolute = current - reference
+    return absolute, absolute / reference * 100
+
+
+def format_plan_distance(plan: PricePlan | None, current_price) -> str:
+    """Format one consistent candidate-vs-current price comparison line."""
+    distance = price_plan_distance(plan, current_price)
+    if distance is None:
+        return ""
+    absolute, percent = distance
+    return f"候选参考价{plan.reference_price:.2f}，实时当前价{float(current_price):.2f}，距离{absolute:+.2f}（{percent:+.2f}%）"
+
+
+def _stored_plan_is_validated(plan: dict) -> bool:
+    """Validate the persisted marker without trusting arbitrary JSON values."""
+    if not isinstance(plan, dict) or plan.get("validated") is not True or plan.get("quality") != "good":
+        return False
+    provenance = plan.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("context") != "daily_close" or provenance.get("basis") != "unadjusted":
+        return False
+    try:
+        parsed = PricePlan(
+            str(plan.get("state") or "unknown"),
+            plan.get("reference_price"), plan.get("atr"), plan.get("support"), plan.get("resistance"),
+            plan.get("attention_low"), plan.get("attention_high"), plan.get("confirmation"),
+            plan.get("sell_low"), plan.get("sell_high"), plan.get("invalidation"), "good",
+            plan.get("evidence") if isinstance(plan.get("evidence"), list) else [], provenance, True,
+        )
+        return price_plan_is_validated(parsed)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def format_stored_plan_distance(plan: dict, current_price) -> str:
+    """Stored-row counterpart of :func:`format_plan_distance`."""
+    if not _stored_plan_is_validated(plan):
+        return ""
+    reference = _finite_positive(plan.get("reference_price"))
+    current = _finite_positive(current_price)
+    if reference is None or current is None:
+        return ""
+    absolute = current - reference
+    return f"候选参考价{reference:.2f}，实时当前价{current:.2f}，距离{absolute:+.2f}（{absolute / reference * 100:+.2f}%）"
 
 
 def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
@@ -445,7 +841,8 @@ def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
         unknown_state = True
     if not math.isfinite(float(quote.price)) or quote.price <= 0:
         flags.append("价格无效")
-    if quote.atr14 is not None and quote.support20 is not None and math.isfinite(float(quote.atr14)) and math.isfinite(float(quote.support20)) and quote.price <= quote.support20 - quote.atr14:
+    plan = candidate.price_plan if candidate else None
+    if price_plan_is_validated(plan) and plan.invalidation is not None and _finite_positive(quote.price) is not None and quote.price <= plan.invalidation:
         flags.append("跌破失效位")
     if quote.history_days and quote.history_days < 20:
         flags.append("历史数据不足")
@@ -512,10 +909,10 @@ def score_quote(quote: Quote) -> Candidate:
         score -= 5
         reasons.append("波动率偏高-5")
     candidate = Candidate(quote, score, reasons, base_score=score)
+    candidate.price_plan = build_price_plan(quote)
     review = review_risk(quote, candidate)
     candidate.risk_level = review.verdict
     candidate.risk_flags = review.flags
-    candidate.price_plan = build_price_plan(quote)
     return candidate
 
 
@@ -610,8 +1007,8 @@ def format_stored_candidate(row: dict, index: int, pct_change=_PCT_UNSET) -> str
     reason_text = "、".join(reasons) or "技术指标有限"
 
     plan = _decode_stored_object(row.get("price_plan"))
-    levels = "历史数据不足"
-    if str(plan.get("quality") or "").strip().lower() == "good":
+    levels = "历史数据不足" if str(plan.get("quality") or "").strip().lower() == "insufficient" else "无已验证收盘计划"
+    if _stored_plan_is_validated(plan):
         invalid_price = any(
             key in plan and plan.get(key) is not None and _finite_format_number(plan.get(key)) is None
             for key in ("reference_price", "atr", "support", "resistance", "attention_low", "attention_high", "confirmation", "sell_low", "sell_high", "invalidation")
@@ -628,7 +1025,8 @@ def format_stored_candidate(row: dict, index: int, pct_change=_PCT_UNSET) -> str
             and float(attention_low) <= float(attention_high)
             and (plan.get("confirmation") is None or confirmation is not None)
         ):
-            levels = f"关注 {attention_low}-{attention_high}｜失效 {invalidation}"
+            reference = _format_stored_price(plan.get("reference_price"))
+            levels = f"参考 {reference or '未知'}｜关注 {attention_low}-{attention_high}｜失效 {invalidation}"
             if confirmation is not None:
                 levels = f"{levels}｜确认 {confirmation}"
 
@@ -661,6 +1059,7 @@ def format_candidate(candidate: Candidate) -> str:
     if quote.momentum5 is not None and quote.momentum20 is not None:
         metrics.append(f"5/20日动量={quote.momentum5:+.1f}%/{quote.momentum20:+.1f}%")
     evidence = "、".join(metrics) or "当前可用技术指标不足"
+    volume_evidence = f"量比{quote.volume_ratio:.2f}" if quote.volume_ratio is not None and _finite_format_number(quote.volume_ratio) is not None else "量能证据不足"
     factor_line = ""
     overlay = candidate.factor_overlay
     if overlay:
@@ -674,11 +1073,16 @@ def format_candidate(candidate: Candidate) -> str:
     if not metrics:
         risk_items.append("技术数据不足，评分参考价值有限")
     risk_text = "；".join(risk_items) if risk_items else "暂未触发机械风险项，但指标可能滞后或不完整"
-    plan = candidate.price_plan or build_price_plan(quote)
-    if plan.quality == "good":
+    plan = candidate.price_plan
+    if price_plan_is_validated(plan):
         levels = f"关注区{plan.attention_low:.2f}-{plan.attention_high:.2f}，确认位{plan.confirmation:.2f}，参考卖出区{plan.sell_low:.2f}-{plan.sell_high:.2f}，失效位{plan.invalidation:.2f}"
+        distance = format_plan_distance(plan, quote.price)
+        if distance:
+            levels = f"{distance}；{levels}"
+    elif plan is not None and plan.quality == "insufficient":
+        levels = "历史数据不足，暂不计算参考价位"
     else:
-        levels = "参考价位：历史数据不足，暂不计算"
+        levels = "无已验证收盘计划，暂不展示价位"
     conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；价位仅供人工研究"
     composite_line = f"综合评分：{candidate.composite_score}/70\n" if candidate.composite_score is not None else ""
     pct_text = _format_pct_change(quote.pct_change)
@@ -689,6 +1093,7 @@ def format_candidate(candidate: Candidate) -> str:
         f"技术评分：{candidate.base_score}/{candidate.score_max}（规则加分：{why}）\n"
         f"{composite_line}"
         f"技术证据：{evidence}\n"
+        f"量能证据：{volume_evidence}\n"
         f"{factor_line}"
         f"参考价位：{levels}\n"
         f"风险审核：{risk_label(candidate.risk_level)}；{risk_text}\n"
@@ -707,12 +1112,17 @@ def format_compact_candidate(candidate: Candidate, index: int) -> str:
     reason_text = "、".join(reasons) or "技术指标有限"
     plan = candidate.price_plan
     score_label = "综合" if candidate.composite_score is not None else "技术"
-    if plan and plan.quality == "good" and plan.attention_low is not None and plan.attention_high is not None and plan.invalidation is not None:
-        levels = f"关注 {plan.attention_low:.2f}-{plan.attention_high:.2f}｜失效 {plan.invalidation:.2f}"
+    if price_plan_is_validated(plan):
+        distance = format_plan_distance(plan, quote.price)
+        levels = f"参考 {plan.reference_price:.2f}｜关注 {plan.attention_low:.2f}-{plan.attention_high:.2f}｜失效 {plan.invalidation:.2f}"
         if plan.confirmation is not None:
             levels = f"{levels}｜确认 {plan.confirmation:.2f}"
-    else:
+        if distance:
+            levels = f"{levels}｜{distance}"
+    elif plan is not None and plan.quality == "insufficient":
         levels = "历史数据不足"
+    else:
+        levels = "无已验证收盘计划"
     return (
         f"{index}. {name}（{quote.code}）｜{score_label} {candidate.score}/{candidate.score_max}｜{_format_pct_change(quote.pct_change)}｜{risk}\n"
         f"   看点：{reason_text}\n"

@@ -14,7 +14,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, format_candidate, format_compact_candidate, format_stored_compact_candidate, in_trading_session, is_tradable, normalize_code, parse_codes, risk_label, score_quote
+from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, build_price_plan, format_candidate, format_compact_candidate, format_stored_compact_candidate, in_trading_session, is_tradable, normalize_code, parse_codes, price_plan_is_validated, risk_label, review_risk, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
 from .providers import HttpRuntime, OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.11.1")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.12.0")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -37,6 +37,7 @@ class Main(Star):
             str(self.config.get("tushare_token", "")),
             self._int("max_concurrency", 8, 1, 64),
             self.http,
+            self.store,
         )
         self.news = RssNewsProvider(str(self.config.get("news_rss_url", "")), timeout, self.http)
         self.llm = OpenAICompatibleClient(
@@ -92,24 +93,53 @@ class Main(Star):
             fields = PricePlan.__dataclass_fields__
             if not isinstance(raw, dict) or not raw.get("quality"):
                 return None
-            return PricePlan(**{key: raw.get(key) for key in fields})
-        except (TypeError, ValueError):
+            # Do not pass absent v0.12 fields as explicit None: dataclass
+            # defaults preserve legacy JSON as unvalidated/hidden.
+            values = {key: raw[key] for key in fields if key in raw}
+            if "evidence" in values and not isinstance(values["evidence"], list):
+                values["evidence"] = []
+            if "provenance" in values and not isinstance(values["provenance"], dict):
+                values["provenance"] = {}
+            if "validated" in values:
+                values["validated"] = values["validated"] is True
+            return PricePlan(**values)
+        except (TypeError, ValueError, KeyError):
             return None
 
     @staticmethod
     def _price_state_for_plan(quote, plan: PricePlan | None) -> str:
         """Evaluate the immutable closing plan against a fresh intraday quote."""
-        if not plan or plan.quality != "good" or quote.price <= 0:
+        if not price_plan_is_validated(plan) or quote.price <= 0:
             return "unknown"
         if plan.invalidation is not None and quote.price <= plan.invalidation:
             return "invalidated"
         if plan.sell_low is not None and quote.price >= plan.sell_low:
             return "near_sell"
-        if plan.confirmation is not None and quote.price >= plan.confirmation and quote.volume_ratio is not None and quote.volume_ratio >= 1:
+        if plan.confirmation is not None and quote.price >= plan.confirmation:
             return "confirmed"
         if plan.attention_low is not None and plan.attention_high is not None and plan.attention_low <= quote.price <= plan.attention_high:
             return "in_attention"
         return "between"
+
+    @staticmethod
+    def _unadjusted_bars(bars) -> list[dict]:
+        """Keep technical calculations on explicitly unadjusted rows only."""
+        result = []
+        for row in bars or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("price_basis") or "unknown").strip().lower() != "unadjusted":
+                continue
+            result.append(row)
+        return result
+
+    def _daily_close_plan(self, quote, actual_date: str) -> PricePlan:
+        return build_price_plan(
+            quote,
+            context="daily_close",
+            actual_date=actual_date,
+            tolerance_pct=self._float("price_plan_close_tolerance_pct", 1.0, 0.0, 20.0),
+        )
 
     def _candidate_valid_until(self, actual_date: str) -> str | None:
         """Return a loose integrity bound; calendar open-count owns expiry."""
@@ -432,8 +462,47 @@ class Main(Star):
             merged.extend(codes)
         return list(dict.fromkeys(merged))
 
-    async def _score_quotes(self, quotes, limit: int, as_of: str = "", include_factors: bool = True):
-        """Run the bounded, layered screen and persist diagnostics in memory."""
+    def _resolve_stock_query(self, query: str) -> dict:
+        """Resolve a command argument through the shared code/name registry."""
+        raw = str(query or "").strip()
+        codes = parse_codes(raw)
+        if len(codes) == 1 and (raw == codes[0] or normalize_code(raw) == codes[0]):
+            return {"status": "ok", "query": raw, "code": codes[0], "name": "", "matches": []}
+        resolver = getattr(self.store, "resolve_stock_symbol", None) or getattr(self.store, "resolve_stock", None)
+        if callable(resolver):
+            try:
+                return resolver(raw, 10)
+            except TypeError:
+                return resolver(raw)
+        return {"status": "miss", "query": raw, "matches": []}
+
+    @staticmethod
+    def _parse_cost(value) -> float | None:
+        raw = str(value or "").strip()
+        if not raw or isinstance(value, bool) or not re.fullmatch(r"[+]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|[+]?\.\d+(?:[eE][+-]?\d+)?", raw):
+            return None
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+    @staticmethod
+    def _ambiguous_stock_text(result: dict) -> str:
+        matches = result.get("matches") if isinstance(result, dict) else []
+        labels = [f"{item.get('name') or '名称未知'}（{item.get('code') or '未知'}）" for item in matches[:10] if isinstance(item, dict)]
+        return "股票名称有歧义，请改用代码或更完整名称：" + "、".join(labels)
+
+    async def _score_quotes(
+        self,
+        quotes,
+        limit: int,
+        as_of: str = "",
+        include_factors: bool = True,
+        *,
+        context: str = "realtime",
+    ):
+        """Run the bounded screen; only an explicit daily_close may validate plans."""
         quotes = list(quotes or [])
         if include_factors:
             await self._fill_quote_names(quotes, as_of)
@@ -446,26 +515,45 @@ class Main(Star):
         deep_limit = self._int("deep_screen_limit", 300, 1, 1000)
         enrich_targets = tradable[:deep_limit]
         before = as_of or datetime.now(CHINA_TZ).date().isoformat()
-        persistent = self.store.latest_daily_bars([q.code for q in enrich_targets], before_or_equal=before, limit=60) if enrich_targets else {}
+        load_daily_bars = getattr(self.store, "latest_daily_bars", None)
+        persistent = load_daily_bars([q.code for q in enrich_targets], before_or_equal=before, limit=60) if enrich_targets and callable(load_daily_bars) else {}
+        if not isinstance(persistent, dict):
+            persistent = {}
         indicator_status: dict[str, str] = {}
         network_targets = []
         for quote in enrich_targets:
-            bars = persistent.get(quote.code, [])
+            # Let the indicator calculator see the complete cached batch so a
+            # mixed basis/source set fails closed instead of being reduced to
+            # a seemingly valid subset first.
+            cached_rows = persistent.get(quote.code, [])
+            try:
+                bars = list(cached_rows or [])
+            except TypeError:
+                bars = []
             if apply_daily_indicators(quote, bars):
                 indicator_status[quote.code] = "persistent_cache"
             else:
                 network_targets.append(quote)
         if network_targets:
-            fetched = await self.quotes.enrich_indicators(
-                network_targets,
-                self._int("max_concurrency", 8, 1, 64),
-                as_of,
-            )
+            concurrency = self._int("max_concurrency", 8, 1, 64)
+            try:
+                fetched = await self.quotes.enrich_indicators(network_targets, concurrency, as_of)
+            except TypeError as exc:
+                # Keep lightweight integrations written against the pre-v0.12
+                # two-argument provider API usable without hiding other errors.
+                try:
+                    fetched = await self.quotes.enrich_indicators(network_targets, concurrency)
+                except TypeError:
+                    raise exc
+            if not isinstance(fetched, dict):
+                fetched = {}
             for quote in network_targets:
                 indicator_status[quote.code] = fetched.get(quote.code, "failed")
-                bars = self.quotes.history_bars.get(quote.code, [])
-                if bars:
-                    self.store.save_daily_bars(quote.code, bars, "eastmoney_indicator")
+                history_bars = getattr(self.quotes, "history_bars", {})
+                bars = history_bars.get(quote.code, []) if isinstance(history_bars, dict) else []
+                save_daily_bars = getattr(self.store, "save_daily_bars", None)
+                if bars and callable(save_daily_bars):
+                    save_daily_bars(quote.code, bars, "eastmoney_indicator", "unadjusted")
         indicator_counts = {
             "network": sum(1 for value in indicator_status.values() if value == "network"),
             "memory_cache": sum(1 for value in indicator_status.values() if value == "memory_cache"),
@@ -483,13 +571,25 @@ class Main(Star):
         }
         # Scores are only produced for deep-screen objects, never for the
         # entire cheap-filter universe.
-        scored = [score_quote(quote) for quote in enrich_targets]
-        full_market = self.store.daily_quotes(as_of) if as_of else []
+        scored = []
+        for quote in enrich_targets:
+            candidate = score_quote(quote)
+            if context == "daily_close":
+                candidate.price_plan = self._daily_close_plan(quote, as_of)
+                review = review_risk(quote, candidate)
+                candidate.risk_level = review.verdict
+                candidate.risk_flags = review.flags
+            scored.append(candidate)
+        load_market_quotes = getattr(self.store, "daily_quotes", None)
+        full_market = load_market_quotes(as_of) if as_of and callable(load_market_quotes) else []
+        if not isinstance(full_market, list):
+            full_market = []
         market_minimum = self._int("market_min_snapshot_size", 4000, 1000, 10000)
         market_quotes = full_market if len(full_market) >= market_minimum else quotes
         market = assess_market_context(market_quotes)
-        if as_of:
-            self.store.save_market_context(as_of, {
+        save_market_context = getattr(self.store, "save_market_context", None)
+        if as_of and callable(save_market_context):
+            save_market_context(as_of, {
                 "regime": market.regime, "breadth": market.breadth, "advancing": market.advancing,
                 "declining": market.declining, "total_amount": market.total_amount, "evidence": market.evidence,
             }, "daily_snapshot" if len(full_market) >= market_minimum else "input_subset", "good" if len(full_market) >= market_minimum else "partial")
@@ -532,8 +632,10 @@ class Main(Star):
                         factor_quality = "partial"
                 except Exception:
                     logger.warning("[%s] Tushare 因子补充不可用", PLUGIN_NAME)
-        if as_of:
+        if as_of and callable(getattr(self.store, "factor_snapshots", None)):
             cached_rows = self.store.factor_snapshots(as_of)
+            if not isinstance(cached_rows, dict):
+                cached_rows = {}
             cache_hits = 0
             for code in [item.quote.code for item in factor_targets]:
                 if code not in raw_factors and code in cached_rows:
@@ -542,8 +644,9 @@ class Main(Star):
             if cache_hits:
                 factor_name = f"{factor_name}+cache" if factor_name else "cache"
                 factor_quality = "cached" if factor_name == "cache" else "partial"
-        if as_of and raw_factors:
-            self.store.save_factor_snapshots(as_of, raw_factors, factor_name or factor_source, factor_quality)
+        save_factor_snapshots = getattr(self.store, "save_factor_snapshots", None)
+        if as_of and raw_factors and callable(save_factor_snapshots):
+            save_factor_snapshots(as_of, raw_factors, factor_name or factor_source, factor_quality)
 
         adjustment = market_adjustment(market.regime)
         momentum_values = [item.quote.momentum5 for item in factor_targets if item.quote.momentum5 is not None and math.isfinite(item.quote.momentum5)]
@@ -663,7 +766,7 @@ class Main(Star):
         status, quality, error = "completed", "partial", None
         try:
             quotes = await self.quotes.fetch_quotes(codes)
-            candidates = await self._score_quotes(quotes, limit, requested_date)
+            candidates = await self._score_quotes(quotes, limit, requested_date, context="daily_close")
             floor = self._float("screen_min_indicator_coverage", 0.8, 0.0, 1.0)
             coverage = float(self._last_screen_diagnostics.get("indicator_coverage", 0.0) or 0.0)
             status = "completed" if coverage >= floor else "degraded"
@@ -712,8 +815,12 @@ class Main(Star):
         return f"模型补充（未验证）：{summary}；风险{self._clean_external_text(annotation.get('risk_level', 'unknown'), 20)}；参考：{evidence or '未提供'}"
 
     def _cost_signal(self, quote, cost_price: float | None) -> str:
+        try:
+            cost_price = float(cost_price) if cost_price is not None else None
+        except (TypeError, ValueError, OverflowError):
+            cost_price = None
         if (
-            not cost_price
+            cost_price is None
             or quote.suspended is None
             or quote.limit_up is None
             or quote.limit_down is None
@@ -1014,7 +1121,7 @@ class Main(Star):
                 cached = []
                 actual_date = trade_date
             if cached:
-                return await self._score_quotes(cached, limit, actual_date or trade_date)
+                return await self._score_quotes(cached, limit, actual_date or trade_date, context="daily_close")
         return await self._scan(self._universe(), limit, record=False, job_name="daily_screen")
 
     def _record_screen(
@@ -1195,7 +1302,7 @@ class Main(Star):
                                 health["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
                                 health_counted = True
                             quotes_by_code = {quote.code: quote for quote in quotes}
-                            await self._score_quotes(quotes, len(quotes), include_factors=False)
+                            await self._score_quotes(quotes, len(quotes), include_factors=False, context="realtime")
                             # Monitoring evaluates every watched quote so risk states are not
                             # lost merely because the stock is not a screening candidate.
                             by_code = {quote.code: score_quote(quote) for quote in quotes}
@@ -1227,10 +1334,13 @@ class Main(Star):
                                     if candidate and stored:
                                         candidate.price_plan = self._price_plan_from_payload(str(stored.get("price_plan") or ""))
                                         candidate.risk_level = str(stored.get("risk_level") or candidate.risk_level)
-                                        candidate.risk_flags = json.loads(stored.get("risk_flags") or "[]")
+                                        raw_flags = json.loads(stored.get("risk_flags") or "[]")
+                                        candidate.risk_flags = raw_flags if isinstance(raw_flags, list) else []
                                     plan_candidate = candidate if stored else None
-                                    if quote and not plan_candidate:
+                                    has_valid_plan = bool(plan_candidate and price_plan_is_validated(plan_candidate.price_plan))
+                                    if quote and not has_valid_plan:
                                         self.store.reset_confirmation(origin, code, run_id=run_id)
+                                    minute_signal = minute_signals.get(code, "") if candidate else ""
                                     if quote and code in completed_codes and not minute_signal:
                                         self.store.reset_confirmation(origin, "minute:" + code, run_id=run_id)
                                     plan_state = self._price_state_for_plan(quote, plan_candidate.price_plan) if quote and plan_candidate else "unknown"
@@ -1238,9 +1348,10 @@ class Main(Star):
                                         quote.suspended is None or quote.limit_up is None or quote.limit_down is None
                                     )
                                     alert_risk_known = bool(candidate) and candidate.risk_level not in {"unknown", "blocked"} and not quote_risk_unknown
-                                    minute_signal = minute_signals.get(code, "") if alert_risk_known else ""
+                                    if not alert_risk_known:
+                                        minute_signal = ""
                                     cost_signal = self._cost_signal(quote, watch_details.get(origin, {}).get(code)) if quote and alert_risk_known else ""
-                                    price_signal = bool(plan_candidate) and alert_risk_known
+                                    price_signal = has_valid_plan and alert_risk_known
                                     state_changed = price_signal and self.store.price_state(origin, code, run_id=run_id) != plan_state
                                     if plan_candidate and plan_candidate.risk_level == "unknown" and price_signal:
                                         price_signal = False
@@ -1379,7 +1490,7 @@ class Main(Star):
                     "可能是 Tushare 尚未发布该日期数据，或行情接口暂时不可用。"
                 )
                 return
-            candidates = await self._score_quotes(quotes, limit, actual_date)
+            candidates = await self._score_quotes(quotes, limit, actual_date, context="daily_close")
             snapshot = self._snapshot_context(trade_date, actual_date, quotes)
             run_id = self._record_screen(trade_date, actual_date, snapshot["source"], quotes, candidates, status="completed" if snapshot["complete"] else "degraded", quality=snapshot["quality"])
             if not run_id:
@@ -1559,44 +1670,94 @@ class Main(Star):
         horizon = max(1, min(int(horizon or 5), 20))
         as_of = str(rows[0].get("actual_trade_date") or "")
         run_id = str(rows[0].get("run_id") or "")
+        try:
+            as_of_date = datetime.strptime(as_of, "%Y-%m-%d").date()
+            if as_of_date.isoformat() != as_of:
+                raise ValueError("non-canonical as_of")
+        except (TypeError, ValueError, OverflowError):
+            yield event.plain_result("验证暂不可用：候选基准日无效。")
+            return
         evaluated = 0
         details = []
         returns = []
-        base = self.store.daily_quotes(as_of)
+        load_base_quotes = getattr(self.store, "daily_quotes", None)
+        base = load_base_quotes(as_of) if callable(load_base_quotes) else []
+        if not isinstance(base, list):
+            base = []
         for row in rows:
-            base_quote = next((q for q in base if q.code == row["code"]), None)
+            plan = self._price_plan_from_payload(str(row.get("price_plan") or ""))
+            if not price_plan_is_validated(plan):
+                # Legacy or adjusted plans are intentionally not replayable.
+                continue
+            provenance = plan.provenance if isinstance(plan.provenance, dict) else {}
+            if str(provenance.get("actual_date") or "") != as_of:
+                continue
+            code = str(row.get("code") or "").strip()
+            if not code:
+                continue
+            base_quote = next((q for q in base if getattr(q, "code", "") == code), None)
             # This is deliberately evaluation-only. It never changes a prior screen.
             if base_quote:
-                evaluation_end = (datetime.fromisoformat(as_of).date() + timedelta(days=horizon * 3 + 7)).isoformat()
-                await self.quotes.enrich_indicators([base_quote], 1, evaluation_end)
-                bars = self.quotes.history_bars.get(base_quote.code, [])
-                if bars:
-                    self.store.save_daily_bars(base_quote.code, bars, "eastmoney_evaluation")
-            future_bars = self.store.daily_bars(row["code"], after=as_of)[:horizon]
-            future = [item for item in future_bars]
+                evaluation_end = (as_of_date + timedelta(days=horizon * 3 + 7)).isoformat()
+                try:
+                    await self.quotes.enrich_indicators([base_quote], 1, evaluation_end)
+                except TypeError as exc:
+                    try:
+                        await self.quotes.enrich_indicators([base_quote], 1)
+                    except TypeError:
+                        raise exc
+                history_bars = getattr(self.quotes, "history_bars", {})
+                bars = self._unadjusted_bars(history_bars.get(base_quote.code, []) if isinstance(history_bars, dict) else [])
+                save_daily_bars = getattr(self.store, "save_daily_bars", None)
+                if bars and callable(save_daily_bars):
+                    save_daily_bars(base_quote.code, bars, "eastmoney_evaluation", "unadjusted")
+            load_future_bars = getattr(self.store, "daily_bars", None)
+            raw_future = load_future_bars(code, after=as_of) if callable(load_future_bars) else []
+            future = []
+            for item in self._unadjusted_bars(raw_future):
+                try:
+                    values = {key: float(item[key]) for key in ("open", "high", "low", "close")}
+                    if not all(math.isfinite(value) and value > 0 for value in values.values()):
+                        continue
+                    if values["high"] < values["low"] or values["high"] < max(values["open"], values["close"]) or values["low"] > min(values["open"], values["close"]):
+                        continue
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                future.append({**item, **values})
+                if len(future) >= horizon:
+                    break
             if not base_quote or len(future) < horizon:
                 continue
             last = future[-1]
-            ret = (last["close"] - base_quote.price) / base_quote.price * 100 if base_quote.price else None
-            highs = [(item["high"] - base_quote.price) / base_quote.price * 100 for item in future]
-            lows = [(item["low"] - base_quote.price) / base_quote.price * 100 for item in future]
-            plan = json.loads(row.get("price_plan") or "{}")
+            try:
+                base_price = float(plan.reference_price)
+            except (TypeError, ValueError, OverflowError):
+                base_price = 0.0
+            if not math.isfinite(base_price) or base_price <= 0:
+                base_price = 0.0
+            if not base_price:
+                continue
+            ret = (last["close"] - base_price) / base_price * 100
+            highs = [(item["high"] - base_price) / base_price * 100 for item in future]
+            lows = [(item["low"] - base_price) / base_price * 100 for item in future]
             first_touch = None
             for item in future:
                 touches = []
-                if plan.get("invalidation") and item["low"] <= plan["invalidation"]:
+                if plan.invalidation and item["low"] <= plan.invalidation:
                     touches.append("失效位")
-                if plan.get("sell_low") and item["high"] >= plan["sell_low"]:
+                if plan.sell_low and item["high"] >= plan.sell_low:
                     touches.append("参考卖出区")
-                if plan.get("confirmation") and item["high"] >= plan["confirmation"]:
+                if plan.confirmation and item["high"] >= plan.confirmation:
                     touches.append("确认位")
                 if touches:
                     first_touch = "、".join(touches) if len(touches) == 1 else "同日多价位触达，日线无法判断先后（" + "、".join(touches) + "）"
                     break
-            self.store.save_result_evaluation(f"{run_id}:{row['code']}:{horizon}", run_id, row["code"], as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), first_touch, True)
+            save_evaluation = getattr(self.store, "save_result_evaluation", None)
+            if callable(save_evaluation):
+                save_evaluation(f"{run_id}:{code}:{horizon}", run_id, code, as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), first_touch, True, "unadjusted", True)
             evaluated += 1
             returns.append(ret)
-            details.append(f"{row['name']}（{row['code']}）：{ret:+.2f}%｜最大浮盈{max(highs):+.2f}%｜最大回撤{min(lows):+.2f}%｜关键位{first_touch or '未触达'}")
+            details.append(f"{row.get('name') or code}（{code}）：{ret:+.2f}%｜最大浮盈{max(highs):+.2f}%｜最大回撤{min(lows):+.2f}%｜关键位{first_touch or '未触达'}")
         if not details:
             yield event.plain_result(f"验证暂不可用：候选后续 K 线不足 {horizon} 个交易日。")
             return
@@ -1605,7 +1766,10 @@ class Main(Star):
 
     @filter.command("结果")
     async def results(self, event: AstrMessageEvent, count: int = 20):
-        rows = self.store.evaluations(limit=max(1, min(int(count or 20), 100)))
+        rows = [
+            row for row in self.store.evaluations(limit=max(1, min(int(count or 20), 100)))
+            if str(row.get("price_basis") or "unknown").strip().lower() == "unadjusted" and bool(row.get("plan_validated"))
+        ]
         if not rows:
             yield event.plain_result("暂无已保存的回放结果，请先执行 /验证 [天数]。")
             return
@@ -1619,22 +1783,28 @@ class Main(Star):
     @filter.command("自选")
     async def watch(self, event: AstrMessageEvent, action: str = "", code: str = "", cost: str = ""):
         origin, action = self._origin(event), str(action or "").strip().lower()
-        raw_parts = (str(code or "") + " " + str(cost or "")).replace("，", " ").replace(",", " ").split()
-        codes = parse_codes(raw_parts[:1])
-        cost_price = None
-        if len(raw_parts) > 1:
-            try:
-                parsed = float(raw_parts[1])
-                if math.isfinite(parsed) and parsed > 0:
-                    cost_price = parsed
-            except (TypeError, ValueError):
-                cost_price = None
-        if action in {"添加", "add"} and codes:
-            if len(raw_parts) > 1 and cost_price is None:
+        raw_code = str(code or "").strip()
+        raw_cost = str(cost or "").strip()
+        # Some adapters pass the command tail as the first argument.  Split
+        # only the optional numeric suffix and keep Chinese names intact.
+        if not raw_cost and raw_code:
+            parts = raw_code.replace("，", " ").replace(",", " ").split()
+            if len(parts) > 1 and self._parse_cost(parts[-1]) is not None:
+                raw_code, raw_cost = " ".join(parts[:-1]), parts[-1]
+        cost_price = self._parse_cost(raw_cost) if raw_cost else None
+        if action in {"添加", "add"}:
+            if raw_cost and cost_price is None:
                 yield event.plain_result("用法：/自选 添加 600000 [成本价]")
                 return
-            code_value = codes[0]
-            stock_name = None
+            resolved = self._resolve_stock_query(raw_code)
+            if resolved.get("status") == "ambiguous":
+                yield event.plain_result(self._ambiguous_stock_text(resolved))
+                return
+            if resolved.get("status") != "ok" or not resolved.get("code"):
+                yield event.plain_result("未找到股票，请使用六位代码或已同步的股票名称。")
+                return
+            code_value = str(resolved["code"])
+            stock_name = str(resolved.get("name") or "").strip() or None
             try:
                 matched = await self.quotes.fetch_quotes([code_value])
                 if matched and matched[0].name.strip():
@@ -1651,9 +1821,16 @@ class Main(Star):
             suffix = f"，成本价 {cost_price:.2f}" if cost_price else ""
             label = f"{stock_name}（{code_value}）" if stock_name else code_value
             yield event.plain_result(("已加入自选：" if ok else "添加失败，可能已达到数量上限：") + label + suffix)
-        elif action in {"删除", "移除", "del", "remove"} and codes:
+        elif action in {"删除", "移除", "del", "remove"}:
+            resolved = self._resolve_stock_query(raw_code)
+            if resolved.get("status") == "ambiguous":
+                yield event.plain_result(self._ambiguous_stock_text(resolved))
+                return
+            if resolved.get("status") != "ok" or not resolved.get("code"):
+                yield event.plain_result("未找到股票，请使用六位代码或已同步的股票名称。")
+                return
             existing = {item_code: item_name for item_code, item_name, _ in self.store.list_watch_details_with_names(origin)}
-            code_value = codes[0]
+            code_value = str(resolved["code"])
             label = f"{existing.get(code_value) or code_value}（{code_value}）" if existing.get(code_value) else code_value
             yield event.plain_result(("已移除：" if self.store.remove_watch(origin, code_value) else "自选中没有：") + label)
         else:
@@ -1721,14 +1898,53 @@ class Main(Star):
 
     @filter.command("行情")
     async def quote(self, event: AstrMessageEvent, code: str = ""):
-        codes = parse_codes(code)
+        raw_query = str(code or "").strip()
+        codes = parse_codes(raw_query)
+        if not codes and raw_query:
+            resolved = self._resolve_stock_query(raw_query)
+            if resolved.get("status") == "ambiguous":
+                yield event.plain_result(self._ambiguous_stock_text(resolved))
+                return
+            if resolved.get("status") == "ok" and resolved.get("code"):
+                codes = [str(resolved["code"])]
+            else:
+                yield event.plain_result("未找到股票，请使用六位代码或已同步的股票名称。")
+                return
         if not codes:
             yield event.plain_result("用法：/行情 600000")
             return
         try:
             quotes = await self.quotes.fetch_quotes(codes[:10])
-            await self.quotes.enrich_indicators(quotes, self._int("max_concurrency", 5, 1, 20))
-            yield event.plain_result("\n".join(format_candidate(score_quote(item)) for item in quotes) or "没有拿到行情，可能是接口限流。")
+            concurrency = self._int("max_concurrency", 5, 1, 20)
+            try:
+                await self.quotes.enrich_indicators(quotes, concurrency)
+            except TypeError as exc:
+                try:
+                    await self.quotes.enrich_indicators(quotes, concurrency, "")
+                except TypeError:
+                    raise exc
+            load_candidates = getattr(self.store, "latest_screen_candidates", None)
+            rows = load_candidates(self._int("candidate_limit", 30, 1, 100)) if callable(load_candidates) else []
+            if not isinstance(rows, list):
+                rows = []
+            stored = {str(row.get("code")): row for row in rows if isinstance(row, dict) and row.get("code")}
+            candidates = []
+            for item in quotes:
+                candidate = score_quote(item)
+                row = stored.get(item.code)
+                if row:
+                    plan = self._price_plan_from_payload(str(row.get("price_plan") or ""))
+                    candidate.price_plan = plan if price_plan_is_validated(plan) else None
+                    candidate.risk_level = str(row.get("risk_level") or candidate.risk_level)
+                    try:
+                        flags = json.loads(row.get("risk_flags") or "[]")
+                        candidate.risk_flags = flags if isinstance(flags, list) else []
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        candidate.risk_flags = []
+                else:
+                    candidate.price_plan = None
+                candidates.append(candidate)
+            yield event.plain_result("\n".join(format_candidate(item) for item in candidates) or "没有拿到行情，可能是接口限流。")
         except Exception:
             logger.exception("[%s] 行情查询失败", PLUGIN_NAME)
             yield event.plain_result("行情查询失败，请稍后重试。")

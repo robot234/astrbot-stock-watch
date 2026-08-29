@@ -39,6 +39,7 @@
   "report_candidate_limit": {"type": "int", "description": "全市场报告默认展示的候选数量", "default": 10},
   "auto_watch_candidates": {"type": "bool", "description": "盘中自动监听最近候选池", "default": true},
   "candidate_plan_valid_days": {"type": "int", "description": "收盘候选价位计划用于盘中监听的有效天数", "default": 10},
+  "price_plan_close_tolerance_pct": {"type": "float", "description": "收盘计划参考价与未复权日线最后收盘价允许的最大偏差百分比", "default": 1.0},
   "intraday_focus_limit": {"type": "int", "description": "盘中重点监听数量上限", "default": 200},
   "deep_screen_limit": {"type": "int", "description": "技术深筛最多处理的高流动性股票数量", "default": 300},
   "factor_screen_limit": {"type": "int", "description": "因子补充和终评最多处理的深筛股票数量", "default": 100},

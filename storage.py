@@ -3,11 +3,12 @@ from __future__ import annotations
 import sqlite3
 import time
 import math
+import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 13
 
 
 class StockStore:
@@ -191,12 +192,29 @@ class StockStore:
                 (10, self._migrate_v10_screen_runs),
                 (11, self._migrate_v11_run_scoped_events),
                 (12, self._migrate_v12_minute_bars),
+                (13, self._migrate_v13_provenance_and_symbols),
             )
             for version, migration in migrations:
                 if current < version:
                     migration(db)
                     self._set_schema_version(db, version)
                     current = version
+            # Keep partially-created v13 stores repairable and make the
+            # legacy date normalization below safe after an interrupted DDL.
+            self._ensure_column(db, "daily_bars", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+            self._ensure_column(db, "result_evaluations", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+            self._ensure_column(db, "result_evaluations", "plan_validated", "INTEGER NOT NULL DEFAULT 0")
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS stock_symbols(
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    normalized_name TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_normalized_name ON stock_symbols(normalized_name)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_code_prefix ON stock_symbols(code)")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS report_versions(
                     report_key TEXT PRIMARY KEY,
@@ -210,16 +228,27 @@ class StockStore:
             # Normalize dates written by pre-v4 releases so lexical range
             # queries cannot mistake legacy rows for future data.
             legacy = db.execute(
-                "SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at "
+                "SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at, price_basis "
                 "FROM daily_bars WHERE length(trade_date)=8"
             ).fetchall()
             for row in legacy:
                 normalized = self._date_norm(str(row[1]))
-                db.execute(
-                    "INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (row[0], normalized, row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9]),
-                )
+                existing = db.execute(
+                    "SELECT price_basis FROM daily_bars WHERE code=? AND trade_date=?",
+                    (row[0], normalized),
+                ).fetchone()
+                basis = str(row[10] or "unknown")
+                if existing and str(existing[0] or "unknown") not in {"", "unknown"}:
+                    basis = str(existing[0])
+                if existing:
+                    if str(existing[0] or "unknown").strip().lower() in {"", "unknown"} and basis.strip().lower() not in {"", "unknown"}:
+                        db.execute("UPDATE daily_bars SET price_basis=? WHERE code=? AND trade_date=?", (basis, row[0], normalized))
+                else:
+                    db.execute(
+                        "INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (row[0], normalized, row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], basis),
+                    )
                 db.execute("DELETE FROM daily_bars WHERE code=? AND trade_date=?", (row[0], row[1]))
 
     @staticmethod
@@ -384,6 +413,80 @@ class StockStore:
             )"""
         )
 
+    @staticmethod
+    def _migrate_v13_provenance_and_symbols(db) -> None:
+        """Add price provenance and build a durable code/name lookup index."""
+        StockStore._ensure_column(db, "daily_bars", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+        StockStore._ensure_column(db, "result_evaluations", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+        StockStore._ensure_column(db, "result_evaluations", "plan_validated", "INTEGER NOT NULL DEFAULT 0")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS stock_symbols(
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                normalized_name TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_normalized_name ON stock_symbols(normalized_name)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_code_prefix ON stock_symbols(code)")
+
+        # A few pre-v13 stores contain both YYYYMMDD and YYYY-MM-DD rows.  Do
+        # the copy before deleting the compact key so a known basis is never
+        # lost, and prefer an already-normalized known basis when both exist.
+        legacy = db.execute(
+            "SELECT code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis "
+            "FROM daily_bars WHERE length(trade_date)=8"
+        ).fetchall()
+        for row in legacy:
+            normalized = StockStore._date_norm(str(row[1]))
+            if normalized == str(row[1]):
+                continue
+            existing = db.execute(
+                "SELECT price_basis FROM daily_bars WHERE code=? AND trade_date=?",
+                (row[0], normalized),
+            ).fetchone()
+            basis = str(row[10] or "unknown")
+            if existing and str(existing[0] or "unknown").strip().lower() not in {"", "unknown"}:
+                basis = str(existing[0])
+            if existing:
+                if str(existing[0] or "unknown").strip().lower() in {"", "unknown"} and basis.strip().lower() not in {"", "unknown"}:
+                    db.execute("UPDATE daily_bars SET price_basis=? WHERE code=? AND trade_date=?", (basis, row[0], normalized))
+            else:
+                db.execute(
+                    "INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (row[0], normalized, row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], basis),
+                )
+            db.execute("DELETE FROM daily_bars WHERE code=? AND trade_date=?", (row[0], row[1]))
+
+        from .core import normalize_code, normalize_stock_name
+
+        def display_name(value) -> str:
+            text = str(value or "")
+            text = "".join(char for char in text if ord(char) >= 32 and ord(char) != 127)
+            return " ".join(text.split())[:64]
+
+        rows: dict[str, tuple[str, str]] = {}
+        sources = (
+            ("watchlist", "SELECT code,name FROM watchlist WHERE name IS NOT NULL AND name<>''"),
+            ("screen_candidate", "SELECT c.code,c.name FROM screen_candidates c JOIN screen_runs r ON r.run_id=c.run_id WHERE c.name IS NOT NULL AND c.name<>'' ORDER BY r.started_at"),
+            ("daily_quote", "SELECT code,name FROM daily_quotes WHERE name IS NOT NULL AND name<>'' ORDER BY trade_date"),
+        )
+        for source, sql in sources:
+            for raw_code, raw_name in db.execute(sql):
+                code = normalize_code(raw_code)
+                name = display_name(raw_name)
+                if not re.fullmatch(r"\d{6}", code) or not name or normalize_stock_name(name) in {"", code}:
+                    continue
+                rows[code] = (name, source)
+        now = datetime.utcnow().isoformat()
+        db.executemany(
+            "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
+            [(code, name, normalize_stock_name(name), source, now) for code, (name, source) in rows.items()],
+        )
+
     def save_factor_snapshots(self, as_of: str, rows: dict[str, dict], source: str, quality: str) -> None:
         import json
         if not as_of or not rows:
@@ -462,10 +565,157 @@ class StockStore:
             row = db.execute("SELECT source,quality,fetched_at FROM market_contexts WHERE as_of=?", (as_of,)).fetchone()
             return dict(row) if row else None
 
+    @staticmethod
+    def _stock_display_name(value) -> str:
+        text = str(value or "")
+        text = "".join(char for char in text if ord(char) >= 32 and ord(char) != 127)
+        return " ".join(text.split())[:64]
+
+    @staticmethod
+    def _coerce_cost(value) -> float | None:
+        """Parse a strictly finite positive cost; malformed input is rejected."""
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, str) and not re.fullmatch(r"[+]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|[+]?\.\d+(?:[eE][+-]?\d+)?", value.strip()):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+    def upsert_stock_symbol(self, code: str, name: str, source: str = "") -> bool:
+        from .core import normalize_code, normalize_stock_name
+
+        normalized_code = normalize_code(code)
+        display = self._stock_display_name(name)
+        normalized_name = normalize_stock_name(display)
+        if not re.fullmatch(r"\d{6}", normalized_code) or not display or not normalized_name or normalized_name == normalized_code:
+            return False
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
+                (normalized_code, display, normalized_name, str(source or "")[:80], datetime.utcnow().isoformat()),
+            )
+        return True
+
+    def upsert_stock_symbols(self, rows, source: str = "") -> int:
+        count = 0
+        for item in rows or []:
+            if isinstance(item, dict):
+                code, name = item.get("code"), item.get("name")
+                row_source = item.get("source") or source
+            else:
+                try:
+                    code, name = item[0], item[1]
+                    row_source = source
+                except (IndexError, TypeError):
+                    continue
+            if self.upsert_stock_symbol(str(code or ""), str(name or ""), str(row_source or "")):
+                count += 1
+        return count
+
+    def stock_symbol(self, code: str) -> dict | None:
+        from .core import normalize_code
+
+        normalized_code = normalize_code(code)
+        if not re.fullmatch(r"\d{6}", normalized_code):
+            return None
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM stock_symbols WHERE code=?", (normalized_code,)).fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        return str(value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def search_stock_symbols(self, query: str, limit: int = 10) -> list[dict]:
+        from .core import normalize_code, normalize_stock_name
+
+        raw = str(query or "").strip()
+        if not raw:
+            return []
+        code_query = normalize_code(raw)
+        try:
+            size = max(1, min(int(limit), 10))
+        except (TypeError, ValueError, OverflowError):
+            size = 10
+        with self._connect() as db:
+            if re.fullmatch(r"\d+", code_query):
+                rows = db.execute(
+                    "SELECT * FROM stock_symbols WHERE code LIKE ? ESCAPE '\\' ORDER BY code LIMIT ?",
+                    (self._escape_like(code_query) + "%", size),
+                ).fetchall()
+            else:
+                normalized = normalize_stock_name(raw)
+                if not normalized:
+                    return []
+                rows = db.execute(
+                    "SELECT * FROM stock_symbols WHERE normalized_name LIKE ? ESCAPE '\\' ORDER BY code LIMIT ?",
+                    ("%" + self._escape_like(normalized) + "%", size),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolve_stock_symbol(self, query: str, limit: int = 10) -> dict:
+        """Resolve code/prefix, exact name, or one unique name substring."""
+        from .core import normalize_code, normalize_stock_name
+
+        raw = str(query or "").strip()
+        miss = {"status": "miss", "query": raw, "matches": []}
+        if not raw:
+            return miss
+        try:
+            size = max(1, min(int(limit), 10))
+        except (TypeError, ValueError, OverflowError):
+            size = 10
+        code_query = normalize_code(raw)
+        with self._connect() as db:
+            if re.fullmatch(r"\d{6}", code_query):
+                row = db.execute("SELECT * FROM stock_symbols WHERE code=?", (code_query,)).fetchone()
+                return {"status": "ok", "query": raw, "code": code_query, "name": str(row["name"]) if row else "", "matches": [dict(row)] if row else []}
+            if re.fullmatch(r"\d{1,5}", code_query):
+                rows = db.execute(
+                    "SELECT * FROM stock_symbols WHERE code LIKE ? ESCAPE '\\' ORDER BY code LIMIT ?",
+                    (self._escape_like(code_query) + "%", size + 1),
+                ).fetchall()
+            else:
+                normalized = normalize_stock_name(raw)
+                if not normalized:
+                    return miss
+                exact = db.execute("SELECT * FROM stock_symbols WHERE normalized_name=? ORDER BY code", (normalized,)).fetchall()
+                if len(exact) == 1:
+                    row = exact[0]
+                    return {"status": "ok", "query": raw, "code": str(row["code"]), "name": str(row["name"]), "matches": [dict(row)]}
+                rows = db.execute(
+                    "SELECT * FROM stock_symbols WHERE normalized_name LIKE ? ESCAPE '\\' ORDER BY code LIMIT ?",
+                    ("%" + self._escape_like(normalized) + "%", size + 1),
+                ).fetchall()
+        matches = [dict(row) for row in rows]
+        if len(matches) == 1:
+            row = matches[0]
+            return {"status": "ok", "query": raw, "code": str(row["code"]), "name": str(row["name"]), "matches": matches}
+        if matches:
+            return {"status": "ambiguous", "query": raw, "matches": matches[:size]}
+        return miss
+
+    # Short aliases make the resolver convenient for command handlers and
+    # preserve a small public API for integrations.
+    resolve_stock = resolve_stock_symbol
+    resolve_stock_query = resolve_stock_symbol
+
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
-        if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
-            cost_price = None
-        clean_name = str(name or "").strip().replace("\n", " ").replace("\r", " ") or None
+        from .core import normalize_code
+
+        code = normalize_code(code)
+        if not re.fullmatch(r"\d{6}", code):
+            return False
+        if cost_price is not None:
+            parsed_cost = self._coerce_cost(cost_price)
+            if parsed_cost is None:
+                return False
+            cost_price = parsed_cost
+        clean_name = self._stock_display_name(name) or None
         with self._connect() as db:
             exists = db.execute("SELECT 1 FROM watchlist WHERE scope=? AND code=?", (scope, code)).fetchone()
             count = db.execute("SELECT COUNT(*) FROM watchlist WHERE scope=?", (scope,)).fetchone()[0]
@@ -477,6 +727,16 @@ class StockStore:
                 "name=COALESCE(excluded.name, watchlist.name)",
                 (scope, code, datetime.utcnow().isoformat(), cost_price, clean_name),
             )
+            if clean_name and clean_name != code:
+                from .core import normalize_stock_name
+
+                normalized_name = normalize_stock_name(clean_name)
+                if normalized_name:
+                    db.execute(
+                        "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
+                        (code, clean_name, normalized_name, "watchlist", datetime.utcnow().isoformat()),
+                    )
             return True
 
     def remove_watch(self, scope: str, code: str) -> bool:
@@ -533,7 +793,8 @@ class StockStore:
             result: dict[str, dict[str, float | None]] = {}
             for scope, code, cost in db.execute("SELECT scope, code, cost_price FROM watchlist ORDER BY scope, code"):
                 try:
-                    value = float(cost) if cost is not None and float(cost) > 0 else None
+                    parsed = float(cost) if cost is not None else 0.0
+                    value = parsed if math.isfinite(parsed) and parsed > 0 else None
                 except (TypeError, ValueError):
                     value = None
                 result.setdefault(str(scope), {})[str(code)] = value
@@ -569,14 +830,26 @@ class StockStore:
             return [str(row[0]) for row in db.execute("SELECT origin FROM whitelist WHERE enabled=1 ORDER BY origin")]
 
     def save_daily_quotes(self, trade_date: str, quotes, keep_days: int = 180) -> int:
-        rows = [
-            (trade_date, quote.code, quote.name, quote.price, quote.prev_close, quote.amount,
-             quote.pct_change, quote.volume, quote.fetched_at.isoformat(), getattr(quote, "source", ""), quote.provider_ts.isoformat() if getattr(quote, "provider_ts", None) else None)
-            for quote in quotes
-        ]
+        from .core import normalize_code, normalize_stock_name
+
+        normalized_trade_date = self._date_norm(trade_date)
+        rows = []
+        symbols = []
+        for quote in quotes or []:
+            code = normalize_code(getattr(quote, "code", ""))
+            if not re.fullmatch(r"\d{6}", code):
+                continue
+            rows.append(
+                (normalized_trade_date, code, quote.name, quote.price, quote.prev_close, quote.amount,
+                 quote.pct_change, quote.volume, quote.fetched_at.isoformat(), getattr(quote, "source", ""), quote.provider_ts.isoformat() if getattr(quote, "provider_ts", None) else None)
+            )
+            name = self._stock_display_name(getattr(quote, "name", ""))
+            normalized_name = normalize_stock_name(name)
+            if name and normalized_name and normalized_name != code:
+                symbols.append((code, name, normalized_name, str(getattr(quote, "source", "") or "daily_quote")[:80], datetime.utcnow().isoformat()))
         if not rows:
             return 0
-        cutoff = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        cutoff = (datetime.strptime(normalized_trade_date, "%Y-%m-%d") - timedelta(days=keep_days)).strftime("%Y-%m-%d")
         with self._connect() as db:
             # A partial retry may contain fewer symbols and must not erase a
             # usable old quote from the same trading date.
@@ -588,6 +861,12 @@ class StockStore:
                 "volume=excluded.volume,fetched_at=excluded.fetched_at,source=excluded.source,provider_ts=excluded.provider_ts",
                 rows,
             )
+            if symbols:
+                db.executemany(
+                    "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
+                    symbols,
+                )
             db.execute("DELETE FROM daily_quotes WHERE trade_date < ?", (cutoff,))
         return len(rows)
 
@@ -720,12 +999,29 @@ class StockStore:
             )
             return [dict(row) for row in rows]
 
-    def save_daily_bars(self, code: str, bars, source: str = "eastmoney") -> int:
-        rows = [(str(code), self._date_norm(str(item.get("trade_date"))), float(item.get("open") or 0), float(item.get("high") or 0), float(item.get("low") or 0), float(item.get("close") or 0), float(item.get("volume") or 0), float(item.get("amount") or 0), source, datetime.utcnow().isoformat()) for item in bars if item.get("trade_date")]
+    def save_daily_bars(self, code: str, bars, source: str = "", price_basis: str | None = None) -> int:
+        from .core import normalize_code
+
+        normalized_code = normalize_code(code)
+        if not re.fullmatch(r"\d{6}", normalized_code):
+            return 0
+        rows = []
+        for item in bars or []:
+            try:
+                trade_date = self._date_norm(str(item.get("trade_date") or ""))
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", trade_date):
+                    continue
+                values = tuple(float(item.get(key) or 0) for key in ("open", "high", "low", "close", "volume", "amount"))
+                if not all(math.isfinite(value) for value in values):
+                    continue
+                basis = str(item.get("price_basis") or price_basis or "unknown").strip().lower() or "unknown"
+                rows.append((normalized_code, trade_date, *values, str(item.get("source") or source or ""), datetime.utcnow().isoformat(), basis))
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
         if not rows:
             return 0
         with self._connect() as db:
-            db.executemany("INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+            db.executemany("INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis) VALUES(?,?,?,?,?,?,?,?,?,?,?)", rows)
         return len(rows)
 
     def save_minute_bars(self, bars, keep_days: int = 7, source: str = "sina") -> int:
@@ -865,6 +1161,15 @@ class StockStore:
             return {}
         result: dict[str, str] = {}
         with self._connect() as db:
+            placeholders = ",".join("?" for _ in values[:900])
+            rows = db.execute(
+                f"SELECT code,name FROM stock_symbols WHERE code IN ({placeholders}) AND name<>'' ORDER BY updated_at DESC",
+                values[:900],
+            ).fetchall()
+            for row in rows:
+                code, name = str(row[0]), str(row[1]).strip()
+                if code not in result and name and name != code:
+                    result[code] = name
             for start in range(0, len(values), 900):
                 chunk = values[start:start + 900]
                 placeholders = ",".join("?" for _ in chunk)
@@ -1358,16 +1663,36 @@ class StockStore:
             args.append(max(1, min(int(limit), 500)))
             return [dict(row) for row in db.execute(sql, args)]
 
-    def save_result_evaluation(self, evaluation_id: str, run_id: str, code: str, as_of: str, horizon: int, status: str, close: float | None, return_pct: float | None, mfe_pct: float | None, mae_pct: float | None, first_touch: str | None, sample_complete: bool) -> None:
+    def save_result_evaluation(
+        self,
+        evaluation_id: str,
+        run_id: str,
+        code: str,
+        as_of: str,
+        horizon: int,
+        status: str,
+        close: float | None,
+        return_pct: float | None,
+        mfe_pct: float | None,
+        mae_pct: float | None,
+        first_touch: str | None,
+        sample_complete: bool,
+        price_basis: str = "unknown",
+        plan_validated: bool = False,
+    ) -> None:
         with self._connect() as db:
-            db.execute("INSERT INTO result_evaluations(evaluation_id,run_id,code,as_of,horizon,status,close,return_pct,mfe_pct,mae_pct,first_touch,sample_complete,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(evaluation_id) DO UPDATE SET status=excluded.status,close=excluded.close,return_pct=excluded.return_pct,mfe_pct=excluded.mfe_pct,mae_pct=excluded.mae_pct,first_touch=excluded.first_touch,sample_complete=excluded.sample_complete,created_at=excluded.created_at", (evaluation_id, run_id, code, as_of, int(horizon), status, close, return_pct, mfe_pct, mae_pct, first_touch, int(sample_complete), datetime.utcnow().isoformat()))
+            db.execute(
+                "INSERT INTO result_evaluations(evaluation_id,run_id,code,as_of,horizon,status,close,return_pct,mfe_pct,mae_pct,first_touch,sample_complete,created_at,price_basis,plan_validated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(evaluation_id) DO UPDATE SET status=excluded.status,close=excluded.close,return_pct=excluded.return_pct,mfe_pct=excluded.mfe_pct,mae_pct=excluded.mae_pct,first_touch=excluded.first_touch,sample_complete=excluded.sample_complete,price_basis=excluded.price_basis,plan_validated=excluded.plan_validated,created_at=excluded.created_at",
+                (evaluation_id, run_id, code, as_of, int(horizon), status, close, return_pct, mfe_pct, mae_pct, first_touch, int(sample_complete), datetime.utcnow().isoformat(), str(price_basis or "unknown").strip().lower(), int(bool(plan_validated))),
+            )
 
     def evaluations(self, run_id: str | None = None, limit: int = 50) -> list[dict]:
         with self._connect() as db:
             if run_id:
-                rows = db.execute("SELECT * FROM result_evaluations WHERE run_id=? ORDER BY created_at DESC LIMIT ?", (run_id, max(1, min(int(limit), 200))))
+                rows = db.execute("SELECT * FROM result_evaluations WHERE run_id=? AND price_basis='unadjusted' AND plan_validated=1 ORDER BY created_at DESC LIMIT ?", (run_id, max(1, min(int(limit), 200))))
             else:
-                rows = db.execute("SELECT * FROM result_evaluations ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 200)),))
+                rows = db.execute("SELECT * FROM result_evaluations WHERE price_basis='unadjusted' AND plan_validated=1 ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 200)),))
             return [dict(row) for row in rows]
 
     def mark_news_seen(self, fingerprint: str, keep_days: int = 14) -> bool:

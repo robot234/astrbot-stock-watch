@@ -74,8 +74,8 @@ def main() -> int:
         return 1
     storage = (ROOT / "storage.py").read_text(encoding="utf-8")
     schema_match = re.search(r"^LATEST_SCHEMA_VERSION\s*=\s*(\d+)\s*$", storage, re.MULTILINE)
-    if not schema_match or schema_match.group(1) != "12":
-        print("FAIL expected LATEST_SCHEMA_VERSION=12")
+    if not schema_match or schema_match.group(1) != "13":
+        print("FAIL expected LATEST_SCHEMA_VERSION=13")
         return 1
 
     tracked = [name.replace("\\", "/") for name in run("git", "ls-files").splitlines() if name]
