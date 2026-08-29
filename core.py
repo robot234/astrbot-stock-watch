@@ -467,6 +467,7 @@ def format_compact_candidate(candidate: Candidate, index: int) -> str:
     reasons = [re.sub(r"[+-]\d+$", "", str(item)) for item in candidate.reasons[:3]]
     reason_text = "、".join(reasons) or "技术指标有限"
     plan = candidate.price_plan
+    score_label = "综合" if candidate.composite_score is not None else "技术"
     if plan and plan.quality == "good" and plan.attention_low is not None and plan.attention_high is not None and plan.invalidation is not None:
         levels = f"关注 {plan.attention_low:.2f}-{plan.attention_high:.2f}｜失效 {plan.invalidation:.2f}"
         if plan.confirmation is not None:
@@ -474,7 +475,7 @@ def format_compact_candidate(candidate: Candidate, index: int) -> str:
     else:
         levels = "历史数据不足"
     return (
-        f"{index}. {name}（{quote.code}）｜技术 {candidate.score}/{candidate.score_max}｜{quote.pct_change:+.2f}%｜{risk}\n"
+        f"{index}. {name}（{quote.code}）｜{score_label} {candidate.score}/{candidate.score_max}｜{quote.pct_change:+.2f}%｜{risk}\n"
         f"   看点：{reason_text}\n"
         f"   价位：{levels}"
     )

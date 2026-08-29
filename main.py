@@ -163,7 +163,8 @@ class Main(Star):
     def _market_report_lines(self, requested_date: str, actual_date: str, quotes: list, candidates, snapshot: dict) -> list[str]:
         diagnostics = self._last_screen_diagnostics
         shown = candidates[:self._int("report_candidate_limit", 10, 1, 30)]
-        quality = {"good": "完整", "partial": "部分", "degraded": "降级", "cached": "缓存"}.get(str(snapshot.get("quality")), "未记录")
+        quality_code = str(snapshot.get("quality"))
+        quality = "完整" if snapshot.get("complete") and quality_code == "good" else {"good": "未确认", "partial": "部分", "degraded": "降级", "cached": "缓存"}.get(quality_code, "未记录")
         lines = [
             f"全市场选股｜{actual_date}",
             f"行情：{snapshot.get('source', '未记录')} · {quality}｜共 {len(quotes)} 只",
