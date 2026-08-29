@@ -559,7 +559,7 @@ class Main(Star):
             now = datetime.now(CHINA_TZ)
             target = str(self.config.get("daily_scan_time", "15:10"))
             retry_ready = self._daily_retry_after is None or now >= self._daily_retry_after
-            if now.strftime("%H:%M") >= target and now.hour < 16 and self.last_daily_scan != now.date().isoformat() and retry_ready and await self._calendar_open(now.date().isoformat()):
+            if now.strftime("%H:%M") >= target and self.last_daily_scan != now.date().isoformat() and retry_ready and await self._calendar_open(now.date().isoformat()):
                 job_key = f"daily_screen:{now.date().isoformat()}"
                 if not self.store.begin_job(job_key, "daily_screen", now.date().isoformat()):
                     await asyncio.sleep(20)
@@ -900,6 +900,7 @@ class Main(Star):
             return
         run_id = str(rows[0].get("run_id") or "")
         evaluated = 0
+        details = []
         for row in rows:
             base = self.store.daily_quotes(as_of)
             base_quote = next((q for q in base if q.code == row["code"]), None)
@@ -911,9 +912,26 @@ class Main(Star):
             ret = (last["close"] - base_quote.price) / base_quote.price * 100 if base_quote.price else None
             highs = [(item["high"] - base_quote.price) / base_quote.price * 100 for item in future]
             lows = [(item["low"] - base_quote.price) / base_quote.price * 100 for item in future]
-            self.store.save_result_evaluation(uuid.uuid4().hex, run_id, row["code"], as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), None, True)
+            plan = json.loads(row.get("price_plan") or "{}")
+            first_touch = None
+            for item in future:
+                if plan.get("invalidation") and item["low"] <= plan["invalidation"]:
+                    first_touch = "失效位"
+                    break
+                if plan.get("sell_low") and item["high"] >= plan["sell_low"]:
+                    first_touch = "参考卖出区"
+                    break
+                if plan.get("confirmation") and item["high"] >= plan["confirmation"]:
+                    first_touch = "确认位"
+                    break
+            self.store.save_result_evaluation(f"{run_id}:{row['code']}:{horizon}", run_id, row["code"], as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), first_touch, True)
             evaluated += 1
-        yield event.plain_result(f"回放验证（仅研究）：基准日 {as_of}，周期 {horizon} 日，完成 {evaluated} 条。结果已写入本地历史；不代表未来收益。")
+            details.append(f"{row['name']}（{row['code']}）：{ret:+.2f}%｜最大浮盈{max(highs):+.2f}%｜最大回撤{min(lows):+.2f}%｜先触达{first_touch or '无'}")
+        if not details:
+            yield event.plain_result(f"验证暂不可用：候选后续 K 线不足 {horizon} 个交易日。")
+            return
+        avg = sum(float(line.split('：')[1].split('%')[0]) for line in details) / len(details)
+        yield event.plain_result(f"回放验证（仅研究）：基准日 {as_of}，周期 {horizon} 日，完成 {evaluated} 条，平均收益{avg:+.2f}%\n" + "\n".join(details[:20]))
 
     @filter.command("自选")
     async def watch(self, event: AstrMessageEvent, action: str = "", code: str = "", cost: str = ""):
