@@ -320,6 +320,7 @@ class Main(Star):
             profit_growth, cash_quality = number("profit_growth"), number("cash_quality")
             valuation = (2 - pe / 20 - (pb / 10 if pb is not None and pb > 0 else 0)) if pe is not None and pe > 0 else None
             flag = lambda value: str(value).strip().lower() in {"1", "true", "yes", "on", "是"}
+            fundamental_risk = flag(row.get("st_flag")) or flag(row.get("audit_flag"))
             calculated_fundamental = fundamental_score(roe, profit_growth, cash_quality, valuation, flag(row.get("st_flag")), flag(row.get("audit_flag")))
             if fundamental is None and calculated_fundamental is not None:
                 fundamental = calculated_fundamental
@@ -329,6 +330,9 @@ class Main(Star):
                 fundamental = max(-3, min(3, round(2 - pe / 20, 1))) if pe is not None else None
             item.quote.industry_score, item.quote.fundamental_score = industry, fundamental
             item.factor_overlay = FactorOverlay(industry_name, industry, fundamental, market.regime, adjustment, str(row.get("source") or factor_name), as_of, str(row.get("quality") or factor_quality))
+            if fundamental_risk:
+                item.risk_level = "blocked"
+                item.risk_flags.append("基本面硬风险")
             if factor_mode == "score" and item.risk_level != "blocked":
                 extra = max(-20, min(20, item.factor_overlay.adjustment))
                 item.composite_score = item.base_score + extra
@@ -570,9 +574,11 @@ class Main(Star):
                     actual_date = self.store.latest_daily_trade_date(requested_date) or requested_date
                     cached_for_record = self.store.daily_quotes(actual_date) if actual_date else []
                     source = next((str(item.source) for item in cached_for_record if getattr(item, "source", "")), "unknown")
-                    self._record_screen(requested_date, actual_date, source, cached_for_record, candidates)
+                    quality = "good" if actual_date == requested_date else "degraded"
+                    self._record_screen(requested_date, actual_date, source, cached_for_record, candidates, quality=quality)
                     lines = [
                         "收盘选股（仅研究/模拟盘）",
+                        f"请求日期：{requested_date}；实际数据交易日：{actual_date}",
                         f"市场环境：{self._last_screen_diagnostics.get('market_regime', 'unknown')}（上涨占比{self._last_screen_diagnostics.get('market_breadth', 0):.1%}）",
                         f"因子数据：{self._last_screen_diagnostics.get('factor_source', 'unknown')}，质量{self._last_screen_diagnostics.get('factor_quality', 'unknown')}，模式{self.config.get('factor_mode', 'report_only')}",
                         "筛选口径：硬过滤 → 趋势/动量/量价/波动评分 → 因子复核 → 人工复核",
@@ -585,9 +591,10 @@ class Main(Star):
                     for origin in self.store.subscriptions():
                         if not await self._push(origin, "\n".join(lines)):
                             push_failed = True
-                    if not push_failed and self._daily_retry_after is None:
+                    completed = not push_failed and self._daily_retry_after is None and actual_date == requested_date
+                    if completed:
                         self.last_daily_scan = now.date().isoformat()
-                    self.store.finish_job(job_key, "completed")
+                    self.store.finish_job(job_key, "completed" if completed else "failed", None if completed else "等待数据或推送重试")
                 except Exception:
                     self.store.finish_job(job_key, "failed", "收盘扫描异常")
                     logger.exception("[%s] 收盘扫描失败", PLUGIN_NAME)

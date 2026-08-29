@@ -262,7 +262,7 @@ class SinaQuoteProvider:
         result: list[Quote] = []
         for symbol, raw in re.findall(r'hq_str_([a-z0-9]+)="(.*?)";', payload, flags=re.I):
             fields = raw.split(",")
-            if len(fields) < 10:
+            if len(fields) < 32:
                 continue
             try:
                 price, prev_close = float(fields[3] or 0), float(fields[2] or 0)
@@ -270,7 +270,11 @@ class SinaQuoteProvider:
             except (TypeError, ValueError):
                 continue
             pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
-            result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, source="sina", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ)))
+            try:
+                quote_time = datetime.fromisoformat(f"{fields[30].strip()}T{fields[31].strip()}").replace(tzinfo=CHINA_TZ)
+            except (TypeError, ValueError):
+                continue
+            result.append(Quote(symbol[2:], fields[0].strip() or symbol[2:], price, prev_close, amount, pct, volume, source="sina", provider_ts=quote_time, fetched_at=quote_time))
         return result
 
     async def fetch_custom_factors(self, url: str, codes: Iterable[str], as_of: str = "") -> dict[str, dict]:
