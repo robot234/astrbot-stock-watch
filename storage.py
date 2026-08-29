@@ -453,6 +453,10 @@ class StockStore:
         with self._connect() as db:
             db.execute("INSERT INTO provider_health(provider,last_success_at,last_error_at,success_count,error_count,last_quality) VALUES(?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET last_success_at=CASE WHEN ? THEN excluded.last_success_at ELSE provider_health.last_success_at END,last_error_at=CASE WHEN ? THEN provider_health.last_error_at ELSE excluded.last_error_at END,success_count=provider_health.success_count+CASE WHEN ? THEN 1 ELSE 0 END,error_count=provider_health.error_count+CASE WHEN ? THEN 0 ELSE 1 END,last_quality=excluded.last_quality", (provider, now if success else None, None if success else now, int(success), int(not success), quality, int(success), int(success), int(success), int(success)))
 
+    def provider_health_rows(self) -> list[dict]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM provider_health ORDER BY provider")]
+
     def recent_screen_runs(self, limit: int = 10) -> list[dict]:
         with self._connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM screen_runs ORDER BY started_at DESC LIMIT ?", (max(1, min(int(limit), 100)),))]

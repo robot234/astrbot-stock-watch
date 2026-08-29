@@ -876,6 +876,8 @@ class Main(Star):
             yield event.plain_result("研究状态：尚未运行收盘扫描。\n盘中监听只输出白名单会话，且不会自动下单。")
             return
         latest = runs[0]
+        health_rows = self.store.provider_health_rows()
+        health_text = "；".join(f"{row['provider']}={row['last_quality']}（成功{row['success_count']}/失败{row['error_count']}）" for row in health_rows) or "暂无来源健康记录"
         yield event.plain_result(
             f"研究状态：{latest['status']}\n"
             f"最近运行：{latest['started_at']}\n"
@@ -883,6 +885,7 @@ class Main(Star):
             f"来源：{latest['source'] or '未知'}；行情{latest['quote_count']}条；候选{latest['candidate_count']}条\n"
             f"数据质量：{latest['quality']}\n"
             f"因子模式：{self.config.get('factor_mode', 'report_only')}；因子来源：{self._last_screen_diagnostics.get('factor_source', '未知')}；因子质量：{self._last_screen_diagnostics.get('factor_quality', '未知')}\n"
+            f"来源健康：{health_text}\n"
             "边界：模型只做摘要解释，价位由规则计算；仅研究/模拟盘，不提供订单或自动交易。"
         )
 
