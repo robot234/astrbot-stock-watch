@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.2")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.3")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -188,7 +188,10 @@ class Main(Star):
             )
         if actual_date != requested_date:
             lines.append(f"注：请求 {requested_date}，当前使用最近交易日数据。")
-        lines.extend(format_compact_candidate(item, index) for index, item in enumerate(shown, 1))
+        for index, item in enumerate(shown, 1):
+            if index > 1:
+                lines.append("")
+            lines.extend(format_compact_candidate(item, index).splitlines())
         if len(candidates) > len(shown):
             lines.append(f"另有 {len(candidates) - len(shown)} 只候选，发送 /候选池 查看。")
         if not candidates:

@@ -541,7 +541,7 @@ class StockStore:
 
     def latest_screen_candidates(self, limit: int = 30) -> list[dict]:
         with self._connect() as db:
-            return [dict(row) for row in db.execute("SELECT c.*, r.actual_trade_date, r.source FROM screen_candidates c JOIN screen_runs r ON r.run_id=c.run_id WHERE r.run_id=(SELECT run_id FROM screen_runs WHERE status='completed' ORDER BY started_at DESC LIMIT 1) ORDER BY c.score DESC LIMIT ?", (max(1, min(int(limit), 100)),))]
+            return [dict(row) for row in db.execute("SELECT c.*, r.actual_trade_date, r.source FROM screen_candidates c JOIN screen_runs r ON r.run_id=c.run_id WHERE r.run_id=(SELECT candidate_run.run_id FROM screen_runs candidate_run WHERE candidate_run.status IN ('completed', 'degraded') AND EXISTS (SELECT 1 FROM screen_candidates candidate_row WHERE candidate_row.run_id=candidate_run.run_id) ORDER BY candidate_run.started_at DESC LIMIT 1) ORDER BY c.score DESC LIMIT ?", (max(1, min(int(limit), 100)),))]
 
     def begin_job(self, job_key: str, job_name: str, trade_date: str, lease_seconds: int = 900) -> bool:
         now = datetime.utcnow().isoformat()
