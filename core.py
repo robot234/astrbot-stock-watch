@@ -313,7 +313,7 @@ def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
     sell_low = confirmation + atr
     sell_high = sell_low + atr
     invalidation = max(0.01, support - atr)
-    state = "invalidated" if price <= invalidation else "near_sell" if sell_low <= price <= sell_high else "confirmed" if price >= confirmation and quote.volume_ratio is not None and quote.volume_ratio >= 1.0 else "in_attention" if attention_low <= price <= attention_high else "between"
+    state = "invalidated" if price <= invalidation else "near_sell" if price >= sell_low else "confirmed" if price >= confirmation and quote.volume_ratio is not None and quote.volume_ratio >= 1.0 else "in_attention" if attention_low <= price <= attention_high else "between"
     return PricePlan(state, price, rounded(atr), rounded(support), rounded(resistance), rounded(attention_low), rounded(attention_high), rounded(confirmation), rounded(sell_low), rounded(sell_high), rounded(invalidation), "good", evidence)
 
 

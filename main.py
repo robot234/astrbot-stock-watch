@@ -699,20 +699,21 @@ class Main(Star):
                                     if not candidate and not cost_signal and not minute_signal:
                                         continue
                                     plan_state = candidate.price_plan.state if candidate and candidate.price_plan else "unknown"
-                                    state_changed = self.store.transition_price_state(origin, code, plan_state) if candidate else False
-                                    if candidate and candidate.risk_level == "unknown" and not cost_signal and not minute_signal:
+                                    price_signal = bool(candidate and not cost_signal and not minute_signal)
+                                    state_changed = price_signal and self.store.price_state(origin, code) != plan_state
+                                    if candidate and candidate.risk_level == "unknown" and price_signal:
                                         continue
-                                    if candidate and candidate.risk_level == "blocked" and plan_state != "invalidated" and not cost_signal and not minute_signal:
+                                    if candidate and candidate.risk_level == "blocked" and plan_state != "invalidated" and price_signal:
                                         continue
-                                    if candidate and not cost_signal and not minute_signal and plan_state not in {"in_attention", "confirmed", "near_sell", "invalidated"}:
+                                    if price_signal and plan_state not in {"in_attention", "confirmed", "near_sell", "invalidated"}:
                                         continue
-                                    if candidate and not cost_signal and not minute_signal and not state_changed:
+                                    if price_signal and not state_changed:
                                         continue
                                     threshold = self._int("intraday_failure_threshold", 0, 0, 100)
                                     if threshold > 0 and health["consecutive_failures"] >= threshold:
                                         continue
-                                    if not cost_signal and self._bool("confirmation_enabled", False):
-                                        confirmation_code = "minute:" + code if is_minute else code
+                                    if (is_minute or price_signal) and self._bool("confirmation_enabled", False):
+                                        confirmation_code = "minute:" + code if is_minute else "price:" + code + ":" + plan_state
                                         confirmed = self.store.observe_confirmation(
                                             origin,
                                             confirmation_code,
@@ -739,7 +740,9 @@ class Main(Star):
                                         if plan_state in {"near_sell", "invalidated"}:
                                             self.store.save_risk_event(f"{today}:{code}:{plan_state}", self._last_screen_run_id, code, plan_state, candidate.risk_level, json.dumps({"price": quote.price, "state": plan_state}, ensure_ascii=False), datetime.now(timezone.utc).isoformat())
                                     sent = await self._push(origin, text)
-                                    if not sent:
+                                    if sent and price_signal:
+                                        self.store.set_price_state(origin, code, plan_state)
+                                    elif not sent:
                                         self.store.release_signal(origin, signal_key, claimed_at=claim_time)
                         else:
                             health["failed_cycles"] += 1

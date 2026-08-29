@@ -161,7 +161,7 @@ class StockStore:
             candidate_columns = {row[1] for row in db.execute("PRAGMA table_info(screen_candidates)")}
             if "factor_payload" not in candidate_columns:
                 db.execute("ALTER TABLE screen_candidates ADD COLUMN factor_payload TEXT NOT NULL DEFAULT '{}'")
-            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5')")
+            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6')")
             # Normalize dates written by pre-v4 releases (YYYYMMDD) so range
             # queries cannot mistake legacy rows for future data.
             legacy = db.execute("SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at FROM daily_bars WHERE length(trade_date)=8").fetchall()
@@ -193,6 +193,16 @@ class StockStore:
             changed = not row or str(row[0]) != state
             db.execute("INSERT INTO price_states(origin,code,state,updated_at) VALUES(?,?,?,?) ON CONFLICT(origin,code) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", (origin, code, state, now))
             return changed
+
+    def price_state(self, origin: str, code: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute("SELECT state FROM price_states WHERE origin=? AND code=?", (origin, code)).fetchone()
+            return str(row[0]) if row else None
+
+    def set_price_state(self, origin: str, code: str, state: str) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as db:
+            db.execute("INSERT INTO price_states(origin,code,state,updated_at) VALUES(?,?,?,?) ON CONFLICT(origin,code) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", (origin, code, state, now))
 
     def factor_snapshots(self, as_of: str) -> dict[str, dict]:
         import json
