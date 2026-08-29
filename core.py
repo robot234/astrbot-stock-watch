@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time
 from typing import Iterable
 from zoneinfo import ZoneInfo
+import json
 import math
 import re
 
@@ -79,6 +80,10 @@ class FactorOverlay:
     source: str = ""
     as_of: str = ""
     quality: str = "unknown"
+    # Current provider classification is a display-only annotation.  Keep it
+    # after the legacy fields so existing positional construction remains
+    # compatible with v0.11.0 payloads.
+    current_industry_name: str = ""
 
     @property
     def adjustment(self) -> int:
@@ -522,6 +527,124 @@ def in_trading_session(now: datetime | None = None) -> bool:
     return time(9, 30) <= value < time(11, 30) or time(13, 0) <= value < time(15, 0)
 
 
+def _clean_format_text(value, limit: int) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]", "", str(value or "")).strip()[:limit]
+
+
+def _finite_format_number(value) -> float | None:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _format_pct_change(value) -> str:
+    number = _finite_format_number(value)
+    return f"{number:+.2f}%" if number is not None else "涨跌未记录"
+
+
+def _decode_stored_object(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _format_stored_score(value, fallback: str = "未知") -> str:
+    number = _finite_format_number(value)
+    if number is None:
+        return fallback
+    formatted = str(int(number)) if number.is_integer() else f"{number:g}"
+    return formatted if len(formatted) <= 16 else fallback
+
+
+def _format_stored_price(value) -> str | None:
+    number = _finite_format_number(value)
+    if number is None or number <= 0:
+        return None
+    formatted = f"{number:.2f}"
+    return formatted if len(formatted) <= 20 else None
+
+
+_PCT_UNSET = object()
+
+
+def format_stored_candidate(row: dict, index: int, pct_change=_PCT_UNSET) -> str:
+    """Render one persisted candidate as the same fixed three-line summary.
+
+    Persisted rows are external state: malformed JSON and non-finite price
+    levels deliberately degrade to a readable fallback instead of aborting a
+    whole candidate-pool report.
+    """
+    row = row if isinstance(row, dict) else {}
+    code = _clean_format_text(row.get("code"), 20) or "未知代码"
+    name = _clean_format_text(row.get("name"), 24)
+    if not name or name == code:
+        name = "名称未获取"
+    score = _format_stored_score(row.get("score"))
+    score_max = _format_stored_score(row.get("score_max"))
+    score_label = "综合" if score_max == "70" else "技术"
+    risk = risk_label(_clean_format_text(row.get("risk_level"), 32) or "unknown")
+
+    raw_reasons = row.get("reasons")
+    reasons_data = []
+    if isinstance(raw_reasons, list):
+        reasons_data = raw_reasons
+    elif isinstance(raw_reasons, str):
+        try:
+            decoded = json.loads(raw_reasons)
+            reasons_data = decoded if isinstance(decoded, list) else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            reasons_data = []
+    reasons = [
+        re.sub(r"[+-]\d+$", "", _clean_format_text(item, 80))
+        for item in reasons_data
+        if _clean_format_text(item, 80)
+    ][:3]
+    reason_text = "、".join(reasons) or "技术指标有限"
+
+    plan = _decode_stored_object(row.get("price_plan"))
+    levels = "历史数据不足"
+    if str(plan.get("quality") or "").strip().lower() == "good":
+        invalid_price = any(
+            key in plan and plan.get(key) is not None and _finite_format_number(plan.get(key)) is None
+            for key in ("reference_price", "atr", "support", "resistance", "attention_low", "attention_high", "confirmation", "sell_low", "sell_high", "invalidation")
+        )
+        attention_low = _format_stored_price(plan.get("attention_low"))
+        attention_high = _format_stored_price(plan.get("attention_high"))
+        invalidation = _format_stored_price(plan.get("invalidation"))
+        confirmation = _format_stored_price(plan.get("confirmation"))
+        if (
+            not invalid_price
+            and attention_low is not None
+            and attention_high is not None
+            and invalidation is not None
+            and float(attention_low) <= float(attention_high)
+            and (plan.get("confirmation") is None or confirmation is not None)
+        ):
+            levels = f"关注 {attention_low}-{attention_high}｜失效 {invalidation}"
+            if confirmation is not None:
+                levels = f"{levels}｜确认 {confirmation}"
+
+    raw_pct = row.get("pct_change") if pct_change is _PCT_UNSET else pct_change
+    return (
+        f"{_format_stored_score(index, fallback=str(index))}. {name}（{code}）｜{score_label} {score}/{score_max}｜{_format_pct_change(raw_pct)}｜{risk}\n"
+        f"   看点：{reason_text}\n"
+        f"   价位：{levels}"
+    )
+
+
+def format_stored_compact_candidate(row: dict, index: int, pct_change=_PCT_UNSET) -> str:
+    """Compatibility alias for callers that name the three-line view compact."""
+    return format_stored_candidate(row, index, pct_change)
+
+
 def format_candidate(candidate: Candidate) -> str:
     quote = candidate.quote
     name = re.sub(r"[\x00-\x1f\x7f]", "", str(quote.name or "")).strip()[:40]
@@ -558,9 +681,11 @@ def format_candidate(candidate: Candidate) -> str:
         levels = "参考价位：历史数据不足，暂不计算"
     conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；价位仅供人工研究"
     composite_line = f"综合评分：{candidate.composite_score}/70\n" if candidate.composite_score is not None else ""
+    pct_text = _format_pct_change(quote.pct_change)
+    pct_line = "涨跌未记录" if pct_text == "涨跌未记录" else f"涨跌{pct_text}"
     return (
         f"候选：{name}（{quote.code}）\n"
-        f"行情：现价{quote.price:.2f}，涨跌{quote.pct_change:+.2f}%，成交额{quote.amount:.0f}\n"
+        f"行情：现价{quote.price:.2f}，{pct_line}，成交额{quote.amount:.0f}\n"
         f"技术评分：{candidate.base_score}/{candidate.score_max}（规则加分：{why}）\n"
         f"{composite_line}"
         f"技术证据：{evidence}\n"
@@ -589,7 +714,7 @@ def format_compact_candidate(candidate: Candidate, index: int) -> str:
     else:
         levels = "历史数据不足"
     return (
-        f"{index}. {name}（{quote.code}）｜{score_label} {candidate.score}/{candidate.score_max}｜{quote.pct_change:+.2f}%｜{risk}\n"
+        f"{index}. {name}（{quote.code}）｜{score_label} {candidate.score}/{candidate.score_max}｜{_format_pct_change(quote.pct_change)}｜{risk}\n"
         f"   看点：{reason_text}\n"
         f"   价位：{levels}"
     )

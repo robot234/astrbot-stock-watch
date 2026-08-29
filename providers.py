@@ -136,6 +136,14 @@ class SinaQuoteProvider:
         self.history_bars: dict[str, list[dict[str, float | str]]] = {}
         self._last_tushare_date: str | None = None
         self._tushare_names: dict[str, str] = {}
+        # Current industry labels are display annotations, not historical
+        # factor snapshots.  Cache both successful lookups and short-lived
+        # failures so a large candidate report cannot hammer the endpoint.
+        self._industry_cache: dict[str, tuple[datetime, str, bool]] = {}
+        # Futures are loop-bound.  The loop identity is checked before a
+        # caller awaits one so providers remain safe across short-lived test
+        # loops and AstrBot's long-lived event loop.
+        self._industry_inflight: dict[str, asyncio.Future] = {}
 
     async def close(self) -> None:
         await self.http.close()
@@ -429,6 +437,154 @@ class SinaQuoteProvider:
             result[str(row["code"])[-6:]] = row
         return result
 
+    @staticmethod
+    def _eastmoney_secid(code: str) -> str:
+        return ("1." if str(code).startswith(("6", "68", "9")) else "0.") + str(code)
+
+    @staticmethod
+    def _clean_industry_text(value) -> str:
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", "", str(value or "")).strip()[:80]
+        return "" if cleaned.lower() in {"-", "--", "null", "none", "n/a", "na"} else cleaned
+
+    @staticmethod
+    def _normalized_industry_code(value) -> str:
+        text = str(value or "").strip()
+        if text.endswith(".0") and text[:-2].isdigit():
+            text = text[:-2]
+        normalized = normalize_code(text)
+        return normalized if re.fullmatch(r"\d{6}", normalized) else ""
+
+    def _cache_industry(self, code: str, value: str = "", success: bool = True, now: datetime | None = None) -> None:
+        timestamp = now or datetime.now(CHINA_TZ)
+        self._industry_cache[str(code)] = (timestamp, self._clean_industry_text(value), bool(success))
+        if len(self._industry_cache) <= 1000:
+            return
+        def cache_time(key: str):
+            try:
+                value = self._industry_cache[key][0]
+                if not isinstance(value, datetime):
+                    return datetime.min.replace(tzinfo=CHINA_TZ)
+                return value if value.tzinfo is not None else value.replace(tzinfo=CHINA_TZ)
+            except (IndexError, KeyError, TypeError):
+                return datetime.min.replace(tzinfo=CHINA_TZ)
+        for key in sorted(self._industry_cache, key=cache_time)[:-1000]:
+            self._industry_cache.pop(key, None)
+
+    def _cached_industry(self, code: str, now: datetime | None = None) -> tuple[bool, str] | None:
+        cached = self._industry_cache.get(str(code))
+        if not cached:
+            return None
+        try:
+            timestamp, value, success = cached
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=CHINA_TZ)
+            age = (now or datetime.now(CHINA_TZ)) - timestamp
+            ttl = timedelta(hours=24) if success else timedelta(minutes=10)
+            if age.total_seconds() < ttl.total_seconds():
+                return bool(success), self._clean_industry_text(value)
+        except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+            pass
+        self._industry_cache.pop(str(code), None)
+        return None
+
+    async def fetch_eastmoney_industries(self, codes: Iterable[str]) -> dict[str, str]:
+        """Fetch current Eastmoney industry labels with bounded shared I/O.
+
+        A response is accepted only when its ``f57`` code matches the request;
+        malformed or mismatched responses become ten-minute negative-cache
+        entries and never leak a label to another stock.
+        """
+        values: list[str] = []
+        seen: set[str] = set()
+        for raw in codes or []:
+            code = normalize_code(raw)
+            if not re.fullmatch(r"\d{6}", code) or code in seen:
+                continue
+            values.append(code)
+            seen.add(code)
+        values = values[:1000]
+        if not values:
+            return {}
+
+        result: dict[str, str] = {}
+        pending: list[str] = []
+        now = datetime.now(CHINA_TZ)
+        for code in values:
+            cached = self._cached_industry(code, now=now)
+            if cached is None:
+                pending.append(code)
+            elif cached[0] and cached[1]:
+                result[code] = cached[1]
+        if not pending:
+            return result
+
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        for code in pending:
+            queue.put_nowait(code)
+
+        async def fetch_one(code: str) -> None:
+            loop = asyncio.get_running_loop()
+            inflight = self._industry_inflight.get(code)
+            if inflight is not None:
+                try:
+                    if inflight.get_loop() is loop:
+                        outcome = await asyncio.shield(inflight)
+                        if outcome[0] and outcome[1]:
+                            result[code] = outcome[1]
+                        return
+                except AttributeError:
+                    pass
+                self._industry_inflight.pop(code, None)
+
+            future = loop.create_future()
+            self._industry_inflight[code] = future
+            outcome: tuple[bool, str] = (False, "")
+            try:
+                async with self.http.slot() as client:
+                    response = await client.get(
+                        "https://push2.eastmoney.com/api/qt/stock/get",
+                        params={"secid": self._eastmoney_secid(code), "fields": "f57,f127"},
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    data = body.get("data") if isinstance(body, dict) else None
+                    if not isinstance(data, dict):
+                        raise ValueError("Eastmoney industry response has no data")
+                    if self._normalized_industry_code(data.get("f57")) != code:
+                        raise ValueError("Eastmoney industry response code mismatch")
+                    industry = self._clean_industry_text(data.get("f127"))
+                    if not industry:
+                        raise ValueError("Eastmoney industry response has no usable label")
+                self._cache_industry(code, industry, True)
+                outcome = (True, industry)
+                if industry:
+                    result[code] = industry
+            except asyncio.CancelledError:
+                self._cache_industry(code, "", False)
+                outcome = (False, "")
+                raise
+            except Exception:
+                self._cache_industry(code, "", False)
+            finally:
+                if not future.done():
+                    future.set_result(outcome)
+                if self._industry_inflight.get(code) is future:
+                    self._industry_inflight.pop(code, None)
+
+        async def worker() -> None:
+            while True:
+                try:
+                    code = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await fetch_one(code)
+                finally:
+                    queue.task_done()
+
+        await asyncio.gather(*(worker() for _ in range(min(len(pending), self.http.max_concurrency))))
+        return result
+
     async def fetch_eastmoney_factors(self, codes: Iterable[str]) -> dict[str, dict]:
         """Best-effort public fields: industry, PE, PB and ROE."""
         result = {}
@@ -438,7 +594,7 @@ class SinaQuoteProvider:
             queue.put_nowait(code)
 
         async def fetch_one(code: str) -> None:
-            secid = ("1." if str(code).startswith(("6", "68", "9")) else "0.") + str(code)
+            secid = self._eastmoney_secid(code)
             try:
                 async with self.http.slot() as client:
                     response = await client.get(
@@ -447,7 +603,12 @@ class SinaQuoteProvider:
                         headers={"Referer": "https://quote.eastmoney.com/"},
                     )
                     response.raise_for_status()
-                    data = (response.json().get("data") or {})
+                    body = response.json()
+                    if not isinstance(body, dict):
+                        raise ValueError("Eastmoney factor response is not an object")
+                    data = body.get("data") or {}
+                    if not isinstance(data, dict) or self._normalized_industry_code(data.get("f57")) != str(code):
+                        raise ValueError("Eastmoney factor response code mismatch")
                 def finite(key):
                     try:
                         value = float(data.get(key))
@@ -455,7 +616,10 @@ class SinaQuoteProvider:
                     except (TypeError, ValueError):
                         return None
                 pe, pb = finite("f162"), finite("f167")
-                result[str(code)] = {"name": str(data.get("f58") or ""), "industry": str(data.get("f127") or ""), "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
+                industry = self._clean_industry_text(data.get("f127"))
+                if industry:
+                    self._cache_industry(str(code), industry, True)
+                result[str(code)] = {"name": str(data.get("f58") or ""), "industry": industry, "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
             except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
                 return
 

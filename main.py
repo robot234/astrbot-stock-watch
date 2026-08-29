@@ -14,7 +14,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, format_candidate, format_compact_candidate, in_trading_session, is_tradable, parse_codes, risk_label, score_quote
+from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, format_candidate, format_compact_candidate, format_stored_compact_candidate, in_trading_session, is_tradable, normalize_code, parse_codes, risk_label, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
 from .providers import HttpRuntime, OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.11.0")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.11.1")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -629,7 +629,31 @@ class Main(Star):
             "factor_source": factor_name or "unknown", "factor_quality": factor_quality,
             "screen_min_indicator_coverage": coverage_floor, "coverage_ok": coverage >= coverage_floor,
         })
-        return (qualified or fallback)[:limit]
+        final_candidates = (qualified or fallback)[:limit]
+        # Industry labels are a current display annotation.  Fetch them only
+        # for the final pool, after scoring/filtering, so this cannot alter the
+        # score, risk, reasons, or historical factor fields above.
+        if include_factors and final_candidates:
+            fetch_industries = getattr(self.quotes, "fetch_eastmoney_industries", None)
+            if callable(fetch_industries):
+                try:
+                    current_rows = await fetch_industries([item.quote.code for item in final_candidates])
+                except Exception:
+                    logger.warning("[%s] 东方财富当前行业源不可用，继续候选结果", PLUGIN_NAME)
+                    current_rows = {}
+                if isinstance(current_rows, dict):
+                    for item in final_candidates:
+                        current = current_rows.get(item.quote.code)
+                        if isinstance(current, dict):
+                            current = current.get("current_industry_name") or current.get("industry") or current.get("f127")
+                        current = self._clean_external_text(current, 80)
+                        if not current:
+                            continue
+                        if item.factor_overlay is None:
+                            item.factor_overlay = FactorOverlay(current_industry_name=current)
+                        else:
+                            item.factor_overlay.current_industry_name = current
+        return final_candidates
 
     async def _scan(self, codes: list[str], limit: int, *, record: bool = True, job_name: str = "manual_screen"):
         """Fetch and score one logical run; manual /选股 is durable too."""
@@ -1367,18 +1391,139 @@ class Main(Star):
             logger.exception("[%s] 手动全市场同步失败", PLUGIN_NAME)
             yield event.plain_result("全市场同步失败，请检查行情接口和插件配置。")
 
+    @staticmethod
+    def _stored_factor_payload(row: dict) -> dict:
+        raw = row.get("factor_payload") if isinstance(row, dict) else None
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str):
+            return {}
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _stored_candidate_industry(cls, row: dict) -> str:
+        payload = cls._stored_factor_payload(row)
+        current = cls._clean_external_text(payload.get("current_industry_name"), 80)
+        if current:
+            return current
+        legacy = cls._clean_external_text(payload.get("industry_name"), 80)
+        return legacy or "行业未记录"
+
+    @classmethod
+    def _stored_candidate_group(cls, row: dict) -> str:
+        payload = cls._stored_factor_payload(row)
+        current = cls._clean_external_text(payload.get("current_industry_name"), 80)
+        if current:
+            return current
+        legacy = cls._clean_external_text(payload.get("industry_name"), 80)
+        return f"候选快照行业：{legacy}" if legacy else "行业未记录"
+
+    @staticmethod
+    def _stored_trade_date(row: dict) -> str:
+        value = str(row.get("actual_trade_date") or "").strip() if isinstance(row, dict) else ""
+        return value if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else ""
+
+    def _candidate_pool_chunks(self, rows: list[dict]) -> list[str]:
+        """Build bounded paragraphs while keeping each candidate's three lines intact."""
+        rows = [row for row in (rows or []) if isinstance(row, dict)]
+        if not rows:
+            return []
+
+        dates = list(dict.fromkeys(self._stored_trade_date(row) for row in rows if self._stored_trade_date(row)))
+        quote_by_date: dict[str, dict[str, object]] = {}
+        for trade_date in dates:
+            try:
+                quotes = self.store.daily_quotes(trade_date)
+            except Exception:
+                quotes = []
+            values: dict[str, object] = {}
+            for quote in quotes or []:
+                if isinstance(quote, dict):
+                    raw_code = quote.get("code", "")
+                    raw_pct = quote.get("pct_change")
+                else:
+                    raw_code = getattr(quote, "code", "")
+                    raw_pct = getattr(quote, "pct_change", None)
+                code = normalize_code(raw_code)
+                if re.fullmatch(r"\d{6}", code) and code not in values:
+                    values[code] = raw_pct
+            quote_by_date[trade_date] = values
+
+        grouped: dict[str, list[tuple[int, dict, float]]] = {}
+        for position, row in enumerate(rows):
+            try:
+                score = float(row.get("score"))
+                score = score if math.isfinite(score) else float("-inf")
+            except (TypeError, ValueError, OverflowError):
+                score = float("-inf")
+            grouped.setdefault(self._stored_candidate_group(row), []).append((position, row, score))
+        ordered_groups = sorted(
+            grouped.items(),
+            key=lambda item: (-max(entry[2] for entry in item[1]), min(entry[0] for entry in item[1])),
+        )
+
+        numbered: list[tuple[str, str]] = []
+        number = 0
+        for industry, entries in ordered_groups:
+            entries.sort(key=lambda entry: (-entry[2], entry[0]))
+            for _position, row, _score in entries:
+                number += 1
+                trade_date = self._stored_trade_date(row)
+                pct_change = quote_by_date.get(trade_date, {}).get(normalize_code(row.get("code", "")))
+                numbered.append((industry, format_stored_compact_candidate(row, number, pct_change)))
+
+        limit = self._int("push_max_chars", 3500, 500, 12000)
+        header = [
+            "最近候选池（仅研究）",
+            "分类说明：东方财富当前行业分类，仅展示，非历史因子；旧记录按候选快照行业标注",
+            f"数据日期：{self._stored_trade_date(rows[0]) or '未知'}；来源：{self._clean_external_text(rows[0].get('source'), 40) or '未知'}",
+        ]
+        chunks: list[str] = []
+        current = list(header)
+        current_group = ""
+        has_candidate = False
+
+        def flush() -> None:
+            nonlocal current, current_group, has_candidate
+            if current:
+                chunks.append("\n".join(current))
+            current = []
+            current_group = ""
+            has_candidate = False
+
+        for industry, text in numbered:
+            block_lines = text.splitlines()
+            heading_needed = current_group != industry
+            prefix: list[str] = []
+            if has_candidate:
+                prefix.append("")
+            if heading_needed:
+                prefix.append(f"板块：{industry}")
+            proposed = current + prefix + block_lines
+            if current and len("\n".join(proposed)) > limit:
+                flush()
+                current = [f"板块：{industry}"]
+                current_group = industry
+                has_candidate = False
+                proposed = current + block_lines
+            current = proposed
+            current_group = industry
+            has_candidate = True
+        flush()
+        return chunks
+
     @filter.command("候选池", alias={"候选详情"})
     async def candidate_pool(self, event: AstrMessageEvent, count: int = 0):
         rows = self.store.latest_screen_candidates(max(1, min(int(count or self._int("candidate_limit", 30, 1, 100)), 100)))
         if not rows:
             yield event.plain_result("暂无已保存候选池，请先执行 /全市场选股。")
             return
-        lines = ["最近候选池（仅研究）"]
-        for row in rows:
-            flags = "、".join(json.loads(row.get("risk_flags") or "[]")) or "无"
-            lines.append(f"{row['name']}（{row['code']}） 评分{row['score']}/{row['score_max']} 风险{risk_label(row['risk_level'])}（{flags}）")
-        lines.append(f"数据日期：{rows[0].get('actual_trade_date') or '未知'}；来源：{rows[0].get('source') or '未知'}")
-        yield event.plain_result("\n".join(lines))
+        for chunk in self._candidate_pool_chunks(rows):
+            yield event.plain_result(chunk)
 
     @filter.command("研究状态", alias={"数据质量"})
     async def research_status(self, event: AstrMessageEvent):
