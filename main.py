@@ -14,7 +14,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, FactorOverlay, MinuteBarAggregator, assess_market_context, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
+from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, assess_market_context, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.9.0")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.0")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -76,7 +76,44 @@ class Main(Star):
             }
         }
         self._last_screen_run_id: str | None = None
-        self._last_screen_diagnostics: dict[str, int] = {}
+        self._last_screen_diagnostics: dict[str, object] = {}
+
+    @staticmethod
+    def _price_plan_from_payload(payload: str) -> PricePlan | None:
+        try:
+            raw = json.loads(payload or "{}")
+            fields = PricePlan.__dataclass_fields__
+            if not isinstance(raw, dict) or not raw.get("quality"):
+                return None
+            return PricePlan(**{key: raw.get(key) for key in fields})
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _price_state_for_plan(quote, plan: PricePlan | None) -> str:
+        """Evaluate the immutable closing plan against a fresh intraday quote."""
+        if not plan or plan.quality != "good" or quote.price <= 0:
+            return "unknown"
+        if plan.invalidation is not None and quote.price <= plan.invalidation:
+            return "invalidated"
+        if plan.sell_low is not None and quote.price >= plan.sell_low:
+            return "near_sell"
+        if plan.confirmation is not None and quote.price >= plan.confirmation and quote.volume_ratio is not None and quote.volume_ratio >= 1:
+            return "confirmed"
+        if plan.attention_low is not None and plan.attention_high is not None and plan.attention_low <= quote.price <= plan.attention_high:
+            return "in_attention"
+        return "between"
+
+    def _snapshot_context(self, requested_date: str, actual_date: str, quotes: list | None = None) -> dict:
+        meta = self.store.snapshot_meta(actual_date) or {}
+        return {
+            "requested_date": requested_date,
+            "actual_date": actual_date,
+            "source": str(meta.get("source") or next((str(q.source) for q in (quotes or []) if getattr(q, "source", "")), "unknown")),
+            "quality": str(meta.get("quality") or "unknown"),
+            "complete": bool(meta.get("complete")),
+            "note": str(meta.get("note") or ""),
+        }
 
     def _minute_signal_text(self, quote, completed) -> str:
         if not completed or not self._bool("minute_trigger_enabled", False):
@@ -187,7 +224,7 @@ class Main(Star):
     @staticmethod
     def _model_text_is_research_safe(text: str) -> bool:
         """Reject model output that turns a research summary into an action instruction."""
-        return not re.search(r"(?:建议|推荐|应当|适合买|考虑买|买入|卖出|止损|止盈|加仓|减仓|目标价|仓位|下单)", text or "")
+        return not re.search(r"(?:建议|推荐|应当|适合买|考虑买|买入|卖出|止损|止盈|加仓|减仓|目标价|仓位|下单|\\bbuy\\b|\\bsell\\b|\\border\\b|target\\s*price|position)", text or "", flags=re.I)
 
     @staticmethod
     def _clean_external_text(value, limit: int) -> str:
@@ -300,6 +337,9 @@ class Main(Star):
                 industry_rows.setdefault(industry, []).append(quote)
         for item in scored:
             row = raw_factors.get(item.quote.code) or {}
+            factor_name_value = str(row.get("name") or "").strip()
+            if factor_name_value and (not item.quote.name or item.quote.name == item.quote.code):
+                item.quote.name = factor_name_value
             def number(key):
                 try:
                     value = float(row.get(key))
@@ -466,9 +506,17 @@ class Main(Star):
         if online is not None:
             self.store.save_calendar(trade_date, online, "tushare")
             return online
-        approximate = datetime.strptime(trade_date, "%Y-%m-%d").weekday() < 5
-        self.store.save_calendar(trade_date, approximate, "weekday_approximate")
-        return approximate
+        try:
+            latest = await self.quotes.fetch_eastmoney_latest_trade_date()
+        except Exception:
+            latest = None
+        if latest:
+            is_open = latest == trade_date
+            self.store.save_calendar(trade_date, is_open, "eastmoney_index")
+            return is_open
+        # A weekday is not proof of an open A-share session. Do not start a
+        # background scan or intraday listener when the calendar is unknown.
+        return False
 
     async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
         """Return a snapshot, whether it was fetched now, and its actual trade date."""
@@ -528,6 +576,11 @@ class Main(Star):
                 result.quotes,
                 self._int("daily_cache_keep_days", 180, 7, 730),
             )
+            complete = actual_date == trade_date and result.quality == "good"
+            self.store.save_snapshot_meta(
+                actual_date, result.source, result.quality, complete, trade_date,
+                "" if complete else "交易日回退或来源未确认，不能视为当日完整收盘快照",
+            )
             logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
             if actual_date == trade_date:
                 self._daily_date_alias[trade_date] = actual_date
@@ -573,12 +626,13 @@ class Main(Star):
                     candidates = await self._daily_candidates(self._int("candidate_limit", 30, 1, 100))
                     actual_date = self.store.latest_daily_trade_date(requested_date) or requested_date
                     cached_for_record = self.store.daily_quotes(actual_date) if actual_date else []
-                    source = next((str(item.source) for item in cached_for_record if getattr(item, "source", "")), "unknown")
-                    quality = "good" if actual_date == requested_date else "degraded"
-                    self._record_screen(requested_date, actual_date, source, cached_for_record, candidates, quality=quality)
+                    snapshot = self._snapshot_context(requested_date, actual_date, cached_for_record)
+                    source, quality = snapshot["source"], snapshot["quality"]
+                    self._record_screen(requested_date, actual_date, source, cached_for_record, candidates, status="completed" if snapshot["complete"] else "degraded", quality=quality)
                     lines = [
                         "收盘选股（仅研究/模拟盘）",
                         f"请求日期：{requested_date}；实际数据交易日：{actual_date}",
+                        f"行情来源：{source}；质量{quality}{'；非完整收盘快照' if not snapshot['complete'] else ''}",
                         f"市场环境：{self._last_screen_diagnostics.get('market_regime', 'unknown')}（上涨占比{self._last_screen_diagnostics.get('market_breadth', 0):.1%}）",
                         f"因子数据：{self._last_screen_diagnostics.get('factor_source', 'unknown')}，质量{self._last_screen_diagnostics.get('factor_quality', 'unknown')}，模式{self.config.get('factor_mode', 'report_only')}",
                         "筛选口径：硬过滤 → 趋势/动量/量价/波动评分 → 因子复核 → 人工复核",
@@ -589,9 +643,16 @@ class Main(Star):
                         lines.append(f"暂无达标候选：可交易{d.get('tradable', 0)}只，补齐历史指标{d.get('enriched', 0)}只，最高分{d.get('max_score', 0)}，最低门槛{d.get('min_score', 15)}。")
                     push_failed = False
                     for origin in self.store.subscriptions():
+                        if not self._push_allowed(origin):
+                            continue
+                        daily_signal = f"daily:{actual_date}"
+                        claimed_at = datetime.now(timezone.utc)
+                        if not self.store.claim_signal(origin, daily_signal, 86400, now=claimed_at):
+                            continue
                         if not await self._push(origin, "\n".join(lines)):
+                            self.store.release_signal(origin, daily_signal, claimed_at=claimed_at)
                             push_failed = True
-                    completed = not push_failed and self._daily_retry_after is None and actual_date == requested_date
+                    completed = not push_failed and self._daily_retry_after is None and snapshot["complete"]
                     if completed:
                         self.last_daily_scan = now.date().isoformat()
                     self.store.finish_job(job_key, "completed" if completed else "failed", None if completed else "等待数据或推送重试")
@@ -614,7 +675,8 @@ class Main(Star):
                         logger.info("[%s] 模型盘中解释任务已取消", PLUGIN_NAME)
                     except Exception:
                         logger.exception("[%s] 模型盘中解释失败", PLUGIN_NAME)
-                if in_trading_session():
+                today_for_calendar = datetime.now(CHINA_TZ).date().isoformat()
+                if in_trading_session() and await self._calendar_open(today_for_calendar):
                     today = datetime.now(CHINA_TZ).date().isoformat()
                     if self._intraday_date != today:
                         self.minute_bars.reset()
@@ -623,8 +685,13 @@ class Main(Star):
                     watch_details = self.store.all_watch_details()
                     active = {origin: list(codes) for origin, codes in watch.items() if self.store.is_subscribed(origin) and codes}
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
+                    stored_candidates: dict[str, dict] = {}
                     if self._bool("auto_watch_candidates", True):
-                        candidate_codes = [item["code"] for item in self.store.latest_screen_candidates(self._int("candidate_limit", 30, 1, 100)) if item.get("code")]
+                        rows = self.store.latest_screen_candidates(self._int("candidate_limit", 30, 1, 100))
+                        max_age = self._int("candidate_plan_valid_days", 10, 1, 60)
+                        cutoff = (datetime.now(CHINA_TZ).date() - timedelta(days=max_age)).isoformat()
+                        stored_candidates = {str(item["code"]): item for item in rows if item.get("code") and str(item.get("actual_trade_date") or "") >= cutoff}
+                        candidate_codes = list(stored_candidates)
                         for origin in self.store.subscriptions():
                             active.setdefault(origin, [])
                         union.extend(candidate_codes)
@@ -696,21 +763,27 @@ class Main(Star):
                                 for code in codes:
                                     quote = quotes_by_code.get(code)
                                     candidate = by_code.get(code)
+                                    stored = stored_candidates.get(code)
+                                    if candidate and stored:
+                                        candidate.price_plan = self._price_plan_from_payload(str(stored.get("price_plan") or ""))
+                                        candidate.risk_level = str(stored.get("risk_level") or candidate.risk_level)
+                                        candidate.risk_flags = json.loads(stored.get("risk_flags") or "[]")
                                     minute_signal = minute_signals.get(code, "")
                                     cost_signal = self._cost_signal(quote, watch_details.get(origin, {}).get(code)) if quote else ""
-                                    is_minute = bool(minute_signal and not candidate and not cost_signal)
-                                    if quote and not candidate:
+                                    is_minute = bool(minute_signal and not cost_signal)
+                                    plan_candidate = candidate if stored else None
+                                    if quote and not plan_candidate:
                                         self.store.reset_confirmation(origin, code)
                                     if quote and code in completed_codes and not is_minute:
                                         self.store.reset_confirmation(origin, "minute:" + code)
-                                    if not candidate and not cost_signal and not minute_signal:
+                                    if not plan_candidate and not cost_signal and not minute_signal:
                                         continue
-                                    plan_state = candidate.price_plan.state if candidate and candidate.price_plan else "unknown"
-                                    price_signal = bool(candidate and not cost_signal and not minute_signal)
+                                    plan_state = self._price_state_for_plan(quote, plan_candidate.price_plan) if quote and plan_candidate else "unknown"
+                                    price_signal = bool(plan_candidate and not cost_signal and not minute_signal)
                                     state_changed = price_signal and self.store.price_state(origin, code) != plan_state
-                                    if candidate and candidate.risk_level == "unknown" and price_signal:
+                                    if plan_candidate and plan_candidate.risk_level == "unknown" and price_signal:
                                         continue
-                                    if candidate and candidate.risk_level == "blocked" and plan_state != "invalidated" and price_signal:
+                                    if plan_candidate and plan_candidate.risk_level == "blocked" and plan_state != "invalidated" and price_signal:
                                         continue
                                     if price_signal and plan_state not in {"in_attention", "confirmed", "near_sell", "invalidated"}:
                                         continue
@@ -730,7 +803,7 @@ class Main(Star):
                                         if not confirmed:
                                             continue
                                     claim_time = datetime.now(timezone.utc)
-                                    signal_key = f"{code}:{plan_state}" if candidate and not cost_signal and not minute_signal else code
+                                    signal_key = f"price:{stored.get('run_id')}:{code}:{plan_state}" if price_signal else (f"minute:{code}" if is_minute else f"cost:{code}")
                                     if not self.store.claim_signal(origin, signal_key, 600, now=claim_time):
                                         continue
                                     if cost_signal:
@@ -739,8 +812,8 @@ class Main(Star):
                                         text = minute_signal
                                     else:
                                         state_text = {"in_attention": "进入关注区", "confirmed": "突破确认位", "near_sell": "进入参考卖出区", "invalidated": "跌破失效位"}.get(plan_state, "盘中价位变化")
-                                        prefix = f"{state_text}（需人工复核）" if candidate.risk_level == "watch_only" else state_text
-                                        text = prefix + "（仅研究/模拟盘）\n" + format_candidate(candidate)
+                                        prefix = f"{state_text}（需人工复核）" if plan_candidate.risk_level == "watch_only" else state_text
+                                        text = prefix + "（仅研究/模拟盘）\n" + format_candidate(plan_candidate)
                                         annotation = self._annotation_text(code)
                                         if annotation:
                                             text += "\n" + annotation
@@ -813,9 +886,9 @@ class Main(Star):
             "/自选 添加 600000 [成本价]：加入自选\n"
             "/自选 删除 600000：移除自选\n"
             "/监听 开启|关闭|状态：控制盘中和故事提醒\n"
-            "/白名单 开启|关闭|列表：管理推送会话\n"
+            "/白名单 状态：查看当前会话是否在推送白名单\n"
             "/研究状态 或 /数据质量：查看运行、来源和质量\n"
-            "/验证 [天数] 或 /回放 [天数]：回放候选后续行情\n"
+            "/验证 [天数]：回放最近候选；/结果：查看已保存回放结果\n"
             "/故事 [关键词]：查看新闻故事\n"
             "所有结果仅供研究和模拟盘，不自动下单。"
         )
@@ -838,6 +911,7 @@ class Main(Star):
                     yield event.plain_result("行情源没有返回真实交易日，已拒绝把数据标记为今天；请使用 Tushare 或先同步可验证的缓存。")
                     return
                 quotes = result.quotes
+                self.store.save_snapshot_meta(actual_date, result.source, result.quality, actual_date == trade_date and result.quality == "good", trade_date, "未启用本地日快照缓存")
                 source = "已抓取交易日 " + actual_date + " 全市场数据（未启用缓存）"
             if not quotes:
                 yield event.plain_result(
@@ -846,9 +920,11 @@ class Main(Star):
                 )
                 return
             candidates = await self._score_quotes(quotes, limit, actual_date)
-            self._record_screen(trade_date, actual_date, "cache/eastmoney/tushare", quotes, candidates)
+            snapshot = self._snapshot_context(trade_date, actual_date, quotes)
+            self._record_screen(trade_date, actual_date, snapshot["source"], quotes, candidates, status="completed" if snapshot["complete"] else "degraded", quality=snapshot["quality"])
             lines = [
                 f"{source}：{len(quotes)} 只",
+                f"来源：{snapshot['source']}；质量{snapshot['quality']}{'；非完整收盘快照' if not snapshot['complete'] else ''}",
                 "全市场选股结果（仅研究/模拟盘）",
                 f"市场环境：{self._last_screen_diagnostics.get('market_regime', 'unknown')}（上涨占比{self._last_screen_diagnostics.get('market_breadth', 0):.1%}）",
                 "筛选口径：硬过滤 → 趋势/动量/量价/波动评分 → 市场环境修正 → 人工复核",
@@ -884,6 +960,9 @@ class Main(Star):
             return
         latest = runs[0]
         health_rows = self.store.provider_health_rows()
+        factor_meta = self.store.factor_snapshot_meta(str(latest.get("actual_trade_date") or "")) or {}
+        market_meta = self.store.market_context_meta(str(latest.get("actual_trade_date") or "")) or {}
+        snapshot_meta = self.store.snapshot_meta(str(latest.get("actual_trade_date") or "")) or {}
         health_text = "；".join(f"{row['provider']}={row['last_quality']}（成功{row['success_count']}/失败{row['error_count']}）" for row in health_rows) or "暂无来源健康记录"
         yield event.plain_result(
             f"研究状态：{latest['status']}\n"
@@ -891,12 +970,14 @@ class Main(Star):
             f"请求日期：{latest['requested_date']}；实际交易日：{latest.get('actual_trade_date') or '未知'}\n"
             f"来源：{latest['source'] or '未知'}；行情{latest['quote_count']}条；候选{latest['candidate_count']}条\n"
             f"数据质量：{latest['quality']}\n"
-            f"因子模式：{self.config.get('factor_mode', 'report_only')}；因子来源：{self._last_screen_diagnostics.get('factor_source', '未知')}；因子质量：{self._last_screen_diagnostics.get('factor_quality', '未知')}\n"
+            f"快照：{snapshot_meta.get('source', '未知')}，质量{snapshot_meta.get('quality', '未知')}，完整收盘{bool(snapshot_meta.get('complete'))}\n"
+            f"因子模式：{self.config.get('factor_mode', 'report_only')}；因子来源：{factor_meta.get('source', '未知')}；因子质量：{factor_meta.get('quality', '未知')}；覆盖{factor_meta.get('row_count', 0)}只\n"
+            f"市场环境来源：{market_meta.get('source', '未知')}；质量{market_meta.get('quality', '未知')}\n"
             f"来源健康：{health_text}\n"
             "边界：模型只做摘要解释，价位由规则计算；仅研究/模拟盘，不提供订单或自动交易。"
         )
 
-    @filter.command("验证", alias={"结果", "回放"})
+    @filter.command("验证", alias={"回放"})
     async def evaluate(self, event: AstrMessageEvent, horizon: int = 5):
         rows = self.store.latest_screen_candidates(100)
         if not rows:
@@ -904,16 +985,20 @@ class Main(Star):
             return
         horizon = max(1, min(int(horizon or 5), 20))
         as_of = str(rows[0].get("actual_trade_date") or "")
-        future_dates = self.store.daily_trade_dates(as_of, horizon)
-        if len(future_dates) < horizon:
-            yield event.plain_result(f"验证暂不可用：候选日期 {as_of} 之后只有 {len(future_dates)} 个完整交易日，至少需要 {horizon} 个。")
-            return
         run_id = str(rows[0].get("run_id") or "")
         evaluated = 0
         details = []
+        returns = []
+        base = self.store.daily_quotes(as_of)
         for row in rows:
-            base = self.store.daily_quotes(as_of)
             base_quote = next((q for q in base if q.code == row["code"]), None)
+            # This is deliberately evaluation-only. It never changes a prior screen.
+            if base_quote:
+                evaluation_end = (datetime.fromisoformat(as_of).date() + timedelta(days=horizon * 3 + 7)).isoformat()
+                await self.quotes.enrich_indicators([base_quote], 1, evaluation_end)
+                bars = self.quotes.history_bars.get(base_quote.code, [])
+                if bars:
+                    self.store.save_daily_bars(base_quote.code, bars, "eastmoney_evaluation")
             future_bars = self.store.daily_bars(row["code"], after=as_of)[:horizon]
             future = [item for item in future_bars]
             if not base_quote or len(future) < horizon:
@@ -925,23 +1010,38 @@ class Main(Star):
             plan = json.loads(row.get("price_plan") or "{}")
             first_touch = None
             for item in future:
+                touches = []
                 if plan.get("invalidation") and item["low"] <= plan["invalidation"]:
-                    first_touch = "失效位"
-                    break
+                    touches.append("失效位")
                 if plan.get("sell_low") and item["high"] >= plan["sell_low"]:
-                    first_touch = "参考卖出区"
-                    break
+                    touches.append("参考卖出区")
                 if plan.get("confirmation") and item["high"] >= plan["confirmation"]:
-                    first_touch = "确认位"
+                    touches.append("确认位")
+                if touches:
+                    first_touch = "、".join(touches) if len(touches) == 1 else "同日多价位触达，日线无法判断先后（" + "、".join(touches) + "）"
                     break
             self.store.save_result_evaluation(f"{run_id}:{row['code']}:{horizon}", run_id, row["code"], as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), first_touch, True)
             evaluated += 1
-            details.append(f"{row['name']}（{row['code']}）：{ret:+.2f}%｜最大浮盈{max(highs):+.2f}%｜最大回撤{min(lows):+.2f}%｜先触达{first_touch or '无'}")
+            returns.append(ret)
+            details.append(f"{row['name']}（{row['code']}）：{ret:+.2f}%｜最大浮盈{max(highs):+.2f}%｜最大回撤{min(lows):+.2f}%｜关键位{first_touch or '未触达'}")
         if not details:
             yield event.plain_result(f"验证暂不可用：候选后续 K 线不足 {horizon} 个交易日。")
             return
-        avg = sum(float(line.split('：')[1].split('%')[0]) for line in details) / len(details)
+        avg = sum(returns) / len(returns)
         yield event.plain_result(f"回放验证（仅研究）：基准日 {as_of}，周期 {horizon} 日，完成 {evaluated} 条，平均收益{avg:+.2f}%\n" + "\n".join(details[:20]))
+
+    @filter.command("结果")
+    async def results(self, event: AstrMessageEvent, count: int = 20):
+        rows = self.store.evaluations(limit=max(1, min(int(count or 20), 100)))
+        if not rows:
+            yield event.plain_result("暂无已保存的回放结果，请先执行 /验证 [天数]。")
+            return
+        lines = ["已保存回放结果（仅研究）"]
+        for row in rows:
+            ret = row.get("return_pct")
+            text = f"{row['code']}｜基准{row['as_of']}｜{row['horizon']}日收益{float(ret):+.2f}%" if ret is not None else f"{row['code']}｜基准{row['as_of']}｜结果未完成"
+            lines.append(text + f"｜关键位{row.get('first_touch') or '未触达'}")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("自选")
     async def watch(self, event: AstrMessageEvent, action: str = "", code: str = "", cost: str = ""):
@@ -1026,14 +1126,19 @@ class Main(Star):
             yield event.plain_result("无法读取当前会话标识，暂不能设置白名单。")
             return
         if action in {"开启", "开", "on", "add", "加入"}:
+            if not self._bool("allow_self_whitelist", False):
+                yield event.plain_result("白名单由插件配置维护；当前不允许会话自行加入。")
+                return
             self.store.set_whitelist(origin, True)
             yield event.plain_result("已加入推送白名单。\n会话标识：" + origin)
         elif action in {"关闭", "关", "off", "remove", "移除"}:
+            if not self._bool("allow_self_whitelist", False):
+                yield event.plain_result("白名单由插件配置维护；当前不允许会话自行修改。")
+                return
             self.store.set_whitelist(origin, False)
             yield event.plain_result("已移出推送白名单。")
         elif action in {"列表", "list"}:
-            values = sorted(set(self._configured_whitelist()) | set(self.store.whitelist()))
-            yield event.plain_result("推送白名单：\n" + ("\n".join(values) if values else "暂无（后台推送默认关闭）"))
+            yield event.plain_result("为保护会话标识，不提供白名单列表。可用 /白名单 状态 查看当前会话。")
         else:
             yield event.plain_result(
                 "当前会话白名单：{}\n会话标识：{}\n用法：/白名单 开启|关闭|列表|状态".format(

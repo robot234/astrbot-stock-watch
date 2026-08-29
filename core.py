@@ -411,6 +411,8 @@ def in_trading_session(now: datetime | None = None) -> bool:
 def format_candidate(candidate: Candidate) -> str:
     quote = candidate.quote
     name = re.sub(r"[\x00-\x1f\x7f]", "", str(quote.name or "")).strip()[:40]
+    if not name or name == quote.code:
+        name = "名称未知"
     why = "、".join(candidate.reasons) or "暂无技术加分"
     metrics = []
     if quote.rsi6 is not None:
@@ -443,7 +445,7 @@ def format_candidate(candidate: Candidate) -> str:
     conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；价位仅供人工研究"
     composite_line = f"综合评分：{candidate.composite_score}/70\n" if candidate.composite_score is not None else ""
     return (
-        f"候选：{name or quote.code}（{quote.code}）\n"
+        f"候选：{name}（{quote.code}）\n"
         f"行情：现价{quote.price:.2f}，涨跌{quote.pct_change:+.2f}%，成交额{quote.amount:.0f}\n"
         f"技术评分：{candidate.base_score}/{candidate.score_max}（规则加分：{why}）\n"
         f"{composite_line}"

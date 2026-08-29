@@ -36,7 +36,10 @@ def fundamental_score(roe, profit_growth, cash_quality, valuation_score, st_flag
     usable = [item for item in values if item is not None]
     if len(usable) < 2:
         return None
-    normalized = [max(-1, min(1, item / 20)) if item is not None else None for item in values]
+    # The inputs have different units. Normalize each one against a transparent,
+    # conservative reference instead of applying one arbitrary divisor to all.
+    scales = (15.0, 25.0, 1_000_000_000.0, 2.0)
+    normalized = [max(-1, min(1, item / scale)) if item is not None else None for item, scale in zip(values, scales)]
     weights = (0.35, 0.3, 0.2, 0.15)
     total = sum(w * n for w, n in zip(weights, normalized) if n is not None)
     used = sum(w for w, n in zip(weights, normalized) if n is not None)

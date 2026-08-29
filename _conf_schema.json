@@ -1,6 +1,7 @@
 {
   "enabled": {"type": "bool", "description": "启用后台监听和收盘扫描", "default": true},
   "push_whitelist": {"type": "string", "description": "后台推送白名单，填写 unified_msg_origin，多个值用逗号或换行分隔；留空时仅允许通过/白名单 开启加入的会话；填写 * 将允许所有会话", "default": ""},
+  "allow_self_whitelist": {"type": "bool", "description": "允许会话通过指令自行加入白名单，默认关闭", "default": false},
   "push_max_chars": {"type": "int", "description": "单次推送最大字符数，超出时按行拆分发送", "default": 3500},
   "daily_cache_enabled": {"type": "bool", "description": "是否每天收盘抓取全市场日快照并缓存到本地", "default": true},
   "daily_cache_keep_days": {"type": "int", "description": "全市场日快照保留天数", "default": 180},
@@ -32,6 +33,7 @@
   "daily_scan_time": {"type": "string", "description": "收盘扫描时间（北京时间）", "default": "15:10"},
   "candidate_limit": {"type": "int", "description": "收盘推送候选数量", "default": 30},
   "auto_watch_candidates": {"type": "bool", "description": "盘中自动监听最近候选池", "default": true},
+  "candidate_plan_valid_days": {"type": "int", "description": "收盘候选价位计划用于盘中监听的有效天数", "default": 10},
   "intraday_focus_limit": {"type": "int", "description": "盘中重点监听数量上限", "default": 200},
   "min_score": {"type": "int", "description": "技术评分最低分（建议先用10，分数只用于排序）", "default": 10},
   "fallback_limit": {"type": "int", "description": "无达标项时最多保留的观察候选数", "default": 5},

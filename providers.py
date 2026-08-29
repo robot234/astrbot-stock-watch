@@ -331,28 +331,77 @@ class SinaQuoteProvider:
                         except (TypeError, ValueError):
                             return None
                     pe, pb = finite("f162"), finite("f167")
-                    result[str(code)] = {"industry": str(data.get("f127") or ""), "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
+                    result[str(code)] = {"name": str(data.get("f58") or ""), "industry": str(data.get("f127") or ""), "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
                 except (httpx.HTTPError, ValueError, TypeError, KeyError):
                     return
             await asyncio.gather(*(fetch_one(code) for code in list(codes)[:300]))
         return result
 
     async def fetch_tushare_factors(self, codes: Iterable[str], trade_date: str = "") -> dict[str, dict]:
-        """Optional Tushare daily_basic + stock_basic enrichment; permissions may vary."""
+        """Optional point-in-time daily and financial factors; permission failures degrade safely."""
         if not self.tushare_token:
             return {}
         values = [normalize_code(c) for c in codes]
+        as_of = str(trade_date or datetime.now(CHINA_TZ).date().isoformat()).replace("-", "")
+        async def call(client, api_name: str, params: dict, fields: str) -> list[dict]:
+            payload = {"api_name": api_name, "token": self.tushare_token, "params": params, "fields": fields}
+            response = await client.post(self.tushare_url, json=payload)
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or int(body.get("code") or 0) != 0:
+                return []
+            data = body.get("data") or {}
+            names = list(data.get("fields") or [])
+            return [dict(zip(names, item)) for item in (data.get("items") or []) if isinstance(item, list)]
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            payload = {"api_name": "daily_basic", "token": self.tushare_token, "params": {"trade_date": str(trade_date).replace("-", "")}, "fields": "ts_code,trade_date,pe,pb,turnover_rate,total_mv"}
-            response = await client.post(self.tushare_url, json=payload); response.raise_for_status()
-            body = response.json(); rows = ((body.get("data") or {}).get("items") or [])
-        result = {}
-        for row in rows:
-            if not isinstance(row, list) or len(row) < 5:
-                continue
-            code = str(row[0]).split(".")[0]
-            if code in values:
-                result[code] = {"pe": row[2], "pb": row[3], "source": "tushare", "quality": "partial"}
+            rows = await call(client, "daily_basic", {"trade_date": as_of}, "ts_code,trade_date,pe,pb,turnover_rate,total_mv")
+            result = {}
+            for row in rows:
+                code = str(row.get("ts_code") or "").split(".")[0]
+                if code in values:
+                    result[code] = {"pe": row.get("pe"), "pb": row.get("pb"), "source": "tushare", "quality": "partial", "as_of": self._normalize_trade_date(as_of)}
+
+            async def financial(code: str):
+                suffix = "SH" if code.startswith(("6", "9")) else ("BJ" if code.startswith(("4", "8")) else "SZ")
+                ts_code = f"{code}.{suffix}"
+                try:
+                    indicator, income, cashflow = await asyncio.gather(
+                        call(client, "fina_indicator", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,roe,debt_to_assets,ocf_to_or"),
+                        call(client, "income", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,revenue_yoy,operate_profit"),
+                        call(client, "cashflow", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,n_cashflow_act"),
+                    )
+                except (httpx.HTTPError, ValueError, TypeError):
+                    return
+                rows_by_api = (indicator, income, cashflow)
+                visible = [row for rows in rows_by_api for row in rows if str(row.get("ann_date") or "").replace("-", "") <= as_of]
+                if not visible:
+                    return
+                latest = max(visible, key=lambda row: str(row.get("ann_date") or ""))
+                target = result.setdefault(code, {"source": "tushare_financial", "quality": "partial", "as_of": self._normalize_trade_date(as_of)})
+                for row in indicator:
+                    if str(row.get("ann_date") or "").replace("-", "") <= as_of:
+                        target.update({"roe": row.get("roe"), "ann_date": row.get("ann_date"), "report_period": row.get("end_date")})
+                        break
+                for row in income:
+                    if str(row.get("ann_date") or "").replace("-", "") <= as_of:
+                        target["profit_growth"] = row.get("revenue_yoy")
+                        target["ann_date"] = target.get("ann_date") or row.get("ann_date")
+                        target["report_period"] = target.get("report_period") or row.get("end_date")
+                        break
+                for row in cashflow:
+                    if str(row.get("ann_date") or "").replace("-", "") <= as_of:
+                        target["cash_quality"] = row.get("n_cashflow_act")
+                        target["ann_date"] = target.get("ann_date") or row.get("ann_date")
+                        target["report_period"] = target.get("report_period") or row.get("end_date")
+                        break
+                target["source"] = "tushare+financial"
+                target["quality"] = "partial"
+            await asyncio.gather(*(financial(code) for code in values[:50]))
+        for code in list(result):
+            row = result[code]
+            # Financial data has a publication date; it is never silently treated as same-day data.
+            if row.get("ann_date") and str(row["ann_date"]).replace("-", "") > as_of:
+                result.pop(code, None)
         return result
 
     async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> None:

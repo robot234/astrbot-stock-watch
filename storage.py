@@ -131,6 +131,11 @@ class StockStore:
                     origin TEXT NOT NULL, code TEXT NOT NULL, state TEXT NOT NULL,
                     updated_at TEXT NOT NULL, PRIMARY KEY(origin, code)
                 );
+                CREATE TABLE IF NOT EXISTS daily_snapshot_meta(
+                    trade_date TEXT PRIMARY KEY, source TEXT NOT NULL, quality TEXT NOT NULL,
+                    complete INTEGER NOT NULL DEFAULT 0, requested_date TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(watchlist)")}
             if "cost_price" not in columns:
@@ -161,7 +166,7 @@ class StockStore:
             candidate_columns = {row[1] for row in db.execute("PRAGMA table_info(screen_candidates)")}
             if "factor_payload" not in candidate_columns:
                 db.execute("ALTER TABLE screen_candidates ADD COLUMN factor_payload TEXT NOT NULL DEFAULT '{}'")
-            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6')")
+            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7')")
             # Normalize dates written by pre-v4 releases (YYYYMMDD) so range
             # queries cannot mistake legacy rows for future data.
             legacy = db.execute("SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at FROM daily_bars WHERE length(trade_date)=8").fetchall()
@@ -220,6 +225,11 @@ class StockStore:
                 continue
         return result
 
+    def factor_snapshot_meta(self, as_of: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT source,quality,fetched_at,COUNT(*) AS row_count FROM factor_snapshots WHERE as_of=? GROUP BY source,quality,fetched_at ORDER BY fetched_at DESC LIMIT 1", (as_of,)).fetchone()
+            return dict(row) if row else None
+
     def market_context(self, as_of: str) -> dict | None:
         import json
         with self._connect() as db:
@@ -228,6 +238,11 @@ class StockStore:
             return json.loads(row[0]) if row else None
         except (TypeError, ValueError):
             return None
+
+    def market_context_meta(self, as_of: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT source,quality,fetched_at FROM market_contexts WHERE as_of=?", (as_of,)).fetchone()
+            return dict(row) if row else None
 
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
@@ -350,6 +365,29 @@ class StockStore:
             db.execute("DELETE FROM daily_quotes WHERE trade_date < ?", (cutoff,))
         return len(rows)
 
+    def save_snapshot_meta(self, trade_date: str, source: str, quality: str, complete: bool, requested_date: str, note: str = "") -> None:
+        if not trade_date:
+            return
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO daily_snapshot_meta(trade_date,source,quality,complete,requested_date,fetched_at,note) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(trade_date) DO UPDATE SET source=excluded.source,quality=excluded.quality,complete=excluded.complete,requested_date=excluded.requested_date,fetched_at=excluded.fetched_at,note=excluded.note",
+                (trade_date, source or "unknown", quality or "unknown", int(complete), requested_date or trade_date, datetime.utcnow().isoformat(), note or ""),
+            )
+
+    def snapshot_meta(self, trade_date: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM daily_snapshot_meta WHERE trade_date=?", (trade_date,)).fetchone()
+            return dict(row) if row else None
+
+    def latest_snapshot_meta(self, before_or_equal: str = "") -> dict | None:
+        with self._connect() as db:
+            if before_or_equal:
+                row = db.execute("SELECT * FROM daily_snapshot_meta WHERE trade_date<=? ORDER BY trade_date DESC LIMIT 1", (before_or_equal,)).fetchone()
+            else:
+                row = db.execute("SELECT * FROM daily_snapshot_meta ORDER BY trade_date DESC LIMIT 1").fetchone()
+            return dict(row) if row else None
+
     def save_daily_bars(self, code: str, bars, source: str = "eastmoney") -> int:
         rows = [(str(code), self._date_norm(str(item.get("trade_date"))), float(item.get("open") or 0), float(item.get("high") or 0), float(item.get("low") or 0), float(item.get("close") or 0), float(item.get("volume") or 0), float(item.get("amount") or 0), source, datetime.utcnow().isoformat()) for item in bars if item.get("trade_date")]
         if not rows:
@@ -465,15 +503,21 @@ class StockStore:
         with self._connect() as db:
             return [dict(row) for row in db.execute("SELECT c.*, r.actual_trade_date, r.source FROM screen_candidates c JOIN screen_runs r ON r.run_id=c.run_id WHERE r.run_id=(SELECT run_id FROM screen_runs WHERE status='completed' ORDER BY started_at DESC LIMIT 1) ORDER BY c.score DESC LIMIT ?", (max(1, min(int(limit), 100)),))]
 
-    def begin_job(self, job_key: str, job_name: str, trade_date: str) -> bool:
+    def begin_job(self, job_key: str, job_name: str, trade_date: str, lease_seconds: int = 900) -> bool:
         now = datetime.utcnow().isoformat()
         with self._connect() as db:
             try:
                 db.execute("INSERT INTO job_runs(job_key,job_name,trade_date,started_at,status) VALUES(?,?,?,?,?)", (job_key, job_name, trade_date, now, "running"))
                 return True
             except sqlite3.IntegrityError:
-                row = db.execute("SELECT status FROM job_runs WHERE job_key=?", (job_key,)).fetchone()
-                if row and str(row[0]) == "failed":
+                row = db.execute("SELECT status,started_at FROM job_runs WHERE job_key=?", (job_key,)).fetchone()
+                stale = False
+                if row and str(row[0]) == "running":
+                    try:
+                        stale = (datetime.utcnow() - datetime.fromisoformat(str(row[1]))).total_seconds() >= max(60, int(lease_seconds))
+                    except (TypeError, ValueError):
+                        stale = True
+                if row and (str(row[0]) == "failed" or stale):
                     db.execute("UPDATE job_runs SET started_at=?,finished_at=NULL,status='running',error=NULL WHERE job_key=?", (now, job_key))
                     return True
                 return False
@@ -501,7 +545,7 @@ class StockStore:
 
     def save_result_evaluation(self, evaluation_id: str, run_id: str, code: str, as_of: str, horizon: int, status: str, close: float | None, return_pct: float | None, mfe_pct: float | None, mae_pct: float | None, first_touch: str | None, sample_complete: bool) -> None:
         with self._connect() as db:
-            db.execute("INSERT OR IGNORE INTO result_evaluations(evaluation_id,run_id,code,as_of,horizon,status,close,return_pct,mfe_pct,mae_pct,first_touch,sample_complete,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (evaluation_id, run_id, code, as_of, int(horizon), status, close, return_pct, mfe_pct, mae_pct, first_touch, int(sample_complete), datetime.utcnow().isoformat()))
+            db.execute("INSERT INTO result_evaluations(evaluation_id,run_id,code,as_of,horizon,status,close,return_pct,mfe_pct,mae_pct,first_touch,sample_complete,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(evaluation_id) DO UPDATE SET status=excluded.status,close=excluded.close,return_pct=excluded.return_pct,mfe_pct=excluded.mfe_pct,mae_pct=excluded.mae_pct,first_touch=excluded.first_touch,sample_complete=excluded.sample_complete,created_at=excluded.created_at", (evaluation_id, run_id, code, as_of, int(horizon), status, close, return_pct, mfe_pct, mae_pct, first_touch, int(sample_complete), datetime.utcnow().isoformat()))
 
     def evaluations(self, run_id: str | None = None, limit: int = 50) -> list[dict]:
         with self._connect() as db:
