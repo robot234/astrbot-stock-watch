@@ -505,9 +505,16 @@ class Main(Star):
                     self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
                     return self.store.daily_quotes(cached_date), False, cached_date
                 if result.source == "eastmoney":
-                    actual_date = trade_date
+                    try:
+                        actual_date = await self.quotes.fetch_eastmoney_latest_trade_date()
+                    except Exception:
+                        actual_date = None
+                    if not actual_date:
+                        self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                        logger.warning("[%s] 东方财富快照无法验证交易日，拒绝缓存", PLUGIN_NAME)
+                        return [], True, trade_date
                     result.quality = "degraded"
-                    logger.warning("[%s] 东方财富快照缺少交易日，按请求日期缓存并标记 degraded", PLUGIN_NAME)
+                    logger.warning("[%s] 东方财富快照交易日由指数日线验证为 %s，标记 degraded", PLUGIN_NAME, actual_date)
                 else:
                     self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
                     return [], True, trade_date

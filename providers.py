@@ -46,6 +46,18 @@ class SinaQuoteProvider:
         """Fetch one daily snapshot, preferring Tushare when a token is configured."""
         return (await self.fetch_market_snapshot_result(daily_market_url, trade_date)).quotes
 
+    async def fetch_eastmoney_latest_trade_date(self) -> str | None:
+        """Verify the snapshot date from the latest completed Shanghai index bar."""
+        params = {"secid": "1.000001", "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55", "klt": "101", "fqt": "0", "lmt": "2", "end": "20500101"}
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get("https://push2his.eastmoney.com/api/qt/stock/kline/get", params=params)
+            response.raise_for_status()
+            rows = ((response.json().get("data") or {}).get("klines") or [])
+        if not rows:
+            return None
+        value = str(rows[-1]).split(",", 1)[0].strip()
+        return self._normalize_trade_date(value) if re.fullmatch(r"\d{4}-?\d{2}-?\d{2}", value) else None
+
     async def fetch_market_snapshot_result(self, daily_market_url: str = "", trade_date: str = "") -> MarketSnapshotResult:
         """Fetch a snapshot and report the actual trading date represented by the data."""
         if self.tushare_token:
