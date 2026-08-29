@@ -194,62 +194,76 @@ class StockStore:
                 (12, self._migrate_v12_minute_bars),
                 (13, self._migrate_v13_provenance_and_symbols),
             )
-            for version, migration in migrations:
-                if current < version:
-                    migration(db)
-                    self._set_schema_version(db, version)
-                    current = version
+            pending = [(version, migration) for version, migration in migrations if current < version]
+            if pending:
+                # Baseline creation/repair is deliberately committed before
+                # migrations.  Every pending migration and its version marker
+                # then share one explicit transaction, so a failure at any
+                # point leaves the database at the last committed schema.
+                db.commit()
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    for version, migration in pending:
+                        migration(db)
+                        self._set_schema_version(db, version)
+                        current = version
+                    # Keep partially-created v13 stores repairable, but keep
+                    # these repairs inside the same 7->13 transaction.
+                    self._ensure_column(db, "daily_bars", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+                    self._ensure_column(db, "result_evaluations", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+                    self._ensure_column(db, "result_evaluations", "plan_validated", "INTEGER NOT NULL DEFAULT 0")
+                    db.execute(
+                        """CREATE TABLE IF NOT EXISTS stock_symbols(
+                            code TEXT PRIMARY KEY,
+                            name TEXT NOT NULL DEFAULT '',
+                            normalized_name TEXT NOT NULL DEFAULT '',
+                            source TEXT NOT NULL DEFAULT '',
+                            updated_at TEXT NOT NULL
+                        )"""
+                    )
+                    db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_normalized_name ON stock_symbols(normalized_name)")
+                    db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_code_prefix ON stock_symbols(code)")
+                    db.execute(
+                        """CREATE TABLE IF NOT EXISTS report_versions(
+                            report_key TEXT PRIMARY KEY,
+                            report_version INTEGER NOT NULL,
+                            run_id TEXT NOT NULL,
+                            quality TEXT NOT NULL DEFAULT 'unknown',
+                            updated_at TEXT NOT NULL
+                        )"""
+                    )
+                    self._normalize_legacy_daily_bar_dates(db)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
             # Keep partially-created v13 stores repairable and make the
             # legacy date normalization below safe after an interrupted DDL.
-            self._ensure_column(db, "daily_bars", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
-            self._ensure_column(db, "result_evaluations", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
-            self._ensure_column(db, "result_evaluations", "plan_validated", "INTEGER NOT NULL DEFAULT 0")
-            db.execute(
-                """CREATE TABLE IF NOT EXISTS stock_symbols(
-                    code TEXT PRIMARY KEY,
-                    name TEXT NOT NULL DEFAULT '',
-                    normalized_name TEXT NOT NULL DEFAULT '',
-                    source TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL
-                )"""
-            )
-            db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_normalized_name ON stock_symbols(normalized_name)")
-            db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_code_prefix ON stock_symbols(code)")
-            db.execute(
-                """CREATE TABLE IF NOT EXISTS report_versions(
-                    report_key TEXT PRIMARY KEY,
-                    report_version INTEGER NOT NULL,
-                    run_id TEXT NOT NULL,
-                    quality TEXT NOT NULL DEFAULT 'unknown',
-                    updated_at TEXT NOT NULL
-                )"""
-            )
-
-            # Normalize dates written by pre-v4 releases so lexical range
-            # queries cannot mistake legacy rows for future data.
-            legacy = db.execute(
-                "SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at, price_basis "
-                "FROM daily_bars WHERE length(trade_date)=8"
-            ).fetchall()
-            for row in legacy:
-                normalized = self._date_norm(str(row[1]))
-                existing = db.execute(
-                    "SELECT price_basis FROM daily_bars WHERE code=? AND trade_date=?",
-                    (row[0], normalized),
-                ).fetchone()
-                basis = str(row[10] or "unknown")
-                if existing and str(existing[0] or "unknown") not in {"", "unknown"}:
-                    basis = str(existing[0])
-                if existing:
-                    if str(existing[0] or "unknown").strip().lower() in {"", "unknown"} and basis.strip().lower() not in {"", "unknown"}:
-                        db.execute("UPDATE daily_bars SET price_basis=? WHERE code=? AND trade_date=?", (basis, row[0], normalized))
-                else:
-                    db.execute(
-                        "INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (row[0], normalized, row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], basis),
-                    )
-                db.execute("DELETE FROM daily_bars WHERE code=? AND trade_date=?", (row[0], row[1]))
+            if not pending:
+                self._ensure_column(db, "daily_bars", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+                self._ensure_column(db, "result_evaluations", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
+                self._ensure_column(db, "result_evaluations", "plan_validated", "INTEGER NOT NULL DEFAULT 0")
+                db.execute(
+                    """CREATE TABLE IF NOT EXISTS stock_symbols(
+                        code TEXT PRIMARY KEY,
+                        name TEXT NOT NULL DEFAULT '',
+                        normalized_name TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+                db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_normalized_name ON stock_symbols(normalized_name)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_stock_symbols_code_prefix ON stock_symbols(code)")
+                db.execute(
+                    """CREATE TABLE IF NOT EXISTS report_versions(
+                        report_key TEXT PRIMARY KEY,
+                        report_version INTEGER NOT NULL,
+                        run_id TEXT NOT NULL,
+                        quality TEXT NOT NULL DEFAULT 'unknown',
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+                self._normalize_legacy_daily_bar_dates(db)
 
     @staticmethod
     def _table_exists(db, table: str) -> bool:
@@ -272,6 +286,32 @@ class StockStore:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(int(version)),),
         )
+
+    def _normalize_legacy_daily_bar_dates(self, db) -> None:
+        """Normalize compact daily-bar dates within the caller's transaction."""
+        legacy = db.execute(
+            "SELECT code, trade_date, open, high, low, close, volume, amount, source, fetched_at, price_basis "
+            "FROM daily_bars WHERE length(trade_date)=8"
+        ).fetchall()
+        for row in legacy:
+            normalized = self._date_norm(str(row[1]))
+            existing = db.execute(
+                "SELECT price_basis FROM daily_bars WHERE code=? AND trade_date=?",
+                (row[0], normalized),
+            ).fetchone()
+            basis = str(row[10] or "unknown")
+            if existing and str(existing[0] or "unknown") not in {"", "unknown"}:
+                basis = str(existing[0])
+            if existing:
+                if str(existing[0] or "unknown").strip().lower() in {"", "unknown"} and basis.strip().lower() not in {"", "unknown"}:
+                    db.execute("UPDATE daily_bars SET price_basis=? WHERE code=? AND trade_date=?", (basis, row[0], normalized))
+            else:
+                db.execute(
+                    "INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (row[0], normalized, row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], basis),
+                )
+            db.execute("DELETE FROM daily_bars WHERE code=? AND trade_date=?", (row[0], row[1]))
 
     @staticmethod
     def _migrate_v8_calendar(db) -> None:
@@ -361,35 +401,35 @@ class StockStore:
     def _migrate_v11_run_scoped_events(db) -> None:
         # Rebuild the three state tables so the run is part of the durable key.
         # Legacy rows remain available under the explicit "legacy" run scope.
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS signal_events_v11(
+        statements = (
+            """CREATE TABLE IF NOT EXISTS signal_events_v11(
                 origin TEXT NOT NULL, code TEXT NOT NULL, run_id TEXT NOT NULL DEFAULT 'legacy',
                 last_sent_at TEXT NOT NULL, PRIMARY KEY(origin, code, run_id)
-            );
-            INSERT OR IGNORE INTO signal_events_v11(origin,code,run_id,last_sent_at)
-                SELECT origin,code,'legacy',last_sent_at FROM signal_events;
-            DROP TABLE signal_events;
-            ALTER TABLE signal_events_v11 RENAME TO signal_events;
-
-            CREATE TABLE IF NOT EXISTS confirmation_events_v11(
+            )""",
+            """INSERT OR IGNORE INTO signal_events_v11(origin,code,run_id,last_sent_at)
+                SELECT origin,code,'legacy',last_sent_at FROM signal_events""",
+            "DROP TABLE signal_events",
+            "ALTER TABLE signal_events_v11 RENAME TO signal_events",
+            """CREATE TABLE IF NOT EXISTS confirmation_events_v11(
                 origin TEXT NOT NULL, code TEXT NOT NULL, run_id TEXT NOT NULL DEFAULT 'legacy',
                 consecutive_count INTEGER NOT NULL, last_observed_at TEXT NOT NULL,
                 PRIMARY KEY(origin, code, run_id)
-            );
-            INSERT OR IGNORE INTO confirmation_events_v11(origin,code,run_id,consecutive_count,last_observed_at)
-                SELECT origin,code,'legacy',consecutive_count,last_observed_at FROM confirmation_events;
-            DROP TABLE confirmation_events;
-            ALTER TABLE confirmation_events_v11 RENAME TO confirmation_events;
-
-            CREATE TABLE IF NOT EXISTS price_states_v11(
+            )""",
+            """INSERT OR IGNORE INTO confirmation_events_v11(origin,code,run_id,consecutive_count,last_observed_at)
+                SELECT origin,code,'legacy',consecutive_count,last_observed_at FROM confirmation_events""",
+            "DROP TABLE confirmation_events",
+            "ALTER TABLE confirmation_events_v11 RENAME TO confirmation_events",
+            """CREATE TABLE IF NOT EXISTS price_states_v11(
                 origin TEXT NOT NULL, code TEXT NOT NULL, run_id TEXT NOT NULL DEFAULT 'legacy',
                 state TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(origin, code, run_id)
-            );
-            INSERT OR IGNORE INTO price_states_v11(origin,code,run_id,state,updated_at)
-                SELECT origin,code,'legacy',state,updated_at FROM price_states;
-            DROP TABLE price_states;
-            ALTER TABLE price_states_v11 RENAME TO price_states;
-        """)
+            )""",
+            """INSERT OR IGNORE INTO price_states_v11(origin,code,run_id,state,updated_at)
+                SELECT origin,code,'legacy',state,updated_at FROM price_states""",
+            "DROP TABLE price_states",
+            "ALTER TABLE price_states_v11 RENAME TO price_states",
+        )
+        for statement in statements:
+            db.execute(statement)
         StockStore._ensure_column(db, "risk_events", "run_id", "TEXT")
         db.execute("UPDATE risk_events SET run_id='legacy' WHERE run_id IS NULL OR run_id=''")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_events_run_code_state ON risk_events(run_id,code,state)")

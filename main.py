@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.12.0")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.12.1")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)

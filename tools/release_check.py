@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+EXPECTED_VERSION = "0.12.1"
 TEXT_SUFFIXES = (".py", ".json", ".yaml", ".yml", ".md")
 FORBIDDEN_PATH_PARTS = (
     "tests/",
@@ -64,7 +65,11 @@ def main() -> int:
         print("FAIL unable to locate one metadata version and one register version")
         return 1
     metadata_version, register_version, _ = versions
-    if not VERSION_RE.fullmatch(metadata_version) or metadata_version != register_version:
+    if (
+        not VERSION_RE.fullmatch(metadata_version)
+        or metadata_version != register_version
+        or metadata_version != EXPECTED_VERSION
+    ):
         print("FAIL version mismatch", metadata_version, register_version)
         return 1
 
