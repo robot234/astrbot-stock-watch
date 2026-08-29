@@ -523,14 +523,19 @@ class Main(Star):
         lookup_date = self._daily_date_alias.get(trade_date, trade_date)
         cached = self.store.daily_quotes(lookup_date)
         cached_meta = self.store.snapshot_meta(lookup_date)
-        if cached and (lookup_date != trade_date or not cached_meta or bool(cached_meta.get("complete"))):
+        if cached and lookup_date != trade_date:
+            return cached, False, lookup_date
+        if cached and cached_meta and bool(cached_meta.get("complete")):
             return cached, False, lookup_date
         async with self._daily_snapshot_lock:
             # Re-check after waiting so the background loop and manual command do not fetch twice.
             lookup_date = self._daily_date_alias.get(trade_date, trade_date)
             cached = self.store.daily_quotes(lookup_date)
             cached_meta = self.store.snapshot_meta(lookup_date)
-            if cached and (lookup_date != trade_date or not cached_meta or bool(cached_meta.get("complete"))):
+            if cached and lookup_date != trade_date:
+                self._daily_retry_after = None
+                return cached, False, lookup_date
+            if cached and cached_meta and bool(cached_meta.get("complete")):
                 self._daily_retry_after = None
                 return cached, False, lookup_date
             try:
