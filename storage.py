@@ -182,6 +182,31 @@ class StockStore:
         with self._connect() as db:
             db.execute("INSERT OR REPLACE INTO market_contexts(as_of,payload,source,quality,fetched_at) VALUES(?,?,?,?,?)", (as_of, json.dumps(payload, ensure_ascii=False), source, quality, datetime.utcnow().isoformat()))
 
+    def factor_snapshots(self, as_of: str) -> dict[str, dict]:
+        import json
+        with self._connect() as db:
+            rows = db.execute("SELECT code,payload FROM factor_snapshots WHERE as_of=? ORDER BY fetched_at DESC", (as_of,)).fetchall()
+        result: dict[str, dict] = {}
+        for row in rows:
+            if row[0] in result:
+                continue
+            try:
+                payload = json.loads(row[1])
+                if isinstance(payload, dict):
+                    result[str(row[0])] = payload
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def market_context(self, as_of: str) -> dict | None:
+        import json
+        with self._connect() as db:
+            row = db.execute("SELECT payload FROM market_contexts WHERE as_of=?", (as_of,)).fetchone()
+        try:
+            return json.loads(row[0]) if row else None
+        except (TypeError, ValueError):
+            return None
+
     def add_watch(self, scope: str, code: str, limit: int, cost_price: float | None = None, name: str | None = None) -> bool:
         if cost_price is not None and (not math.isfinite(cost_price) or cost_price <= 0):
             cost_price = None

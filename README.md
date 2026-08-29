@@ -66,6 +66,7 @@
 - `factor_mode`：`report_only` 只展示行业、基本面和大盘因子；`score` 才把它们加入综合排序。建议先使用 `report_only`。
 - `factor_source`：因子来源。`auto`/`eastmoney` 使用东方财富公开字段；`tushare` 使用已配置 Token 的估值字段；`custom` 使用自定义 JSON 接口。
 - `factor_data_url`：可选自定义因子接口。留空时使用 `factor_source` 指定的内置来源。接口返回 `data` 数组，每项至少包含 `code`，可选 `industry`、`industry_score`、`fundamental_score`、`quality`。
+- `market_min_snapshot_size`：只有本地快照达到该数量才按“完整市场”计算大盘环境，默认 4000；不足时报告会标为 `partial`。
 - `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号，确认进度会保存到 SQLite。
 - `confirmation_periods`：连续确认次数，默认 2 次。
 - `confirmation_max_gap_seconds`：连续确认最大间隔，默认 90 秒。
@@ -119,6 +120,7 @@
 - 盘中自选股默认使用新浪批量行情接口，适合少量自选股轮询。
 - 历史日线和技术指标使用东方财富接口。
 - 东方财富因子字段仅用于当前研究报告，包含行业标签和部分估值/ROE，质量会标为 `partial`；它不作为历史回放的完整基本面真值。
+- 历史交易日不会使用东方财富的当前财务字段倒灌；插件会优先读取该日期已缓存的因子快照，否则标为未知。
 - 行业强弱由同批已补齐日线的股票计算行业 5 日相对动量、上涨占比和成交活跃度；样本不足会标为未知，不强行加分。
 - Tushare Pro 更适合每日和历史数据，不建议用于高频盘中监听。Token 只填入 AstrBot 配置或环境变量，不要放进 URL 或提交到 GitHub。
 

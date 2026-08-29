@@ -71,9 +71,6 @@ class FactorOverlay:
         values = (self.industry_score, self.fundamental_score)
         return int(round(sum(value for value in values if value is not None))) + self.market_adjustment
 
-    @property
-    def composite_score(self) -> int | None:
-        return None
 
 
 @dataclass(slots=True)
@@ -444,7 +441,7 @@ def format_candidate(candidate: Candidate) -> str:
     else:
         levels = "参考价位：历史数据不足，暂不计算"
     conclusion = "进入观察池，先复核日线趋势、基本面、公告和流动性；价位仅供人工研究"
-    composite_line = f"综合评分：{candidate.composite_score}/73\n" if candidate.composite_score is not None else ""
+    composite_line = f"综合评分：{candidate.composite_score}/70\n" if candidate.composite_score is not None else ""
     return (
         f"候选：{name or quote.code}（{quote.code}）\n"
         f"行情：现价{quote.price:.2f}，涨跌{quote.pct_change:+.2f}%，成交额{quote.amount:.0f}\n"

@@ -234,16 +234,18 @@ class Main(Star):
         self._last_screen_diagnostics = {"input": len(quotes), "tradable": len(tradable), "enriched": sum(1 for q in enrich_targets if q.history_days >= 20)}
         scored = [score_quote(quote) for quote in tradable]
         full_market = self.store.daily_quotes(as_of) if as_of else []
-        market_quotes = full_market if len(full_market) >= 1000 else quotes
+        market_minimum = self._int("market_min_snapshot_size", 4000, 1000, 10000)
+        market_quotes = full_market if len(full_market) >= market_minimum else quotes
         market = assess_market_context(market_quotes)
         if as_of:
             self.store.save_market_context(as_of, {
                 "regime": market.regime, "breadth": market.breadth, "advancing": market.advancing,
                 "declining": market.declining, "total_amount": market.total_amount, "evidence": market.evidence,
-            }, "daily_snapshot" if full_market else "input_subset", "good" if len(full_market) >= 1000 else "partial")
+            }, "daily_snapshot" if len(full_market) >= market_minimum else "input_subset", "good" if len(full_market) >= market_minimum else "partial")
         factor_url = str(self.config.get("factor_data_url", "")).strip()
         factor_source = str(self.config.get("factor_source", "auto")).strip().lower()
         factor_mode = str(self.config.get("factor_mode", "report_only")).strip().lower()
+        historical_factor_date = bool(as_of and as_of < datetime.now(CHINA_TZ).date().isoformat())
         raw_factors: dict[str, dict] = {}
         factor_name, factor_quality = "", "unknown"
         if factor_url:
@@ -252,21 +254,22 @@ class Main(Star):
                 factor_name, factor_quality = "custom", "good" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] 自定义因子源不可用，继续技术筛选", PLUGIN_NAME)
-        elif factor_source == "tushare":
+        if not raw_factors and factor_source in {"auto", "tushare", "custom"} and self.quotes.tushare_token:
             try:
                 raw_factors = await self.quotes.fetch_tushare_factors([q.code for q in enrich_targets], as_of)
                 factor_name, factor_quality = "tushare", "partial" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] Tushare 因子源不可用，继续技术筛选", PLUGIN_NAME)
-        elif factor_source in {"auto", "eastmoney"}:
+        if not raw_factors and not historical_factor_date and factor_source in {"auto", "eastmoney", "custom", "tushare"}:
             try:
                 raw_factors = await self.quotes.fetch_eastmoney_factors([q.code for q in enrich_targets])
                 factor_name, factor_quality = "eastmoney", "partial" if raw_factors else "unknown"
-                if not raw_factors and factor_source == "auto" and self.quotes.tushare_token:
-                    raw_factors = await self.quotes.fetch_tushare_factors([q.code for q in enrich_targets], as_of)
-                    factor_name, factor_quality = "tushare", "partial" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] 东方财富因子源不可用，继续技术筛选", PLUGIN_NAME)
+        if not raw_factors and as_of:
+            raw_factors = self.store.factor_snapshots(as_of)
+            if raw_factors:
+                factor_name, factor_quality = "cache", "cached"
         if as_of and raw_factors:
             self.store.save_factor_snapshots(as_of, raw_factors, factor_name or factor_source, factor_quality)
         adjustment = market_adjustment(market.regime)
@@ -307,6 +310,7 @@ class Main(Star):
                 extra = max(-20, min(20, item.factor_overlay.adjustment))
                 item.composite_score = item.base_score + extra
                 item.score = item.composite_score
+                item.score_max = 70
                 if extra:
                     item.reasons.append(f"因子综合修正{extra:+d}")
         minimum = self._int("min_score", 10, -100, 100)

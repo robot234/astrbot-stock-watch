@@ -8,6 +8,7 @@
   "factor_mode": {"type": "string", "description": "因子模式：report_only 只展示，score 才参与排序", "default": "report_only"},
   "factor_data_url": {"type": "string", "description": "行业/基本面兼容 JSON 接口地址，留空使用可用内置来源", "default": ""},
   "factor_source": {"type": "string", "description": "因子来源：auto/eastmoney/tushare/custom", "default": "auto"},
+  "market_min_snapshot_size": {"type": "int", "description": "判定完整市场环境的最少快照数量", "default": 4000},
   "tushare_url": {"type": "string", "description": "Tushare Pro 接口地址", "default": ""},
   "tushare_token": {"type": "string", "description": "Tushare Pro Token", "default": "", "obvious_hint": true},
   "universe_codes": {"type": "string", "description": "选股代码，逗号分隔；留空时使用自选股", "default": ""},

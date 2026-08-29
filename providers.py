@@ -297,7 +297,8 @@ class SinaQuoteProvider:
                             return value if math.isfinite(value) else None
                         except (TypeError, ValueError):
                             return None
-                    result[str(code)] = {"industry": str(data.get("f127") or ""), "pe": finite("f162"), "pb": finite("f167"), "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
+                    pe, pb = finite("f162"), finite("f167")
+                    result[str(code)] = {"industry": str(data.get("f127") or ""), "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
                 except (httpx.HTTPError, ValueError, TypeError, KeyError):
                     return
             await asyncio.gather(*(fetch_one(code) for code in list(codes)[:300]))
