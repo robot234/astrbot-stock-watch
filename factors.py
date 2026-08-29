@@ -29,8 +29,10 @@ def industry_strength(industry_return5, benchmark_return5, breadth, amount_ratio
     score = 10 * (0.5 * max(-1, min(1, excess / 10)) + 0.3 * (vals[2] * 2 - 1) + 0.2 * max(-1, min(1, (vals[3] - 1) / 2)))
     return max(-10, min(10, round(score)))
 
-def fundamental_score(roe, profit_growth, cash_quality, valuation_score, st_flag=False, audit_flag=False):
-    if st_flag or audit_flag:
+def fundamental_score(roe, profit_growth, cash_quality, valuation_score, st_flag=None, audit_flag=None):
+    # True is a hard risk; None means the source did not establish the flag
+    # and must not be silently coerced to False by the score calculation.
+    if st_flag is True or audit_flag is True:
         return -10
     values = [_finite(item) for item in (roe, profit_growth, cash_quality, valuation_score)]
     usable = [item for item in values if item is not None]

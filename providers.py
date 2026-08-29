@@ -6,6 +6,7 @@ import json
 import math
 import re
 import xml.etree.ElementTree as ET
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
@@ -31,17 +32,113 @@ class MarketSnapshotResult:
     fetched_at: datetime = field(default_factory=lambda: datetime.now(CHINA_TZ))
 
 
+class HttpRuntime:
+    """One lazily opened client plus a process-local request gate.
+
+    Providers share this runtime so a large screen cannot create one client
+    and one unconstrained task per symbol.  The loop check keeps the object
+    usable in short-lived test/event loops as well as AstrBot's long-lived
+    loop.
+    """
+
+    def __init__(self, timeout: float = 10, max_concurrency: int = 8, headers: dict | None = None):
+        self.timeout = timeout
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.headers = dict(headers or {})
+        self._semaphore: asyncio.Semaphore | None = None
+        self._semaphore_loop = None
+        self._client: httpx.AsyncClient | None = None
+        self._entered = False
+        self._loop = None
+        self._client_lock: asyncio.Lock | None = None
+        self._lock_loop = None
+
+    def _gate(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if self._semaphore is None or self._semaphore_loop is not loop:
+            self._semaphore = asyncio.Semaphore(self.max_concurrency)
+            self._semaphore_loop = loop
+        return self._semaphore
+
+    @staticmethod
+    async def _dispose(client, entered: bool) -> None:
+        if client is None:
+            return
+        exit_method = getattr(client, "__aexit__", None)
+        if exit_method and entered:
+            await exit_method(None, None, None)
+            return
+        close = getattr(client, "aclose", None)
+        if close:
+            await close()
+
+    async def client(self) -> httpx.AsyncClient:
+        loop = asyncio.get_running_loop()
+        if self._client is not None and self._loop is loop:
+            return self._client
+        if self._client_lock is None or self._lock_loop is not loop:
+            self._client_lock = asyncio.Lock()
+            self._lock_loop = loop
+        async with self._client_lock:
+            if self._client is not None and self._loop is loop:
+                return self._client
+            # A prior asyncio.run() may have closed its loop.  Dispose of the
+            # old client before opening a replacement on the current loop.
+            previous, previous_entered = self._client, self._entered
+            self._client, self._loop, self._entered = None, None, False
+            if previous is not None:
+                try:
+                    await self._dispose(previous, previous_entered)
+                except Exception:
+                    # A client owned by a closed loop may no longer be
+                    # closable; it must not prevent a fresh runtime.
+                    pass
+            client = httpx.AsyncClient(timeout=self.timeout, headers=self.headers)
+            entered = False
+            try:
+                enter = getattr(client, "__aenter__", None)
+                if enter:
+                    opened = await enter()
+                    if opened is not None:
+                        client = opened
+                    entered = True
+            except Exception:
+                try:
+                    await self._dispose(client, entered)
+                except Exception:
+                    pass
+                raise
+            self._client, self._loop, self._entered = client, loop, entered
+            return client
+
+    @asynccontextmanager
+    async def slot(self):
+        async with self._gate():
+            yield await self.client()
+
+    async def close(self) -> None:
+        client, self._client = self._client, None
+        self._loop = None
+        entered = self._entered
+        self._entered = False
+        await self._dispose(client, entered)
+
+
 class SinaQuoteProvider:
     """Prototype provider; replace it with a licensed/stable source for production."""
 
-    def __init__(self, timeout: float = 10, tushare_url: str = "", tushare_token: str = ""):
+    def __init__(self, timeout: float = 10, tushare_url: str = "", tushare_token: str = "", max_concurrency: int = 8, http_runtime: HttpRuntime | None = None):
         self.timeout = timeout
         self.tushare_url = str(tushare_url or "").strip() or "https://api.tushare.pro"
         self.tushare_token = str(tushare_token or "").strip()
+        self.http = http_runtime or HttpRuntime(timeout, max_concurrency)
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
         self.history_bars: dict[str, list[dict[str, float | str]]] = {}
         self._last_tushare_date: str | None = None
         self._tushare_names: dict[str, str] = {}
+
+    async def close(self) -> None:
+        await self.http.close()
 
     async def fetch_market_snapshot(self, daily_market_url: str = "", trade_date: str = "") -> list[Quote]:
         """Fetch one daily snapshot, preferring Tushare when a token is configured."""
@@ -50,7 +147,7 @@ class SinaQuoteProvider:
     async def fetch_eastmoney_latest_trade_date(self) -> str | None:
         """Verify the snapshot date from the latest completed Shanghai index bar."""
         params = {"secid": "1.000001", "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55", "klt": "101", "fqt": "0", "lmt": "2", "end": "20500101"}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self.http.slot() as client:
             response = await client.get("https://push2his.eastmoney.com/api/qt/stock/kline/get", params=params)
             response.raise_for_status()
             rows = ((response.json().get("data") or {}).get("klines") or [])
@@ -81,7 +178,7 @@ class SinaQuoteProvider:
 
     async def _fetch_tushare_snapshot_result(self, trade_date: str = "") -> MarketSnapshotResult:
         requested = str(trade_date or datetime.now(CHINA_TZ).strftime("%Y%m%d")).replace("-", "")
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self.http.slot() as client:
             self._last_tushare_date = None
             quotes = await self._fetch_tushare_daily(client, requested)
             if quotes:
@@ -175,7 +272,7 @@ class SinaQuoteProvider:
     async def enrich_names(self, quotes: list[Quote]) -> int:
         if not self.tushare_token or not quotes:
             return 0
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self.http.slot() as client:
             return await self._apply_tushare_names(client, quotes)
 
     async def _fetch_tushare_trade_dates(self, client: httpx.AsyncClient, end_date: str) -> list[str]:
@@ -208,7 +305,7 @@ class SinaQuoteProvider:
         if not self.tushare_token:
             return None
         value = str(trade_date or datetime.now(CHINA_TZ).date().isoformat()).replace("-", "")
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self.http.slot() as client:
             payload = {"api_name": "trade_cal", "token": self.tushare_token, "params": {"exchange": "SSE", "start_date": value, "end_date": value}, "fields": "cal_date,is_open"}
             response = await client.post(self.tushare_url, json=payload); response.raise_for_status()
             body = response.json(); data = body.get("data") or {}; fields = list(data.get("fields") or [])
@@ -226,13 +323,7 @@ class SinaQuoteProvider:
         page = 1
         # Eastmoney may silently cap oversized pages; 200 keeps pagination predictable.
         page_size = 200
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                "Referer": "https://quote.eastmoney.com/",
-            },
-        ) as client:
+        async with self.http.slot() as client:
             while True:
                 params = {
                     "pn": page,
@@ -249,7 +340,14 @@ class SinaQuoteProvider:
                 data = None
                 for attempt in range(3):
                     try:
-                        response = await client.get(url, params=params)
+                        response = await client.get(
+                            url,
+                            params=params,
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                                "Referer": "https://quote.eastmoney.com/",
+                            },
+                        )
                         response.raise_for_status()
                         data = response.json().get("data") or {}
                         break
@@ -287,12 +385,12 @@ class SinaQuoteProvider:
         return Quote(code, str(row.get("f14") or code), price, prev_close, amount, pct_change, volume, source="eastmoney", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ))
 
     async def fetch_quotes(self, codes: Iterable[str]) -> list[Quote]:
-        values = [normalize_code(code) for code in codes]
+        values = list(dict.fromkeys(normalize_code(code) for code in codes if normalize_code(code)))[:500]
         if not values:
             return []
         url = "https://hq.sinajs.cn/list=" + ",".join(_sina_symbol(code) for code in values)
-        async with httpx.AsyncClient(timeout=self.timeout, headers={"Referer": "https://finance.sina.com.cn/"}) as client:
-            response = await client.get(url)
+        async with self.http.slot() as client:
+            response = await client.get(url, headers={"Referer": "https://finance.sina.com.cn/"})
             response.raise_for_status()
             payload = response.text
         result: list[Quote] = []
@@ -319,8 +417,8 @@ class SinaQuoteProvider:
         """
         if not str(url or "").strip():
             return {}
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            response = await client.get(url, params={"codes": ",".join(codes), "as_of": as_of})
+        async with self.http.slot() as client:
+            response = await client.get(url, params={"codes": ",".join(codes), "as_of": as_of}, follow_redirects=True)
             response.raise_for_status()
             payload = response.json()
         rows = payload.get("data", payload) if isinstance(payload, dict) else payload
@@ -334,37 +432,57 @@ class SinaQuoteProvider:
     async def fetch_eastmoney_factors(self, codes: Iterable[str]) -> dict[str, dict]:
         """Best-effort public fields: industry, PE, PB and ROE."""
         result = {}
-        async with httpx.AsyncClient(timeout=self.timeout, headers={"Referer": "https://quote.eastmoney.com/"}) as client:
-            semaphore = asyncio.Semaphore(8)
-            async def fetch_one(code):
-                secid = ("1." if str(code).startswith(("6", "68", "9")) else "0.") + str(code)
-                try:
-                    async with semaphore:
-                        response = await client.get("https://push2.eastmoney.com/api/qt/stock/get", params={"secid": secid, "fields": "f57,f58,f127,f162,f167,f173"})
+        values = list(dict.fromkeys(normalize_code(code) for code in codes if normalize_code(code)))[:300]
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        for code in values:
+            queue.put_nowait(code)
+
+        async def fetch_one(code: str) -> None:
+            secid = ("1." if str(code).startswith(("6", "68", "9")) else "0.") + str(code)
+            try:
+                async with self.http.slot() as client:
+                    response = await client.get(
+                        "https://push2.eastmoney.com/api/qt/stock/get",
+                        params={"secid": secid, "fields": "f57,f58,f127,f162,f167,f173"},
+                        headers={"Referer": "https://quote.eastmoney.com/"},
+                    )
                     response.raise_for_status()
                     data = (response.json().get("data") or {})
-                    def finite(key):
-                        try:
-                            value = float(data.get(key))
-                            return value if math.isfinite(value) else None
-                        except (TypeError, ValueError):
-                            return None
-                    pe, pb = finite("f162"), finite("f167")
-                    result[str(code)] = {"name": str(data.get("f58") or ""), "industry": str(data.get("f127") or ""), "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
-                except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                def finite(key):
+                    try:
+                        value = float(data.get(key))
+                        return value if math.isfinite(value) else None
+                    except (TypeError, ValueError):
+                        return None
+                pe, pb = finite("f162"), finite("f167")
+                result[str(code)] = {"name": str(data.get("f58") or ""), "industry": str(data.get("f127") or ""), "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
+            except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+                return
+
+        async def worker() -> None:
+            while True:
+                try:
+                    code = queue.get_nowait()
+                except asyncio.QueueEmpty:
                     return
-            await asyncio.gather(*(fetch_one(code) for code in list(codes)[:300]))
+                try:
+                    await fetch_one(code)
+                finally:
+                    queue.task_done()
+
+        await asyncio.gather(*(worker() for _ in range(min(len(values), self.http.max_concurrency))))
         return result
 
     async def fetch_tushare_factors(self, codes: Iterable[str], trade_date: str = "") -> dict[str, dict]:
         """Optional point-in-time daily and financial factors; permission failures degrade safely."""
         if not self.tushare_token:
             return {}
-        values = [normalize_code(c) for c in codes]
+        values = list(dict.fromkeys(normalize_code(c) for c in codes if normalize_code(c)))[:50]
         as_of = str(trade_date or datetime.now(CHINA_TZ).date().isoformat()).replace("-", "")
         async def call(client, api_name: str, params: dict, fields: str) -> list[dict]:
             payload = {"api_name": api_name, "token": self.tushare_token, "params": params, "fields": fields}
-            response = await client.post(self.tushare_url, json=payload)
+            async with self.http.slot():
+                response = await client.post(self.tushare_url, json=payload)
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, dict) or int(body.get("code") or 0) != 0:
@@ -372,47 +490,65 @@ class SinaQuoteProvider:
             data = body.get("data") or {}
             names = list(data.get("fields") or [])
             return [dict(zip(names, item)) for item in (data.get("items") or []) if isinstance(item, list)]
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            rows = await call(client, "daily_basic", {"trade_date": as_of}, "ts_code,trade_date,pe,pb,turnover_rate,total_mv")
-            result = {}
-            for row in rows:
-                code = str(row.get("ts_code") or "").split(".")[0]
-                if code in values:
-                    result[code] = {"pe": row.get("pe"), "pb": row.get("pb"), "source": "tushare", "quality": "partial", "as_of": self._normalize_trade_date(as_of)}
+        client = await self.http.client()
+        rows = await call(client, "daily_basic", {"trade_date": as_of}, "ts_code,trade_date,pe,pb,turnover_rate,total_mv")
+        result = {}
+        for row in rows:
+            code = str(row.get("ts_code") or "").split(".")[0]
+            if code in values:
+                result[code] = {"pe": row.get("pe"), "pb": row.get("pb"), "source": "tushare", "quality": "partial", "as_of": self._normalize_trade_date(as_of)}
 
-            async def financial(code: str):
-                suffix = "SH" if code.startswith(("6", "9")) else ("BJ" if code.startswith(("4", "8")) else "SZ")
-                ts_code = f"{code}.{suffix}"
+        async def financial(code: str):
+            suffix = "SH" if code.startswith(("6", "9")) else ("BJ" if code.startswith(("4", "8")) else "SZ")
+            ts_code = f"{code}.{suffix}"
+            try:
+                indicator, income, cashflow = await asyncio.gather(
+                    call(client, "fina_indicator", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,roe,debt_to_assets,ocf_to_or"),
+                    call(client, "income", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,revenue_yoy,operate_profit"),
+                    call(client, "cashflow", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,n_cashflow_act"),
+                )
+            except (httpx.HTTPError, ValueError, TypeError):
+                return
+            def latest_visible(rows: list[dict]) -> dict | None:
+                valid = []
+                for row in rows:
+                    ann_date = str(row.get("ann_date") or "").replace("-", "")
+                    if re.fullmatch(r"\d{8}", ann_date) and ann_date <= as_of:
+                        valid.append(row)
+                return max(valid, key=lambda row: str(row.get("ann_date")).replace("-", "")) if valid else None
+            indicator_row = latest_visible(indicator)
+            income_row = latest_visible(income)
+            cashflow_row = latest_visible(cashflow)
+            if not any((indicator_row, income_row, cashflow_row)):
+                return
+            target = result.setdefault(code, {"source": "tushare_financial", "quality": "partial", "as_of": self._normalize_trade_date(as_of)})
+            if indicator_row:
+                target.update({"roe": indicator_row.get("roe"), "roe_ann_date": indicator_row.get("ann_date"), "roe_report_period": indicator_row.get("end_date")})
+            if income_row:
+                target.update({"profit_growth": income_row.get("revenue_yoy"), "profit_ann_date": income_row.get("ann_date"), "profit_report_period": income_row.get("end_date")})
+            if cashflow_row:
+                target.update({"cash_quality": cashflow_row.get("n_cashflow_act"), "cash_ann_date": cashflow_row.get("ann_date"), "cash_report_period": cashflow_row.get("end_date")})
+            target["source"] = "tushare+financial"
+            target["quality"] = "partial"
+
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        for code in values:
+            queue.put_nowait(code)
+
+        async def worker() -> None:
+            while True:
                 try:
-                    indicator, income, cashflow = await asyncio.gather(
-                        call(client, "fina_indicator", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,roe,debt_to_assets,ocf_to_or"),
-                        call(client, "income", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,revenue_yoy,operate_profit"),
-                        call(client, "cashflow", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,n_cashflow_act"),
-                    )
-                except (httpx.HTTPError, ValueError, TypeError):
+                    code = queue.get_nowait()
+                except asyncio.QueueEmpty:
                     return
-                def latest_visible(rows: list[dict]) -> dict | None:
-                    valid = []
-                    for row in rows:
-                        ann_date = str(row.get("ann_date") or "").replace("-", "")
-                        if re.fullmatch(r"\d{8}", ann_date) and ann_date <= as_of:
-                            valid.append(row)
-                    return max(valid, key=lambda row: str(row.get("ann_date")).replace("-", "")) if valid else None
-                indicator_row = latest_visible(indicator)
-                income_row = latest_visible(income)
-                cashflow_row = latest_visible(cashflow)
-                if not any((indicator_row, income_row, cashflow_row)):
-                    return
-                target = result.setdefault(code, {"source": "tushare_financial", "quality": "partial", "as_of": self._normalize_trade_date(as_of)})
-                if indicator_row:
-                    target.update({"roe": indicator_row.get("roe"), "roe_ann_date": indicator_row.get("ann_date"), "roe_report_period": indicator_row.get("end_date")})
-                if income_row:
-                    target.update({"profit_growth": income_row.get("revenue_yoy"), "profit_ann_date": income_row.get("ann_date"), "profit_report_period": income_row.get("end_date")})
-                if cashflow_row:
-                    target.update({"cash_quality": cashflow_row.get("n_cashflow_act"), "cash_ann_date": cashflow_row.get("ann_date"), "cash_report_period": cashflow_row.get("end_date")})
-                target["source"] = "tushare+financial"
-                target["quality"] = "partial"
-            await asyncio.gather(*(financial(code) for code in values[:50]))
+                try:
+                    await financial(code)
+                finally:
+                    queue.task_done()
+
+        worker_count = min(8, self.http.max_concurrency, len(values))
+        if worker_count:
+            await asyncio.gather(*(worker() for _ in range(worker_count)))
         for code in list(result):
             row = result[code]
             # Financial data has a publication date; it is never silently treated as same-day data.
@@ -422,13 +558,18 @@ class SinaQuoteProvider:
         return result
 
     async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> dict[str, str]:
-        """Fetch a short adjusted daily history for the small candidate set."""
+        """Fetch bounded daily history with one shared client and worker set."""
         if not quotes:
             return {}
-        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        # The runtime gate is global to this provider; the local worker count
+        # also bounds task creation when a caller passes a 300-symbol target.
+        worker_count = max(1, min(int(max_concurrency), self.http.max_concurrency, 20))
         results: dict[str, str] = {}
+        queue: asyncio.Queue[Quote] = asyncio.Queue()
+        for quote in quotes:
+            queue.put_nowait(quote)
 
-        async def enrich(quote: Quote) -> None:
+        async def enrich(quote: Quote, client: httpx.AsyncClient) -> None:
             cache_key = f"{quote.code}:{as_of or 'latest'}"
             cached = self._indicator_cache.get(cache_key)
             if cached and datetime.now(CHINA_TZ) - cached[0] < timedelta(minutes=15):
@@ -453,11 +594,10 @@ class SinaQuoteProvider:
                 "lmt": "60",
             }
             try:
-                async with semaphore:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
-                        response = await client.get(url, params=params)
-                        response.raise_for_status()
-                        payload = response.json()
+                async with self.http.slot() as shared_client:
+                    response = await shared_client.get(url, params=params)
+                    response.raise_for_status()
+                    payload = response.json()
                 klines = ((payload.get("data") or {}).get("klines") or [])
                 parsed = []
                 cutoff = str(as_of or "").replace("-", "")
@@ -472,30 +612,53 @@ class SinaQuoteProvider:
                         parsed.append((row_date, float(fields[1]), float(fields[3]), float(fields[4]), float(fields[2]), float(fields[5]), float(fields[6]) if len(fields) > 6 else 0.0))
                     except (TypeError, ValueError):
                         continue
-                self.history_bars[quote.code] = [{"trade_date": f"{item[0][:4]}-{item[0][4:6]}-{item[0][6:8]}", "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6]} for item in parsed]
-                values = calculate_daily_indicators(self.history_bars[quote.code])
-                if apply_daily_indicators(quote, self.history_bars[quote.code]):
+                history = [{"trade_date": f"{item[0][:4]}-{item[0][4:6]}-{item[0][6:8]}", "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6]} for item in parsed]
+                self.history_bars[quote.code] = history
+                values = calculate_daily_indicators(history)
+                if apply_daily_indicators(quote, history):
                     self._indicator_cache[cache_key] = (datetime.now(CHINA_TZ), values)
                     results[quote.code] = "network"
                 else:
                     results[quote.code] = "failed"
             except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, AttributeError):
                 results[quote.code] = "failed"
-                return
 
-        await asyncio.gather(*(enrich(quote) for quote in quotes))
+        async def worker() -> None:
+            while True:
+                try:
+                    quote = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await enrich(quote, await self.http.client())
+                finally:
+                    queue.task_done()
+
+        await asyncio.gather(*(worker() for _ in range(min(worker_count, len(quotes)))))
+        # Bound caches so a long-running process does not retain every symbol
+        # ever seen by a custom universe.
+        if len(self._indicator_cache) > 1200:
+            for key in list(self._indicator_cache)[:-1000]:
+                self._indicator_cache.pop(key, None)
+        if len(self.history_bars) > 1200:
+            for key in list(self.history_bars)[:-1000]:
+                self.history_bars.pop(key, None)
         return {quote.code: results.get(quote.code, "failed") for quote in quotes}
 
 
 class RssNewsProvider:
-    def __init__(self, url: str, timeout: float = 10):
+    def __init__(self, url: str, timeout: float = 10, http_runtime: HttpRuntime | None = None):
         self.url, self.timeout = url.strip(), timeout
+        self.http = http_runtime or HttpRuntime(timeout, 4)
+
+    async def close(self) -> None:
+        await self.http.close()
 
     async def fetch(self) -> list[NewsItem]:
         if not self.url:
             return []
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            response = await client.get(self.url)
+        async with self.http.slot() as client:
+            response = await client.get(self.url, follow_redirects=True)
             response.raise_for_status()
             root = ET.fromstring(response.content)
         items: list[NewsItem] = []
@@ -510,10 +673,14 @@ class RssNewsProvider:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 30, min_interval: float = 10, daily_limit: int = 100):
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 30, min_interval: float = 10, daily_limit: int = 100, http_runtime: HttpRuntime | None = None):
         self.base_url, self.api_key, self.model, self.timeout = base_url.rstrip("/"), api_key, model, timeout
         self.min_interval, self.daily_limit = max(0, min_interval), max(1, daily_limit)
         self._annotation_times: list[datetime] = []
+        self.http = http_runtime or HttpRuntime(timeout, 2)
+
+    async def close(self) -> None:
+        await self.http.close()
 
     async def summarize(self, items: list[NewsItem]) -> str:
         if not items or not self.api_key:
@@ -523,7 +690,7 @@ class OpenAICompatibleClient:
             {"role": "system", "content": "你是A股资讯助手。只根据提供的新闻，简洁输出事件、涉及公司/行业、可能影响和可信度；不要给出买卖指令。"},
             {"role": "user", "content": content},
         ]}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self.http.slot() as client:
             response = await client.post(self.base_url + "/chat/completions", json=payload, headers={"Authorization": "Bearer " + self.api_key})
             response.raise_for_status()
             data = response.json()
@@ -571,7 +738,7 @@ class OpenAICompatibleClient:
             ],
         }
         try:
-            async with httpx.AsyncClient(timeout=min(self.timeout, 15)) as client:
+            async with self.http.slot() as client:
                 response = await client.post(self.base_url + "/chat/completions", json=payload, headers={"Authorization": "Bearer " + self.api_key})
                 response.raise_for_status()
                 content = response.json()["choices"][0]["message"]["content"]

@@ -47,9 +47,11 @@ class Quote:
     history_days: int = 0
     source: str = ""
     provider_ts: datetime | None = None
-    suspended: bool = False
-    limit_up: bool = False
-    limit_down: bool = False
+    # None means the provider did not establish the state. It is not the
+    # same as a confirmed False and remains visible to risk review.
+    suspended: bool | None = None
+    limit_up: bool | None = None
+    limit_down: bool | None = None
     fetched_at: datetime = field(default_factory=lambda: datetime.now(CHINA_TZ))
 
 
@@ -217,6 +219,40 @@ class MinuteBarAggregator:
 
     def bars(self, code: str) -> list[MinuteBar]:
         return list(self.history.get(code, []))
+
+    def restore(self, bars: Iterable[MinuteBar | dict], trade_date: str | None = None) -> int:
+        """Restore completed bars only; leave the current bar and baseline empty."""
+        expected = str(trade_date or "")[:10]
+        restored = 0
+        for item in bars or []:
+            try:
+                if isinstance(item, MinuteBar):
+                    code, start = str(item.code), item.start
+                    values = (item.open, item.high, item.low, item.close, item.volume, item.amount)
+                else:
+                    code = str(item.get("code") or "")
+                    raw_start = item.get("start") or item.get("start_at")
+                    start = raw_start if isinstance(raw_start, datetime) else datetime.fromisoformat(str(raw_start).replace("Z", "+00:00"))
+                    values = tuple(item.get(key) for key in ("open", "high", "low", "close", "volume", "amount"))
+                if not code or not isinstance(start, datetime):
+                    continue
+                start = start if start.tzinfo else start.replace(tzinfo=CHINA_TZ)
+                if expected and start.astimezone(CHINA_TZ).date().isoformat() != expected:
+                    continue
+                numbers = tuple(float(value or 0) for value in values)
+                if not all(math.isfinite(value) for value in numbers):
+                    continue
+                target = self.history.setdefault(code, [])
+                if any(existing.start == start for existing in target):
+                    continue
+                target.append(MinuteBar(code, start, *numbers))
+                target.sort(key=lambda bar: bar.start)
+                if len(target) > self.max_bars_per_code:
+                    del target[:-self.max_bars_per_code]
+                restored += 1
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+        return restored
 
     def reset(self) -> None:
         self.current.clear()
@@ -391,10 +427,17 @@ def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
 def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
     flags: list[str] = []
     evidence: list[str] = []
-    if quote.suspended:
+    unknown_state = False
+    if quote.suspended is True:
         flags.append("停牌")
-    if quote.limit_up or quote.limit_down:
+    elif quote.suspended is None:
+        flags.append("停牌状态未知")
+        unknown_state = True
+    if quote.limit_up is True or quote.limit_down is True:
         flags.append("涨跌停")
+    elif quote.limit_up is None or quote.limit_down is None:
+        flags.append("涨跌停状态未知")
+        unknown_state = True
     if not math.isfinite(float(quote.price)) or quote.price <= 0:
         flags.append("价格无效")
     if quote.atr14 is not None and quote.support20 is not None and math.isfinite(float(quote.atr14)) and math.isfinite(float(quote.support20)) and quote.price <= quote.support20 - quote.atr14:
@@ -407,15 +450,15 @@ def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
         flags.append("波动率偏高")
     if flags and any(item in flags for item in ("停牌", "涨跌停", "价格无效", "跌破失效位")):
         return RiskReview("blocked", "high", flags, ["触发硬性交易状态过滤"])
-    if not quote.history_days or quote.atr14 is None:
-        return RiskReview("unknown", "unknown", flags + ["技术数据不完整"], ["缺少足够历史行情，不能判定风险"])
+    if unknown_state or not quote.history_days or quote.atr14 is None:
+        return RiskReview("unknown", "unknown", flags + (["技术数据不完整"] if not quote.history_days or quote.atr14 is None else []), ["缺少足够行情状态或历史数据，不能判定风险"])
     if flags:
         return RiskReview("watch_only", "medium", flags, evidence or ["存在需要人工复核的技术风险"])
     return RiskReview("eligible", "low", [], ["基础行情、状态和历史指标检查通过"])
 
 
 def is_tradable(quote: Quote, price_min: float = 2, price_max: float = 80) -> bool:
-    return price_min <= quote.price <= price_max and quote.price > 0 and not quote.suspended and not quote.limit_up and not quote.limit_down
+    return price_min <= quote.price <= price_max and quote.price > 0 and quote.suspended is not True and quote.limit_up is not True and quote.limit_down is not True
 
 
 def score_quote(quote: Quote) -> Candidate:

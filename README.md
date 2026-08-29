@@ -9,7 +9,10 @@
 - Tushare 当天暂无数据时自动寻找最近有数据的交易日
 - 盘中轮询自选股，触发信号后推送提醒
 - 盘中行情按会话合并抓取，信号冷却状态持久化到 SQLite
+- SQLite 使用可重复执行的 v7→v12 迁移；交易日、快照请求、候选运行和事件均保留状态
 - 连续确认状态持久化到 SQLite，插件重启后可继续累计
+- 分层深筛最多处理 300 只技术对象和 100 只因子对象，持久日线优先，空结果受覆盖率保护
+- 已完成分钟线批量落库，重启恢复当日历史并按 7 天清理；不会恢复未完成 bar 或虚构成交量基线
 - 轮询 RSS 或公告流，去重后推送市场故事
 - 可选调用 OpenAI 兼容模型 API，总结新闻和事件
 - 支持群聊、私聊推送白名单
@@ -46,12 +49,16 @@
 - `universe_codes`：选股代码，逗号分隔。留空时使用各会话的自选股。
 - `daily_cache_enabled`：是否启用每日全市场快照缓存，默认 `true`。
 - `daily_cache_keep_days`：日快照保留天数，默认 180 天。
+- `calendar_ttl_seconds` / `calendar_unknown_ttl_seconds`：已确认/未知交易日状态的缓存 TTL，默认 86400/900 秒。东方财富旧日线只能证明最近已有交易日，不能证明请求日闭市。
 - `daily_market_url`：自定义全市场快照接口。留空使用东方财富；自定义接口需要返回兼容格式的 JSON，并支持 `pn`、`pz`、`fs`、`fields` 分页参数。
 - `tushare_url`：Tushare Pro 接口地址，通常留空即可，默认使用 `https://api.tushare.pro`。
 - `tushare_token`：Tushare Pro Token。填写后每日快照优先调用 Tushare `daily` 接口；留空则不调用 Tushare，使用东方财富。
 - `quote_interval_seconds`：盘中自选股行情轮询间隔，默认 30 秒。
 - `minute_enabled`：是否记录盘中一分钟聚合行情，默认开启；只用于观测和后续指标，不改变现有评分。成交量/额按行情源累计值计算为分钟增量，开始监听前的累计部分不会回溯。
 - `minute_bar_history`：每只股票保留的已完成分钟线数量，默认 120 根。
+- `minute_bar_keep_days`：SQLite 保留已完成分钟线的天数，默认 7 天。
+- `deep_screen_limit` / `factor_screen_limit`：技术深筛和因子终评上限，默认 300/100。
+- `screen_min_indicator_coverage`：完整空结果允许清理候选池所需的技术指标覆盖率，默认 0.8。
 - `minute_trigger_enabled`：是否启用分钟线突破提醒，默认关闭。开启后要求连续上涨并突破近几根分钟线高点，只发研究提醒，不自动下单。
 - `minute_trigger_lookback`、`minute_trigger_min_bars`：突破参考窗口和最少分钟线数量，默认都是 5 根。
 - `minute_trigger_consecutive_up`：连续上涨根数，默认 3 根。
