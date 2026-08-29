@@ -15,7 +15,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .core import CHINA_TZ, FactorOverlay, MinuteBarAggregator, assess_market_context, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
-from .factors import industry_strength, market_adjustment
+from .factors import fundamental_score, industry_strength, market_adjustment
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
 
@@ -254,7 +254,7 @@ class Main(Star):
                 factor_name, factor_quality = "custom", "good" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] 自定义因子源不可用，继续技术筛选", PLUGIN_NAME)
-        if not raw_factors and factor_source in {"auto", "tushare", "custom"} and self.quotes.tushare_token:
+        if not raw_factors and factor_source == "tushare" and self.quotes.tushare_token:
             try:
                 raw_factors = await self.quotes.fetch_tushare_factors([q.code for q in enrich_targets], as_of)
                 factor_name, factor_quality = "tushare", "partial" if raw_factors else "unknown"
@@ -266,10 +266,26 @@ class Main(Star):
                 factor_name, factor_quality = "eastmoney", "partial" if raw_factors else "unknown"
             except Exception:
                 logger.warning("[%s] 东方财富因子源不可用，继续技术筛选", PLUGIN_NAME)
-        if not raw_factors and as_of:
-            raw_factors = self.store.factor_snapshots(as_of)
-            if raw_factors:
-                factor_name, factor_quality = "cache", "cached"
+        if factor_source == "auto" and self.quotes.tushare_token:
+            missing_codes = [quote.code for quote in enrich_targets if quote.code not in raw_factors]
+            if missing_codes:
+                try:
+                    tushare_rows = await self.quotes.fetch_tushare_factors(missing_codes, as_of)
+                    if tushare_rows:
+                        raw_factors.update(tushare_rows)
+                        factor_name = f"{factor_name}+tushare" if factor_name else "tushare"
+                        factor_quality = "partial"
+                except Exception:
+                    logger.warning("[%s] Tushare 因子补充不可用", PLUGIN_NAME)
+        if as_of:
+            cached_rows = self.store.factor_snapshots(as_of)
+            missing_codes = [quote.code for quote in enrich_targets if quote.code not in raw_factors]
+            for code in missing_codes:
+                if code in cached_rows:
+                    raw_factors[code] = cached_rows[code]
+            if cached_rows and missing_codes:
+                factor_name = f"{factor_name}+cache" if factor_name else "cache"
+                factor_quality = "cached" if not factor_name.replace("+cache", "") else "partial"
         if as_of and raw_factors:
             self.store.save_factor_snapshots(as_of, raw_factors, factor_name or factor_source, factor_quality)
         adjustment = market_adjustment(market.regime)
@@ -298,11 +314,14 @@ class Main(Star):
                 amount_ratio = (sum(member.amount for member in members) / len(members)) / mean_amount if mean_amount > 0 else 1.0
                 industry = industry_strength(avg_momentum, benchmark_momentum, breadth, amount_ratio)
             fundamental = number("fundamental_score")
-            if fundamental is None and row.get("roe") is not None:
-                roe = number("roe")
-                fundamental = max(-10, min(10, round(roe / 2, 1))) if roe is not None else None
-            if fundamental is None and row.get("pe") is not None:
-                pe = number("pe")
+            roe, pe = number("roe"), number("pe")
+            valuation = (2 - pe / 20) if pe is not None and pe > 0 else None
+            calculated_fundamental = fundamental_score(roe, None, None, valuation) if roe is not None and valuation is not None else None
+            if fundamental is None and calculated_fundamental is not None:
+                fundamental = calculated_fundamental
+            if fundamental is None and roe is not None:
+                fundamental = max(-10, min(10, round(roe / 2, 1)))
+            if fundamental is None and pe is not None:
                 fundamental = max(-3, min(3, round(2 - pe / 20, 1))) if pe is not None else None
             item.quote.industry_score, item.quote.fundamental_score = industry, fundamental
             item.factor_overlay = FactorOverlay(industry_name, industry, fundamental, market.regime, adjustment, str(row.get("source") or factor_name), as_of, str(row.get("quality") or factor_quality))
@@ -315,7 +334,7 @@ class Main(Star):
                     item.reasons.append(f"因子综合修正{extra:+d}")
         minimum = self._int("min_score", 10, -100, 100)
         scored.sort(key=lambda item: (item.score, item.quote.amount), reverse=True)
-        qualified = [item for item in scored if item.score >= minimum and item.risk_level != "blocked"]
+        qualified = [item for item in scored if item.base_score >= minimum and item.risk_level != "blocked"]
         fallback_limit = self._int("fallback_limit", 5, 0, 30)
         fallback = []
         if not qualified and fallback_limit and scored:
