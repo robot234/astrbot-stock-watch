@@ -217,7 +217,7 @@ class Main(Star):
             merged.extend(codes)
         return list(dict.fromkeys(merged))
 
-    async def _score_quotes(self, quotes, limit: int, as_of: str = ""):
+    async def _score_quotes(self, quotes, limit: int, as_of: str = "", include_factors: bool = True):
         tradable = [quote for quote in quotes if is_tradable(
             quote,
             self._float("price_min", 2, 0.01, 100000),
@@ -242,8 +242,8 @@ class Main(Star):
                 "regime": market.regime, "breadth": market.breadth, "advancing": market.advancing,
                 "declining": market.declining, "total_amount": market.total_amount, "evidence": market.evidence,
             }, "daily_snapshot" if len(full_market) >= market_minimum else "input_subset", "good" if len(full_market) >= market_minimum else "partial")
-        factor_url = str(self.config.get("factor_data_url", "")).strip()
-        factor_source = str(self.config.get("factor_source", "auto")).strip().lower()
+        factor_url = str(self.config.get("factor_data_url", "")).strip() if include_factors else ""
+        factor_source = str(self.config.get("factor_source", "auto")).strip().lower() if include_factors else "disabled"
         factor_mode = str(self.config.get("factor_mode", "report_only")).strip().lower()
         historical_factor_date = bool(as_of and as_of < datetime.now(CHINA_TZ).date().isoformat())
         raw_factors: dict[str, dict] = {}
@@ -504,9 +504,13 @@ class Main(Star):
                 if cached_date:
                     self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
                     return self.store.daily_quotes(cached_date), False, cached_date
-                self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
-                logger.warning("[%s] 行情源未提供真实交易日，拒绝将快照伪装为请求日期", PLUGIN_NAME)
-                return [], True, trade_date
+                if result.source == "eastmoney":
+                    actual_date = trade_date
+                    result.quality = "degraded"
+                    logger.warning("[%s] 东方财富快照缺少交易日，按请求日期缓存并标记 degraded", PLUGIN_NAME)
+                else:
+                    self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                    return [], True, trade_date
             saved = self.store.save_daily_quotes(
                 actual_date,
                 result.quotes,
@@ -606,6 +610,8 @@ class Main(Star):
                     union = list(dict.fromkeys(code for codes in active.values() for code in codes))
                     if self._bool("auto_watch_candidates", True):
                         candidate_codes = [item["code"] for item in self.store.latest_screen_candidates(self._int("candidate_limit", 30, 1, 100)) if item.get("code")]
+                        for origin in self.store.subscriptions():
+                            active.setdefault(origin, [])
                         union.extend(candidate_codes)
                         for origin in active:
                             active[origin] = list(dict.fromkeys(active[origin] + candidate_codes))
@@ -648,7 +654,7 @@ class Main(Star):
                                 health["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
                                 health_counted = True
                             quotes_by_code = {quote.code: quote for quote in quotes}
-                            candidates = await self._score_quotes(quotes, len(quotes))
+                            candidates = await self._score_quotes(quotes, len(quotes), include_factors=False)
                             by_code = {candidate.quote.code: candidate for candidate in candidates}
                             if not cycle_failed:
                                 health["successful_cycles"] += 1
