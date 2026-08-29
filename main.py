@@ -280,12 +280,14 @@ class Main(Star):
         if as_of:
             cached_rows = self.store.factor_snapshots(as_of)
             missing_codes = [quote.code for quote in enrich_targets if quote.code not in raw_factors]
+            cache_hits = 0
             for code in missing_codes:
                 if code in cached_rows:
                     raw_factors[code] = cached_rows[code]
-            if cached_rows and missing_codes:
+                    cache_hits += 1
+            if cache_hits:
                 factor_name = f"{factor_name}+cache" if factor_name else "cache"
-                factor_quality = "cached" if not factor_name.replace("+cache", "") else "partial"
+                factor_quality = "cached" if factor_name == "cache" else "partial"
         if as_of and raw_factors:
             self.store.save_factor_snapshots(as_of, raw_factors, factor_name or factor_source, factor_quality)
         adjustment = market_adjustment(market.regime)
@@ -314,9 +316,10 @@ class Main(Star):
                 amount_ratio = (sum(member.amount for member in members) / len(members)) / mean_amount if mean_amount > 0 else 1.0
                 industry = industry_strength(avg_momentum, benchmark_momentum, breadth, amount_ratio)
             fundamental = number("fundamental_score")
-            roe, pe = number("roe"), number("pe")
-            valuation = (2 - pe / 20) if pe is not None and pe > 0 else None
-            calculated_fundamental = fundamental_score(roe, None, None, valuation) if roe is not None and valuation is not None else None
+            roe, pe, pb = number("roe"), number("pe"), number("pb")
+            profit_growth, cash_quality = number("profit_growth"), number("cash_quality")
+            valuation = (2 - pe / 20 - (pb / 10 if pb is not None and pb > 0 else 0)) if pe is not None and pe > 0 else None
+            calculated_fundamental = fundamental_score(roe, profit_growth, cash_quality, valuation, bool(row.get("st_flag")), bool(row.get("audit_flag")))
             if fundamental is None and calculated_fundamental is not None:
                 fundamental = calculated_fundamental
             if fundamental is None and roe is not None:

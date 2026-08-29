@@ -262,7 +262,7 @@ class SinaQuoteProvider:
         return result
 
     async def fetch_custom_factors(self, url: str, codes: Iterable[str], as_of: str = "") -> dict[str, dict]:
-        """Optional JSON factor source: {data:[{code,industry_score,fundamental_score}]}.
+        """Optional JSON factor source: {data:[{code,industry_score,fundamental_score,...}]}.
         Values are annotations only; unknown/malformed rows are ignored.
         """
         if not str(url or "").strip():
