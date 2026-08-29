@@ -200,7 +200,7 @@ class Main(Star):
         if not origin:
             return False
         configured = self._configured_whitelist()
-        return "*" in configured or origin in configured or self.store.is_whitelisted(origin)
+        return "*" in configured or origin in configured or (self._bool("allow_self_whitelist", False) and self.store.is_whitelisted(origin))
 
     def _message_chunks(self, text: str) -> list[str]:
         """Split long reports at line boundaries so chat adapters do not truncate them."""
@@ -522,19 +522,25 @@ class Main(Star):
         """Return a snapshot, whether it was fetched now, and its actual trade date."""
         lookup_date = self._daily_date_alias.get(trade_date, trade_date)
         cached = self.store.daily_quotes(lookup_date)
-        if cached:
+        cached_meta = self.store.snapshot_meta(lookup_date)
+        if cached and (lookup_date != trade_date or not cached_meta or bool(cached_meta.get("complete"))):
             return cached, False, lookup_date
         async with self._daily_snapshot_lock:
             # Re-check after waiting so the background loop and manual command do not fetch twice.
             lookup_date = self._daily_date_alias.get(trade_date, trade_date)
             cached = self.store.daily_quotes(lookup_date)
-            if cached:
+            cached_meta = self.store.snapshot_meta(lookup_date)
+            if cached and (lookup_date != trade_date or not cached_meta or bool(cached_meta.get("complete"))):
                 self._daily_retry_after = None
                 return cached, False, lookup_date
             try:
                 result = await self.quotes.fetch_market_snapshot_result(
                     str(self.config.get("daily_market_url", "")), trade_date
                 )
+                minimum = self._int("daily_snapshot_min_size", 4000, 1000, 10000)
+                valid_codes = {quote.code for quote in result.quotes if str(getattr(quote, "code", "")).isdigit() and len(str(quote.code)) == 6 and float(getattr(quote, "price", 0) or 0) > 0}
+                if result.quotes and len(valid_codes) < minimum:
+                    result.quality = "partial"
                 self.store.update_provider_health(result.source or "unknown", bool(result.quotes), result.quality)
             except Exception:
                 self.store.update_provider_health("unknown", False, "unknown", "fetch failed")
@@ -576,13 +582,13 @@ class Main(Star):
                 result.quotes,
                 self._int("daily_cache_keep_days", 180, 7, 730),
             )
-            complete = actual_date == trade_date and result.quality == "good"
+            complete = actual_date == trade_date and result.quality == "good" and saved >= self._int("daily_snapshot_min_size", 4000, 1000, 10000)
             self.store.save_snapshot_meta(
                 actual_date, result.source, result.quality, complete, trade_date,
                 "" if complete else "交易日回退或来源未确认，不能视为当日完整收盘快照",
             )
             logger.info("[%s] 全市场日快照已缓存：%s 只", PLUGIN_NAME, saved)
-            if actual_date == trade_date:
+            if complete:
                 self._daily_date_alias[trade_date] = actual_date
                 self._daily_retry_after = None
                 fetched = True
@@ -770,47 +776,31 @@ class Main(Star):
                                         candidate.risk_flags = json.loads(stored.get("risk_flags") or "[]")
                                     minute_signal = minute_signals.get(code, "")
                                     cost_signal = self._cost_signal(quote, watch_details.get(origin, {}).get(code)) if quote else ""
-                                    is_minute = bool(minute_signal and not cost_signal)
                                     plan_candidate = candidate if stored else None
                                     if quote and not plan_candidate:
                                         self.store.reset_confirmation(origin, code)
-                                    if quote and code in completed_codes and not is_minute:
+                                    if quote and code in completed_codes and not minute_signal:
                                         self.store.reset_confirmation(origin, "minute:" + code)
-                                    if not plan_candidate and not cost_signal and not minute_signal:
-                                        continue
                                     plan_state = self._price_state_for_plan(quote, plan_candidate.price_plan) if quote and plan_candidate else "unknown"
-                                    price_signal = bool(plan_candidate and not cost_signal and not minute_signal)
+                                    price_signal = bool(plan_candidate)
                                     state_changed = price_signal and self.store.price_state(origin, code) != plan_state
                                     if plan_candidate and plan_candidate.risk_level == "unknown" and price_signal:
-                                        continue
+                                        price_signal = False
                                     if plan_candidate and plan_candidate.risk_level == "blocked" and plan_state != "invalidated" and price_signal:
-                                        continue
+                                        price_signal = False
                                     if price_signal and plan_state not in {"in_attention", "confirmed", "near_sell", "invalidated"}:
-                                        continue
+                                        price_signal = False
                                     if price_signal and not state_changed:
-                                        continue
+                                        price_signal = False
                                     threshold = self._int("intraday_failure_threshold", 0, 0, 100)
                                     if threshold > 0 and health["consecutive_failures"] >= threshold:
                                         continue
-                                    if (is_minute or price_signal) and self._bool("confirmation_enabled", False):
-                                        confirmation_code = "minute:" + code if is_minute else "price:" + code + ":" + plan_state
-                                        confirmed = self.store.observe_confirmation(
-                                            origin,
-                                            confirmation_code,
-                                            self._int("confirmation_periods", 2, 1, 5),
-                                            self._int("confirmation_max_gap_seconds", 90, 30, 600),
-                                        )
-                                        if not confirmed:
-                                            continue
-                                    claim_time = datetime.now(timezone.utc)
-                                    signal_key = f"price:{stored.get('run_id')}:{code}:{plan_state}" if price_signal else (f"minute:{code}" if is_minute else f"cost:{code}")
-                                    if not self.store.claim_signal(origin, signal_key, 600, now=claim_time):
-                                        continue
+                                    events: list[tuple[str, str, bool]] = []
                                     if cost_signal:
-                                        text = cost_signal
-                                    elif is_minute:
-                                        text = minute_signal
-                                    else:
+                                        events.append((f"cost:{code}", cost_signal, False))
+                                    if minute_signal:
+                                        events.append((f"minute:{code}", minute_signal, False))
+                                    if price_signal:
                                         state_text = {"in_attention": "进入关注区", "confirmed": "突破确认位", "near_sell": "进入参考卖出区", "invalidated": "跌破失效位"}.get(plan_state, "盘中价位变化")
                                         prefix = f"{state_text}（需人工复核）" if plan_candidate.risk_level == "watch_only" else state_text
                                         text = prefix + "（仅研究/模拟盘）\n" + format_candidate(plan_candidate)
@@ -819,11 +809,20 @@ class Main(Star):
                                             text += "\n" + annotation
                                         if plan_state in {"near_sell", "invalidated"}:
                                             self.store.save_risk_event(f"{today}:{code}:{plan_state}", self._last_screen_run_id, code, plan_state, candidate.risk_level, json.dumps({"price": quote.price, "state": plan_state}, ensure_ascii=False), datetime.now(timezone.utc).isoformat())
-                                    sent = await self._push(origin, text)
-                                    if sent and price_signal:
-                                        self.store.set_price_state(origin, code, plan_state)
-                                    elif not sent:
-                                        self.store.release_signal(origin, signal_key, claimed_at=claim_time)
+                                        events.append((f"price:{stored.get('run_id')}:{code}:{plan_state}", text, True))
+                                    for signal_key, text, is_price in events:
+                                        if (is_price or signal_key.startswith("minute:")) and self._bool("confirmation_enabled", False):
+                                            confirmation_code = "price:" + code + ":" + plan_state if is_price else "minute:" + code
+                                            if not self.store.observe_confirmation(origin, confirmation_code, self._int("confirmation_periods", 2, 1, 5), self._int("confirmation_max_gap_seconds", 90, 30, 600)):
+                                                continue
+                                        claim_time = datetime.now(timezone.utc)
+                                        if not self.store.claim_signal(origin, signal_key, 600, now=claim_time):
+                                            continue
+                                        sent = await self._push(origin, text)
+                                        if sent and is_price:
+                                            self.store.set_price_state(origin, code, plan_state)
+                                        elif not sent:
+                                            self.store.release_signal(origin, signal_key, claimed_at=claim_time)
                         else:
                             health["failed_cycles"] += 1
                             health["consecutive_failures"] += 1

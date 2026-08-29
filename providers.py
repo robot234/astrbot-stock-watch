@@ -372,35 +372,33 @@ class SinaQuoteProvider:
                     )
                 except (httpx.HTTPError, ValueError, TypeError):
                     return
-                rows_by_api = (indicator, income, cashflow)
-                visible = [row for rows in rows_by_api for row in rows if str(row.get("ann_date") or "").replace("-", "") <= as_of]
-                if not visible:
+                def latest_visible(rows: list[dict]) -> dict | None:
+                    valid = []
+                    for row in rows:
+                        ann_date = str(row.get("ann_date") or "").replace("-", "")
+                        if re.fullmatch(r"\d{8}", ann_date) and ann_date <= as_of:
+                            valid.append(row)
+                    return max(valid, key=lambda row: str(row.get("ann_date")).replace("-", "")) if valid else None
+                indicator_row = latest_visible(indicator)
+                income_row = latest_visible(income)
+                cashflow_row = latest_visible(cashflow)
+                if not any((indicator_row, income_row, cashflow_row)):
                     return
-                latest = max(visible, key=lambda row: str(row.get("ann_date") or ""))
                 target = result.setdefault(code, {"source": "tushare_financial", "quality": "partial", "as_of": self._normalize_trade_date(as_of)})
-                for row in indicator:
-                    if str(row.get("ann_date") or "").replace("-", "") <= as_of:
-                        target.update({"roe": row.get("roe"), "ann_date": row.get("ann_date"), "report_period": row.get("end_date")})
-                        break
-                for row in income:
-                    if str(row.get("ann_date") or "").replace("-", "") <= as_of:
-                        target["profit_growth"] = row.get("revenue_yoy")
-                        target["ann_date"] = target.get("ann_date") or row.get("ann_date")
-                        target["report_period"] = target.get("report_period") or row.get("end_date")
-                        break
-                for row in cashflow:
-                    if str(row.get("ann_date") or "").replace("-", "") <= as_of:
-                        target["cash_quality"] = row.get("n_cashflow_act")
-                        target["ann_date"] = target.get("ann_date") or row.get("ann_date")
-                        target["report_period"] = target.get("report_period") or row.get("end_date")
-                        break
+                if indicator_row:
+                    target.update({"roe": indicator_row.get("roe"), "roe_ann_date": indicator_row.get("ann_date"), "roe_report_period": indicator_row.get("end_date")})
+                if income_row:
+                    target.update({"profit_growth": income_row.get("revenue_yoy"), "profit_ann_date": income_row.get("ann_date"), "profit_report_period": income_row.get("end_date")})
+                if cashflow_row:
+                    target.update({"cash_quality": cashflow_row.get("n_cashflow_act"), "cash_ann_date": cashflow_row.get("ann_date"), "cash_report_period": cashflow_row.get("end_date")})
                 target["source"] = "tushare+financial"
                 target["quality"] = "partial"
             await asyncio.gather(*(financial(code) for code in values[:50]))
         for code in list(result):
             row = result[code]
             # Financial data has a publication date; it is never silently treated as same-day data.
-            if row.get("ann_date") and str(row["ann_date"]).replace("-", "") > as_of:
+            announcement_dates = [str(row.get(key) or "").replace("-", "") for key in ("roe_ann_date", "profit_ann_date", "cash_ann_date")]
+            if any(value and (not re.fullmatch(r"\d{8}", value) or value > as_of) for value in announcement_dates):
                 result.pop(code, None)
         return result
 
