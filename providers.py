@@ -41,6 +41,7 @@ class SinaQuoteProvider:
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
         self.history_bars: dict[str, list[dict[str, float | str]]] = {}
         self._last_tushare_date: str | None = None
+        self._tushare_names: dict[str, str] = {}
 
     async def fetch_market_snapshot(self, daily_market_url: str = "", trade_date: str = "") -> list[Quote]:
         """Fetch one daily snapshot, preferring Tushare when a token is configured."""
@@ -84,6 +85,7 @@ class SinaQuoteProvider:
             self._last_tushare_date = None
             quotes = await self._fetch_tushare_daily(client, requested)
             if quotes:
+                await self._apply_tushare_names(client, quotes)
                 return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(requested), "tushare", "good")
 
             dates = await self._fetch_tushare_trade_dates(client, requested)
@@ -97,6 +99,7 @@ class SinaQuoteProvider:
             for date_value in dates[:30]:
                 quotes = await self._fetch_tushare_daily(client, date_value)
                 if quotes:
+                    await self._apply_tushare_names(client, quotes)
                     return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(date_value), "tushare", "good")
         return MarketSnapshotResult([], None, "tushare", "unknown")
 
@@ -141,6 +144,20 @@ class SinaQuoteProvider:
             raise ValueError("Tushare response contains mixed or missing trade_date")
         self._last_tushare_date = self._normalize_trade_date(next(iter(row_dates)))
         return result
+
+    async def _apply_tushare_names(self, client: httpx.AsyncClient, quotes: list[Quote]) -> None:
+        if not self._tushare_names:
+            payload = {"api_name": "stock_basic", "token": self.tushare_token, "params": {"list_status": "L"}, "fields": "ts_code,name"}
+            try:
+                response = await client.post(self.tushare_url, json=payload)
+                response.raise_for_status()
+                data = response.json().get("data") or {}
+                fields, items = list(data.get("fields") or []), data.get("items") or []
+                self._tushare_names = {str(row["ts_code"]).split(".")[0]: str(row["name"]) for row in (dict(zip(fields, item)) for item in items) if row.get("ts_code") and row.get("name")}
+            except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+                return
+        for quote in quotes:
+            quote.name = self._tushare_names.get(quote.code, quote.name)
 
     async def _fetch_tushare_trade_dates(self, client: httpx.AsyncClient, end_date: str) -> list[str]:
         payload = {
