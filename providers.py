@@ -12,7 +12,7 @@ from typing import Iterable
 
 import httpx
 
-from .core import CHINA_TZ, Candidate, NewsItem, Quote, calc_atr, calc_rsi, normalize_code, simple_moving_average
+from .core import CHINA_TZ, Candidate, NewsItem, Quote, apply_daily_indicators, calculate_daily_indicators, normalize_code
 
 
 def _sina_symbol(code: str) -> str:
@@ -421,11 +421,12 @@ class SinaQuoteProvider:
                 result.pop(code, None)
         return result
 
-    async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> None:
+    async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> dict[str, str]:
         """Fetch a short adjusted daily history for the small candidate set."""
         if not quotes:
-            return
+            return {}
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        results: dict[str, str] = {}
 
         async def enrich(quote: Quote) -> None:
             cache_key = f"{quote.code}:{as_of or 'latest'}"
@@ -435,7 +436,9 @@ class SinaQuoteProvider:
                 quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
                 quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values.get("atr14"), values.get("support20"), values.get("resistance20"), values.get("volatility20"), int(values.get("history_days") or 0))
                 quote.momentum5, quote.momentum20 = values.get("momentum5"), values.get("momentum20")
+                results[quote.code] = "memory_cache" if quote.history_days >= 20 and quote.atr14 is not None else "failed"
                 return
+            self.history_bars.pop(quote.code, None)
             secid = ("1." if quote.code.startswith(("6", "68", "9")) else "0.") + quote.code
             url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
             params = {
@@ -469,37 +472,19 @@ class SinaQuoteProvider:
                         parsed.append((row_date, float(fields[1]), float(fields[3]), float(fields[4]), float(fields[2]), float(fields[5]), float(fields[6]) if len(fields) > 6 else 0.0))
                     except (TypeError, ValueError):
                         continue
-                closes = [item[4] for item in parsed]
-                highs = [item[2] for item in parsed]
-                lows = [item[3] for item in parsed]
-                volumes = [item[5] for item in parsed]
                 self.history_bars[quote.code] = [{"trade_date": f"{item[0][:4]}-{item[0][4:6]}-{item[0][6:8]}", "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6]} for item in parsed]
-                if len(closes) < 20:
-                    return
-                returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] > 0]
-                volatility = (sum((value - sum(returns[-20:]) / len(returns[-20:])) ** 2 for value in returns[-20:]) / len(returns[-20:])) ** 0.5 if len(returns) >= 5 else None
-                values = {
-                    "rsi6": calc_rsi(closes, 6),
-                    "ma5": simple_moving_average(closes, 5),
-                    "ma10": simple_moving_average(closes, 10),
-                    "ma20": simple_moving_average(closes, 20),
-                    "volume_ratio": (volumes[-1] / (sum(volumes[-6:-1]) / 5)) if len(volumes) >= 6 and sum(volumes[-6:-1]) > 0 else None,
-                    "atr14": calc_atr(highs, lows, closes, 14),
-                    "support20": min(lows[-20:]) if len(lows) >= 20 else None,
-                    "resistance20": max(highs[-20:]) if len(highs) >= 20 else None,
-                    "volatility20": volatility,
-                    "history_days": len(closes),
-                    "momentum5": ((closes[-1] / closes[-6] - 1) * 100) if len(closes) >= 6 and closes[-6] > 0 else None,
-                    "momentum20": ((closes[-1] / closes[-21] - 1) * 100) if len(closes) >= 21 and closes[-21] > 0 else None,
-                }
-                self._indicator_cache[cache_key] = (datetime.now(CHINA_TZ), values)
-                quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"])
-                quote.atr14, quote.support20, quote.resistance20, quote.volatility20, quote.history_days = (values["atr14"], values["support20"], values["resistance20"], values["volatility20"], values["history_days"])
-                quote.momentum5, quote.momentum20 = values.get("momentum5"), values.get("momentum20")
-            except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+                values = calculate_daily_indicators(self.history_bars[quote.code])
+                if apply_daily_indicators(quote, self.history_bars[quote.code]):
+                    self._indicator_cache[cache_key] = (datetime.now(CHINA_TZ), values)
+                    results[quote.code] = "network"
+                else:
+                    results[quote.code] = "failed"
+            except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, AttributeError):
+                results[quote.code] = "failed"
                 return
 
         await asyncio.gather(*(enrich(quote) for quote in quotes))
+        return {quote.code: results.get(quote.code, "failed") for quote in quotes}
 
 
 class RssNewsProvider:

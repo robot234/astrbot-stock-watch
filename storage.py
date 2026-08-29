@@ -408,6 +408,26 @@ class StockStore:
             sql += " ORDER BY trade_date"
             return [dict(row) for row in db.execute(sql, args)]
 
+    def latest_daily_bars(self, codes, before_or_equal: str = "", limit: int = 60) -> dict[str, list[dict]]:
+        """Read bounded, point-in-time-safe daily bars for many codes without a giant IN clause."""
+        cutoff = self._date_norm(before_or_equal) if before_or_equal else ""
+        size = max(20, min(int(limit), 240))
+        values = list(dict.fromkeys(str(code).strip() for code in codes if str(code).strip()))
+        result: dict[str, list[dict]] = {}
+        with self._connect() as db:
+            for code in values:
+                sql = "SELECT * FROM daily_bars WHERE code=?"
+                args = [code]
+                if cutoff:
+                    sql += " AND trade_date<=?"
+                    args.append(cutoff)
+                sql += " ORDER BY trade_date DESC LIMIT ?"
+                args.append(size)
+                rows = [dict(row) for row in db.execute(sql, args)]
+                if rows:
+                    result[code] = list(reversed(rows))
+        return result
+
     def daily_quotes(self, trade_date: str) -> list:
         from .core import Quote
 

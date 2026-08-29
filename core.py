@@ -279,6 +279,65 @@ def calc_atr(highs: Iterable[float], lows: Iterable[float], closes: Iterable[flo
     return round(sum(true_ranges[-period:]) / period, 4)
 
 
+def calculate_daily_indicators(bars: Iterable[dict]) -> dict[str, float | int | None]:
+    """Calculate one consistent indicator set from persisted or freshly fetched OHLCV bars."""
+    normalized: list[tuple[str, float, float, float, float, float]] = []
+    for row in bars:
+        try:
+            trade_date = str(row.get("trade_date") or "").strip()
+            open_price = float(row.get("open"))
+            high = float(row.get("high"))
+            low = float(row.get("low"))
+            close = float(row.get("close"))
+            volume = float(row.get("volume") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not trade_date or not all(math.isfinite(value) for value in (open_price, high, low, close, volume)):
+            continue
+        if min(open_price, high, low, close) <= 0 or high < low or high < max(open_price, close) or low > min(open_price, close):
+            continue
+        normalized.append((trade_date, open_price, high, low, close, max(0.0, volume)))
+    normalized.sort(key=lambda row: row[0])
+    closes = [row[4] for row in normalized]
+    highs = [row[2] for row in normalized]
+    lows = [row[3] for row in normalized]
+    volumes = [row[5] for row in normalized]
+    returns = [(closes[index] - closes[index - 1]) / closes[index - 1] for index in range(1, len(closes)) if closes[index - 1] > 0]
+    recent_returns = returns[-20:]
+    volatility = None
+    if len(recent_returns) >= 5:
+        average = sum(recent_returns) / len(recent_returns)
+        volatility = (sum((value - average) ** 2 for value in recent_returns) / len(recent_returns)) ** 0.5
+    return {
+        "rsi6": calc_rsi(closes, 6),
+        "ma5": simple_moving_average(closes, 5),
+        "ma10": simple_moving_average(closes, 10),
+        "ma20": simple_moving_average(closes, 20),
+        "volume_ratio": (volumes[-1] / (sum(volumes[-6:-1]) / 5)) if len(volumes) >= 6 and sum(volumes[-6:-1]) > 0 else None,
+        "atr14": calc_atr(highs, lows, closes, 14),
+        "support20": min(lows[-20:]) if len(lows) >= 20 else None,
+        "resistance20": max(highs[-20:]) if len(highs) >= 20 else None,
+        "volatility20": volatility,
+        "history_days": len(closes),
+        "momentum5": ((closes[-1] / closes[-6] - 1) * 100) if len(closes) >= 6 and closes[-6] > 0 else None,
+        "momentum20": ((closes[-1] / closes[-21] - 1) * 100) if len(closes) >= 21 and closes[-21] > 0 else None,
+    }
+
+
+def apply_daily_indicators(quote: Quote, bars: Iterable[dict]) -> bool:
+    """Assign a daily-indicator set and report whether its history is usable for screening."""
+    values = calculate_daily_indicators(bars)
+    quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.volume_ratio = (
+        values["rsi6"], values["ma5"], values["ma10"], values["ma20"], values["volume_ratio"],
+    )
+    quote.atr14, quote.support20, quote.resistance20, quote.volatility20 = (
+        values["atr14"], values["support20"], values["resistance20"], values["volatility20"],
+    )
+    quote.history_days = int(values["history_days"] or 0)
+    quote.momentum5, quote.momentum20 = values["momentum5"], values["momentum20"]
+    return quote.history_days >= 20 and quote.atr14 is not None
+
+
 def build_price_plan(quote: Quote, tick: float = 0.01) -> PricePlan:
     """Derive reference zones from completed data available at the quote timestamp."""
     def rounded(value: float | None) -> float | None:

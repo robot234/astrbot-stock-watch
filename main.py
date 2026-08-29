@@ -14,7 +14,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, assess_market_context, format_candidate, format_compact_candidate, in_trading_session, is_tradable, parse_codes, score_quote
+from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, format_candidate, format_compact_candidate, in_trading_session, is_tradable, parse_codes, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.1")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.2")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -111,9 +111,15 @@ class Main(Star):
             return "" if text.lower() in {"", "unknown", "未知", "none", "null"} else text
         sources = {usable(getattr(quote, "source", "")) for quote in (quotes or [])}
         sources.discard("")
-        source = usable(meta.get("source")) or (next(iter(sources)) if len(sources) == 1 else "未记录")
+        source = usable(meta.get("source")) or (next(iter(sources)) if len(sources) == 1 else "")
         quality = usable(meta.get("quality")).lower()
         valid_count = len({str(getattr(quote, "code", "")) for quote in (quotes or []) if str(getattr(quote, "code", "")).isdigit() and float(getattr(quote, "price", 0) or 0) > 0})
+        if not source and valid_count:
+            # Legacy snapshots did not preserve a provider label. They are still local cached data,
+            # but must not be presented as a verified source such as Tushare.
+            source, quality = "历史缓存", "cached"
+        elif not source:
+            source = "未记录"
         if quality not in {"good", "partial", "degraded", "cached"}:
             if source == "tushare" and valid_count >= self._int("daily_snapshot_min_size", 4000, 1000, 10000):
                 quality = "good"
@@ -170,13 +176,29 @@ class Main(Star):
             f"行情：{snapshot.get('source', '未记录')} · {quality}｜共 {len(quotes)} 只",
             f"市场：{self._market_label(diagnostics.get('market_regime', 'unknown'))}｜上涨占比 {float(diagnostics.get('market_breadth', 0)):.1%}｜候选 {len(candidates)} 只",
         ]
+        targets = int(diagnostics.get("indicator_targets", 0) or 0)
+        if targets:
+            lines.append(
+                "指标：网络 {network}｜短时缓存 {memory}｜历史缓存 {persistent}｜失败 {failed}".format(
+                    network=diagnostics.get("indicator_network", 0),
+                    memory=diagnostics.get("indicator_memory_cache", 0),
+                    persistent=diagnostics.get("indicator_persistent_cache", 0),
+                    failed=diagnostics.get("indicator_failed", 0),
+                )
+            )
         if actual_date != requested_date:
             lines.append(f"注：请求 {requested_date}，当前使用最近交易日数据。")
         lines.extend(format_compact_candidate(item, index) for index, item in enumerate(shown, 1))
         if len(candidates) > len(shown):
             lines.append(f"另有 {len(candidates) - len(shown)} 只候选，发送 /候选池 查看。")
         if not candidates:
-            lines.append(f"暂无达标候选：可交易 {diagnostics.get('tradable', 0)} 只，补齐指标 {diagnostics.get('enriched', 0)} 只，最高分 {diagnostics.get('max_score', 0)}。")
+            enriched = int(diagnostics.get("enriched", 0) or 0)
+            if targets and not enriched:
+                lines.append(f"指标数据未能补齐：可交易 {diagnostics.get('tradable', 0)} 只，目标 {targets} 只均失败。本次不能解读为“没有候选”，请稍后重试或先执行 /股票同步。")
+            elif targets and enriched < targets:
+                lines.append(f"暂无达标候选：可交易 {diagnostics.get('tradable', 0)} 只，已补齐 {enriched}/{targets} 只，最高分 {diagnostics.get('max_score', 0)}。结论仅覆盖已补齐指标的股票。")
+            else:
+                lines.append(f"暂无达标候选：可交易 {diagnostics.get('tradable', 0)} 只，补齐指标 {enriched} 只，最高分 {diagnostics.get('max_score', 0)}。")
         lines.append("仅供研究/模拟盘，价位须结合公告、基本面和自身风险承受复核。")
         return lines
 
@@ -330,12 +352,33 @@ class Main(Star):
         tradable.sort(key=lambda quote: quote.amount, reverse=True)
         enrich_targets = tradable[: min(300, max(80, limit * 5))]
         # 日线历史请求只对流动性靠前的有限集合执行，控制网络和内存开销。
-        await self.quotes.enrich_indicators(enrich_targets, self._int("max_concurrency", 5, 1, 20), as_of)
+        indicator_status = await self.quotes.enrich_indicators(enrich_targets, self._int("max_concurrency", 5, 1, 20), as_of)
         for quote in enrich_targets:
             bars = self.quotes.history_bars.get(quote.code, [])
             if bars:
-                self.store.save_daily_bars(quote.code, bars, quote.source or "eastmoney")
-        self._last_screen_diagnostics = {"input": len(quotes), "tradable": len(tradable), "enriched": sum(1 for q in enrich_targets if q.history_days >= 20)}
+                # These bars come from the indicator provider, not from the snapshot provider.
+                self.store.save_daily_bars(quote.code, bars, "eastmoney_indicator")
+        cache_targets = [quote for quote in enrich_targets if indicator_status.get(quote.code) == "failed"]
+        persistent_bars = self.store.latest_daily_bars(
+            [quote.code for quote in cache_targets],
+            before_or_equal=as_of,
+            limit=60,
+        ) if cache_targets else {}
+        for quote in cache_targets:
+            if apply_daily_indicators(quote, persistent_bars.get(quote.code, [])):
+                indicator_status[quote.code] = "persistent_cache"
+        indicator_counts = {
+            "network": sum(1 for quote in enrich_targets if indicator_status.get(quote.code) == "network"),
+            "memory_cache": sum(1 for quote in enrich_targets if indicator_status.get(quote.code) == "memory_cache"),
+            "persistent_cache": sum(1 for quote in enrich_targets if indicator_status.get(quote.code) == "persistent_cache"),
+            "failed": sum(1 for quote in enrich_targets if indicator_status.get(quote.code) not in {"network", "memory_cache", "persistent_cache"}),
+        }
+        self._last_screen_diagnostics = {
+            "input": len(quotes), "tradable": len(tradable), "indicator_targets": len(enrich_targets),
+            "indicator_network": indicator_counts["network"], "indicator_memory_cache": indicator_counts["memory_cache"],
+            "indicator_persistent_cache": indicator_counts["persistent_cache"], "indicator_failed": indicator_counts["failed"],
+            "enriched": sum(indicator_counts[key] for key in ("network", "memory_cache", "persistent_cache")),
+        }
         scored = [score_quote(quote) for quote in tradable]
         full_market = self.store.daily_quotes(as_of) if as_of else []
         market_minimum = self._int("market_min_snapshot_size", 4000, 1000, 10000)
