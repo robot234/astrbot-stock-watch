@@ -14,7 +14,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, format_candidate, format_compact_candidate, in_trading_session, is_tradable, parse_codes, score_quote
+from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, format_candidate, format_compact_candidate, in_trading_session, is_tradable, parse_codes, risk_label, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.3")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.4")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -1043,7 +1043,7 @@ class Main(Star):
         lines = ["最近候选池（仅研究）"]
         for row in rows:
             flags = "、".join(json.loads(row.get("risk_flags") or "[]")) or "无"
-            lines.append(f"{row['name']}（{row['code']}） 评分{row['score']}/{row['score_max']} 风险{row['risk_level']}（{flags}）")
+            lines.append(f"{row['name']}（{row['code']}） 评分{row['score']}/{row['score_max']} 风险{risk_label(row['risk_level'])}（{flags}）")
         lines.append(f"数据日期：{rows[0].get('actual_trade_date') or '未知'}；来源：{rows[0].get('source') or '未知'}")
         yield event.plain_result("\n".join(lines))
 

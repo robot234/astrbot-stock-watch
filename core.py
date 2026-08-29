@@ -9,6 +9,18 @@ import re
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
+_RISK_LABELS = {
+    "eligible": "可跟踪",
+    "watch_only": "需复核",
+    "blocked": "已拦截",
+    "unknown": "数据不足",
+}
+
+
+def risk_label(risk_level: str) -> str:
+    """Return a user-facing label for an internal candidate risk enum."""
+    return _RISK_LABELS.get(str(risk_level), "风险待确认")
+
 
 @dataclass(slots=True)
 class Quote:
@@ -511,7 +523,7 @@ def format_candidate(candidate: Candidate) -> str:
         f"技术证据：{evidence}\n"
         f"{factor_line}"
         f"参考价位：{levels}\n"
-        f"风险审核：{candidate.risk_level}；{risk_text}\n"
+        f"风险审核：{risk_label(candidate.risk_level)}；{risk_text}\n"
         f"研究结论：{conclusion}。"
     )
 
@@ -522,7 +534,7 @@ def format_compact_candidate(candidate: Candidate, index: int) -> str:
     name = re.sub(r"[\x00-\x1f\x7f]", "", str(quote.name or "")).strip()[:24]
     if not name or name == quote.code:
         name = "名称未获取"
-    risk = {"eligible": "可跟踪", "watch_only": "需复核", "unknown": "数据不足", "blocked": "已拦截"}.get(candidate.risk_level, candidate.risk_level)
+    risk = risk_label(candidate.risk_level)
     reasons = [re.sub(r"[+-]\d+$", "", str(item)) for item in candidate.reasons[:3]]
     reason_text = "、".join(reasons) or "技术指标有限"
     plan = candidate.price_plan
