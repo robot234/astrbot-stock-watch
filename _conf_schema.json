@@ -33,6 +33,7 @@
   "news_interval_seconds": {"type": "int", "description": "新闻/RSS轮询间隔", "default": 180},
   "daily_scan_time": {"type": "string", "description": "收盘扫描时间（北京时间）", "default": "15:10"},
   "candidate_limit": {"type": "int", "description": "收盘推送候选数量", "default": 30},
+  "report_candidate_limit": {"type": "int", "description": "全市场报告默认展示的候选数量", "default": 10},
   "auto_watch_candidates": {"type": "bool", "description": "盘中自动监听最近候选池", "default": true},
   "candidate_plan_valid_days": {"type": "int", "description": "收盘候选价位计划用于盘中监听的有效天数", "default": 10},
   "intraday_focus_limit": {"type": "int", "description": "盘中重点监听数量上限", "default": 200},

@@ -14,7 +14,7 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, assess_market_context, format_candidate, in_trading_session, is_tradable, parse_codes, score_quote
+from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, assess_market_context, format_candidate, format_compact_candidate, in_trading_session, is_tradable, parse_codes, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
 from .providers import OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
 from .storage import StockStore
@@ -22,7 +22,7 @@ from .storage import StockStore
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.0")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.10.1")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -106,14 +106,78 @@ class Main(Star):
 
     def _snapshot_context(self, requested_date: str, actual_date: str, quotes: list | None = None) -> dict:
         meta = self.store.snapshot_meta(actual_date) or {}
+        def usable(value) -> str:
+            text = str(value or "").strip()
+            return "" if text.lower() in {"", "unknown", "未知", "none", "null"} else text
+        sources = {usable(getattr(quote, "source", "")) for quote in (quotes or [])}
+        sources.discard("")
+        source = usable(meta.get("source")) or (next(iter(sources)) if len(sources) == 1 else "未记录")
+        quality = usable(meta.get("quality")).lower()
+        valid_count = len({str(getattr(quote, "code", "")) for quote in (quotes or []) if str(getattr(quote, "code", "")).isdigit() and float(getattr(quote, "price", 0) or 0) > 0})
+        if quality not in {"good", "partial", "degraded", "cached"}:
+            if source == "tushare" and valid_count >= self._int("daily_snapshot_min_size", 4000, 1000, 10000):
+                quality = "good"
+            elif source == "eastmoney":
+                quality = "degraded"
+            elif valid_count:
+                quality = "partial"
+            else:
+                quality = "未记录"
         return {
             "requested_date": requested_date,
             "actual_date": actual_date,
-            "source": str(meta.get("source") or next((str(q.source) for q in (quotes or []) if getattr(q, "source", "")), "unknown")),
-            "quality": str(meta.get("quality") or "unknown"),
-            "complete": bool(meta.get("complete")),
+            "source": source,
+            "quality": quality,
+            "complete": bool(meta.get("complete")) and quality == "good",
             "note": str(meta.get("note") or ""),
         }
+
+    async def _fill_quote_names(self, quotes: list, as_of: str = "") -> int:
+        missing = [quote.code for quote in quotes if not getattr(quote, "name", "") or quote.name == quote.code]
+        if not missing:
+            return 0
+        updated = 0
+        try:
+            updated += await self.quotes.enrich_names(quotes)
+        except Exception:
+            logger.warning("[%s] Tushare 股票名称补全失败", PLUGIN_NAME)
+        still_missing = [quote.code for quote in quotes if not getattr(quote, "name", "") or quote.name == quote.code]
+        try:
+            cached_names = self.store.latest_quote_names(still_missing)
+        except Exception:
+            logger.warning("[%s] 本地股票名称缓存查询失败", PLUGIN_NAME)
+            cached_names = {}
+        for quote in quotes:
+            name = cached_names.get(quote.code)
+            if name and (not quote.name or quote.name == quote.code):
+                quote.name = name
+                updated += 1
+        if updated and as_of:
+            self.store.save_daily_quotes(as_of, quotes, self._int("daily_cache_keep_days", 180, 7, 730))
+        return updated
+
+    @staticmethod
+    def _market_label(regime: str) -> str:
+        return {"risk_on": "偏强", "neutral": "震荡", "risk_off": "偏弱"}.get(str(regime), "未记录")
+
+    def _market_report_lines(self, requested_date: str, actual_date: str, quotes: list, candidates, snapshot: dict) -> list[str]:
+        diagnostics = self._last_screen_diagnostics
+        shown = candidates[:self._int("report_candidate_limit", 10, 1, 30)]
+        quality = {"good": "完整", "partial": "部分", "degraded": "降级", "cached": "缓存"}.get(str(snapshot.get("quality")), "未记录")
+        lines = [
+            f"全市场选股｜{actual_date}",
+            f"行情：{snapshot.get('source', '未记录')} · {quality}｜共 {len(quotes)} 只",
+            f"市场：{self._market_label(diagnostics.get('market_regime', 'unknown'))}｜上涨占比 {float(diagnostics.get('market_breadth', 0)):.1%}｜候选 {len(candidates)} 只",
+        ]
+        if actual_date != requested_date:
+            lines.append(f"注：请求 {requested_date}，当前使用最近交易日数据。")
+        lines.extend(format_compact_candidate(item, index) for index, item in enumerate(shown, 1))
+        if len(candidates) > len(shown):
+            lines.append(f"另有 {len(candidates) - len(shown)} 只候选，发送 /候选池 查看。")
+        if not candidates:
+            lines.append(f"暂无达标候选：可交易 {diagnostics.get('tradable', 0)} 只，补齐指标 {diagnostics.get('enriched', 0)} 只，最高分 {diagnostics.get('max_score', 0)}。")
+        lines.append("仅供研究/模拟盘，价位须结合公告、基本面和自身风险承受复核。")
+        return lines
 
     def _minute_signal_text(self, quote, completed) -> str:
         if not completed or not self._bool("minute_trigger_enabled", False):
@@ -255,6 +319,8 @@ class Main(Star):
         return list(dict.fromkeys(merged))
 
     async def _score_quotes(self, quotes, limit: int, as_of: str = "", include_factors: bool = True):
+        if include_factors:
+            await self._fill_quote_names(quotes, as_of)
         tradable = [quote for quote in quotes if is_tradable(
             quote,
             self._float("price_min", 2, 0.01, 100000),
@@ -640,18 +706,7 @@ class Main(Star):
                     snapshot = self._snapshot_context(requested_date, actual_date, cached_for_record)
                     source, quality = snapshot["source"], snapshot["quality"]
                     self._record_screen(requested_date, actual_date, source, cached_for_record, candidates, status="completed" if snapshot["complete"] else "degraded", quality=quality)
-                    lines = [
-                        "收盘选股（仅研究/模拟盘）",
-                        f"请求日期：{requested_date}；实际数据交易日：{actual_date}",
-                        f"行情来源：{source}；质量{quality}{'；非完整收盘快照' if not snapshot['complete'] else ''}",
-                        f"市场环境：{self._last_screen_diagnostics.get('market_regime', 'unknown')}（上涨占比{self._last_screen_diagnostics.get('market_breadth', 0):.1%}）",
-                        f"因子数据：{self._last_screen_diagnostics.get('factor_source', 'unknown')}，质量{self._last_screen_diagnostics.get('factor_quality', 'unknown')}，模式{self.config.get('factor_mode', 'report_only')}",
-                        "筛选口径：硬过滤 → 趋势/动量/量价/波动评分 → 因子复核 → 人工复核",
-                        *[format_candidate(item) for item in candidates],
-                    ]
-                    if not candidates:
-                        d = self._last_screen_diagnostics
-                        lines.append(f"暂无达标候选：可交易{d.get('tradable', 0)}只，补齐历史指标{d.get('enriched', 0)}只，最高分{d.get('max_score', 0)}，最低门槛{d.get('min_score', 15)}。")
+                    lines = self._market_report_lines(requested_date, actual_date, cached_for_record, candidates, snapshot)
                     push_failed = False
                     for origin in self.store.subscriptions():
                         if not self._push_allowed(origin):
@@ -926,18 +981,7 @@ class Main(Star):
             candidates = await self._score_quotes(quotes, limit, actual_date)
             snapshot = self._snapshot_context(trade_date, actual_date, quotes)
             self._record_screen(trade_date, actual_date, snapshot["source"], quotes, candidates, status="completed" if snapshot["complete"] else "degraded", quality=snapshot["quality"])
-            lines = [
-                f"{source}：{len(quotes)} 只",
-                f"来源：{snapshot['source']}；质量{snapshot['quality']}{'；非完整收盘快照' if not snapshot['complete'] else ''}",
-                "全市场选股结果（仅研究/模拟盘）",
-                f"市场环境：{self._last_screen_diagnostics.get('market_regime', 'unknown')}（上涨占比{self._last_screen_diagnostics.get('market_breadth', 0):.1%}）",
-                "筛选口径：硬过滤 → 趋势/动量/量价/波动评分 → 市场环境修正 → 人工复核",
-            ]
-            lines.extend(format_candidate(item) for item in candidates)
-            if not candidates:
-                d = self._last_screen_diagnostics
-                lines.append(f"暂无达标候选：可交易{d.get('tradable', 0)}只，成功补齐历史指标{d.get('enriched', 0)}只，最高分{d.get('max_score', 0)}，最低门槛{d.get('min_score', self._int('min_score', 10, -100, 100))}。")
-                lines.append("若想扩大观察范围，可把 min_score 调低；指标补齐数为 0 时请检查行情接口限流或配置。")
+            lines = self._market_report_lines(trade_date, actual_date, quotes, candidates, snapshot)
             yield event.plain_result("\n".join(lines))
         except Exception:
             logger.exception("[%s] 手动全市场同步失败", PLUGIN_NAME)

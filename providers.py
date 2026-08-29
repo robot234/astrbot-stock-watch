@@ -145,19 +145,38 @@ class SinaQuoteProvider:
         self._last_tushare_date = self._normalize_trade_date(next(iter(row_dates)))
         return result
 
-    async def _apply_tushare_names(self, client: httpx.AsyncClient, quotes: list[Quote]) -> None:
-        if not self._tushare_names:
-            payload = {"api_name": "stock_basic", "token": self.tushare_token, "params": {"list_status": "L"}, "fields": "ts_code,name"}
-            try:
-                response = await client.post(self.tushare_url, json=payload)
-                response.raise_for_status()
-                data = response.json().get("data") or {}
-                fields, items = list(data.get("fields") or []), data.get("items") or []
-                self._tushare_names = {str(row["ts_code"]).split(".")[0]: str(row["name"]) for row in (dict(zip(fields, item)) for item in items) if row.get("ts_code") and row.get("name")}
-            except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
-                return
+    async def _apply_tushare_names(self, client: httpx.AsyncClient, quotes: list[Quote]) -> int:
+        missing = [quote.code for quote in quotes if not quote.name or quote.name == quote.code]
+        if missing and (not self._tushare_names or any(code not in self._tushare_names for code in missing)):
+            for status in ("L", "P", "D"):
+                try:
+                    payload = {"api_name": "stock_basic", "token": self.tushare_token, "params": {"list_status": status}, "fields": "ts_code,name"}
+                    response = await client.post(self.tushare_url, json=payload)
+                    response.raise_for_status()
+                    body = response.json()
+                    if not isinstance(body, dict) or int(body.get("code") or 0) != 0:
+                        continue
+                    data = body.get("data") or {}
+                    fields, items = list(data.get("fields") or []), data.get("items") or []
+                    for row in (dict(zip(fields, item)) for item in items if isinstance(item, list)):
+                        code, name = str(row.get("ts_code") or "").split(".")[0], str(row.get("name") or "").strip()
+                        if len(code) == 6 and name:
+                            self._tushare_names[code] = name
+                except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+                    continue
+        updated = 0
         for quote in quotes:
-            quote.name = self._tushare_names.get(quote.code, quote.name)
+            name = self._tushare_names.get(quote.code)
+            if name and quote.name != name:
+                quote.name = name
+                updated += 1
+        return updated
+
+    async def enrich_names(self, quotes: list[Quote]) -> int:
+        if not self.tushare_token or not quotes:
+            return 0
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            return await self._apply_tushare_names(client, quotes)
 
     async def _fetch_tushare_trade_dates(self, client: httpx.AsyncClient, end_date: str) -> list[str]:
         payload = {

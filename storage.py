@@ -430,6 +430,26 @@ class StockStore:
                 result.append(Quote(str(row[0]), str(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), source=str(row[8] or ""), provider_ts=provider_ts, fetched_at=fetched_at))
             return result
 
+    def latest_quote_names(self, codes) -> dict[str, str]:
+        """Return the newest usable cached display name for each requested code."""
+        values = list(dict.fromkeys(str(code).zfill(6) for code in codes if str(code).zfill(6).isdigit() and len(str(code).zfill(6)) == 6))
+        if not values:
+            return {}
+        result: dict[str, str] = {}
+        with self._connect() as db:
+            for start in range(0, len(values), 900):
+                chunk = values[start:start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = db.execute(
+                    f"SELECT code,name FROM daily_quotes WHERE code IN ({placeholders}) AND name<>'' AND name<>code ORDER BY trade_date DESC",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    code, name = str(row[0]), str(row[1]).strip()
+                    if code not in result and name and name != code:
+                        result[code] = name
+        return result
+
     def latest_daily_trade_date(self, before_or_equal: str) -> str | None:
         """Return the newest locally cached trade date not later than the requested date."""
         with self._connect() as db:

@@ -455,3 +455,26 @@ def format_candidate(candidate: Candidate) -> str:
         f"风险审核：{candidate.risk_level}；{risk_text}\n"
         f"研究结论：{conclusion}。"
     )
+
+
+def format_compact_candidate(candidate: Candidate, index: int) -> str:
+    """Three-line market-screen summary; detailed reports keep using format_candidate."""
+    quote = candidate.quote
+    name = re.sub(r"[\x00-\x1f\x7f]", "", str(quote.name or "")).strip()[:24]
+    if not name or name == quote.code:
+        name = "名称未获取"
+    risk = {"eligible": "可跟踪", "watch_only": "需复核", "unknown": "数据不足", "blocked": "已拦截"}.get(candidate.risk_level, candidate.risk_level)
+    reasons = [re.sub(r"[+-]\d+$", "", str(item)) for item in candidate.reasons[:3]]
+    reason_text = "、".join(reasons) or "技术指标有限"
+    plan = candidate.price_plan
+    if plan and plan.quality == "good" and plan.attention_low is not None and plan.attention_high is not None and plan.invalidation is not None:
+        levels = f"关注 {plan.attention_low:.2f}-{plan.attention_high:.2f}｜失效 {plan.invalidation:.2f}"
+        if plan.confirmation is not None:
+            levels = f"{levels}｜确认 {plan.confirmation:.2f}"
+    else:
+        levels = "历史数据不足"
+    return (
+        f"{index}. {name}（{quote.code}）｜技术 {candidate.score}/{candidate.score_max}｜{quote.pct_change:+.2f}%｜{risk}\n"
+        f"   看点：{reason_text}\n"
+        f"   价位：{levels}"
+    )
