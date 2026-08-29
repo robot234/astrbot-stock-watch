@@ -697,6 +697,9 @@ class Main(Star):
                                         continue
                                     if candidate and candidate.risk_level in {"blocked", "unknown"} and not cost_signal and not minute_signal:
                                         continue
+                                    plan_state = candidate.price_plan.state if candidate and candidate.price_plan else "unknown"
+                                    if candidate and not cost_signal and not minute_signal and plan_state not in {"in_attention", "confirmed", "near_sell", "invalidated"}:
+                                        continue
                                     threshold = self._int("intraday_failure_threshold", 0, 0, 100)
                                     if threshold > 0 and health["consecutive_failures"] >= threshold:
                                         continue
@@ -718,11 +721,14 @@ class Main(Star):
                                     elif is_minute:
                                         text = minute_signal
                                     else:
-                                        prefix = "盘中观察信号（需人工复核）" if candidate.risk_level == "watch_only" else "盘中信号"
+                                        state_text = {"in_attention": "进入关注区", "confirmed": "突破确认位", "near_sell": "进入参考卖出区", "invalidated": "跌破失效位"}.get(plan_state, "盘中价位变化")
+                                        prefix = f"{state_text}（需人工复核）" if candidate.risk_level == "watch_only" else state_text
                                         text = prefix + "（仅研究/模拟盘）\n" + format_candidate(candidate)
                                         annotation = self._annotation_text(code)
                                         if annotation:
                                             text += "\n" + annotation
+                                        if plan_state in {"near_sell", "invalidated"}:
+                                            self.store.save_risk_event(f"{today}:{code}:{plan_state}", self._last_screen_run_id, code, plan_state, candidate.risk_level, json.dumps({"price": quote.price, "state": plan_state}, ensure_ascii=False), datetime.now(timezone.utc).isoformat())
                                     sent = await self._push(origin, text)
                                     if not sent:
                                         self.store.release_signal(origin, code, claimed_at=claim_time)
@@ -1003,6 +1009,7 @@ class Main(Star):
             return
         try:
             quotes = await self.quotes.fetch_quotes(codes[:10])
+            await self.quotes.enrich_indicators(quotes, self._int("max_concurrency", 5, 1, 20))
             yield event.plain_result("\n".join(format_candidate(score_quote(item)) for item in quotes) or "没有拿到行情，可能是接口限流。")
         except Exception:
             logger.exception("[%s] 行情查询失败", PLUGIN_NAME)
