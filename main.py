@@ -713,10 +713,10 @@ class Main(Star):
                 return "rate_limit" if re.search(r"rate|limit", text) else "breaker"
             if re.search(r"calendar", text):
                 return "calendar"
-            if re.search(r"publish|coverage", text):
-                return "publish" if "publish" in text else "coverage"
             if re.search(r"history|daily|row|empty|not.?found|not.?publish|unavailable", text):
                 return "history_invalid" if re.search(r"history|daily|row", text) else "not_published"
+            if re.search(r"publish|coverage", text):
+                return "publish" if "publish" in text else "coverage"
         return None
 
     def _mark_tushare_fallback(self, reason: str, diagnostics: dict | None = None) -> dict:
