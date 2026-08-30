@@ -8,21 +8,22 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, apply_daily_indicators, assess_market_context, build_price_plan, format_candidate, format_compact_candidate, format_stored_compact_candidate, in_trading_session, is_tradable, normalize_code, parse_codes, price_plan_is_validated, risk_label, review_risk, score_quote
+from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, Quote, apply_daily_indicators, assess_market_context, build_price_plan, format_candidate, format_compact_candidate, format_stored_compact_candidate, in_trading_session, is_tradable, normalize_code, parse_codes, price_plan_is_validated, risk_label, review_risk, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
-from .providers import HttpRuntime, OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, news_fingerprint
+from .providers import BulkDailyResult, HttpRuntime, OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, TushareBulkError, TushareCircuitOpen, TushareRequestGateway, news_fingerprint
 from .storage import StockStore
 
 PLUGIN_NAME = "astrbot_stock_watch"
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.12.1")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.13.0")
 class Main(Star):
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
@@ -31,6 +32,28 @@ class Main(Star):
         self.store = StockStore(data_dir / "stock_watch.sqlite3")
         timeout = self._float("request_timeout", 10, 3, 60)
         self.http = HttpRuntime(timeout, self._int("max_concurrency", 8, 1, 64))
+        self.raw_dataset_key = str(self.config.get("tushare_raw_dataset_key", "tushare_daily")).strip() or "tushare_daily"
+        # Normalize the deprecated natural-day setting once at the boundary;
+        # every production bulk request below uses the session-count contract.
+        self.raw_session_count = self._session_count_from_config(self.config)
+        # Keep the historical attribute as a compatibility alias for
+        # integrations that still inspect raw_lookback_days.
+        self.raw_lookback_days = self.raw_session_count
+        self.raw_max_stale_trading_days = self._int("tushare_raw_max_stale_trading_days", 2, 0, 10)
+        self.raw_chunk_size = self._int("tushare_raw_chunk_size", 500, 50, 2000)
+        self.raw_min_snapshot_size = self._int("daily_snapshot_min_size", 4000, 1, 10000)
+        self.raw_min_overall_coverage = self._float("tushare_raw_min_overall_coverage", 0.97, 0.0, 1.0)
+        self.raw_min_market_coverage = self._float("tushare_raw_min_market_coverage", 0.95, 0.0, 1.0)
+        self.raw_min_market_median_ratio = self._float("tushare_raw_min_market_median_ratio", 0.95, 0.0, 1.0)
+        self.raw_publish_enabled = self._bool("tushare_raw_publish_enabled", False)
+        self.raw_universe_version = str(self.config.get("tushare_raw_universe_version", "")).strip()[:160]
+        self.raw_universe_counts = self.config.get("tushare_raw_universe_counts")
+        if self.raw_universe_counts in (None, ""):
+            self.raw_universe_counts = self.config.get("tushare_raw_universe_evidence")
+        # Independent universe evidence is part of the raw integrity
+        # contract.  Keep the legacy setting readable, but never let an
+        # explicit false value weaken the fail-closed path.
+        self.raw_require_universe_evidence = True
         self.quotes = SinaQuoteProvider(
             timeout,
             str(self.config.get("tushare_url", "")),
@@ -38,6 +61,19 @@ class Main(Star):
             self._int("max_concurrency", 8, 1, 64),
             self.http,
             self.store,
+            bulk_page_size=self._int("tushare_bulk_page_size", 6000, 1, 10000),
+            bulk_retry_attempts=self._int("tushare_retry_attempts", 3, 1, 3),
+            bj_calendar_policy=str(self.config.get("tushare_bj_calendar_policy", "require_bse")),
+            raw_dataset_key=self.raw_dataset_key,
+            min_snapshot_size=self.raw_min_snapshot_size,
+            min_overall_coverage=self.raw_min_overall_coverage,
+            min_market_coverage=self.raw_min_market_coverage,
+            min_market_median_ratio=self.raw_min_market_median_ratio,
+            universe_version=self.raw_universe_version,
+            universe_counts=self.raw_universe_counts,
+            require_universe_evidence=self.raw_require_universe_evidence,
+            raw_publish_enabled=self.raw_publish_enabled,
+            session_count=self.raw_session_count,
         )
         self.news = RssNewsProvider(str(self.config.get("news_rss_url", "")), timeout, self.http)
         self.llm = OpenAICompatibleClient(
@@ -83,6 +119,7 @@ class Main(Star):
             }
         }
         self._last_screen_diagnostics: dict[str, object] = {}
+        self._raw_screen_provenance: dict[str, object] = {}
         self._screen_sequence = 0
         self._last_screen_report_claimed = True
 
@@ -134,12 +171,25 @@ class Main(Star):
         return result
 
     def _daily_close_plan(self, quote, actual_date: str) -> PricePlan:
-        return build_price_plan(
+        plan = build_price_plan(
             quote,
             context="daily_close",
             actual_date=actual_date,
             tolerance_pct=self._float("price_plan_close_tolerance_pct", 1.0, 0.0, 20.0),
         )
+        # Keep the exact raw generation beside the validated anchor so a
+        # later replay can select the same immutable batch instead of relying
+        # on whichever cache happens to be active then.
+        if self._tushare_mode() and isinstance(plan.provenance, dict):
+            raw = self._raw_screen_provenance if isinstance(self._raw_screen_provenance, dict) else {}
+            for key in ("batch_id", "dataset_id", "generation"):
+                if raw.get(key) is not None:
+                    plan.provenance[key] = raw[key]
+            if raw.get("batch_id") is not None:
+                plan.provenance["raw_batch_id"] = raw["batch_id"]
+            if raw.get("generation") is not None:
+                plan.provenance["raw_generation"] = raw["generation"]
+        return plan
 
     def _candidate_valid_until(self, actual_date: str) -> str | None:
         """Return a loose integrity bound; calendar open-count owns expiry."""
@@ -284,7 +334,8 @@ class Main(Star):
         targets = int(diagnostics.get("indicator_targets", 0) or 0)
         if targets:
             lines.append(
-                "指标：网络 {network}｜短时缓存 {memory}｜历史缓存 {persistent}｜失败 {failed}".format(
+                "指标：raw批次 {raw}｜网络 {network}｜短时缓存 {memory}｜历史缓存 {persistent}｜失败 {failed}".format(
+                    raw=diagnostics.get("indicator_raw_batch", 0),
                     network=diagnostics.get("indicator_network", 0),
                     memory=diagnostics.get("indicator_memory_cache", 0),
                     persistent=diagnostics.get("indicator_persistent_cache", 0),
@@ -301,7 +352,12 @@ class Main(Star):
             lines.append(f"另有 {len(candidates) - len(shown)} 只候选，发送 /候选池 查看。")
         if not candidates:
             enriched = int(diagnostics.get("enriched", 0) or 0)
-            if targets and not enriched:
+            if diagnostics.get("history_unavailable"):
+                lines.append(
+                    "历史日线不可用：Tushare raw 批次缺失、过期或校验未通过，不能把本次结果解读为“没有候选”；"
+                    "请稍后重试并确认 raw 批次已同步。"
+                )
+            elif targets and not enriched:
                 lines.append(f"指标数据未能补齐：可交易 {diagnostics.get('tradable', 0)} 只，目标 {targets} 只均失败。本次不能解读为“没有候选”，请稍后重试或先执行 /股票同步。")
             elif targets and enriched < targets:
                 lines.append(f"暂无达标候选：可交易 {diagnostics.get('tradable', 0)} 只，已补齐 {enriched}/{targets} 只，最高分 {diagnostics.get('max_score', 0)}。结论仅覆盖已补齐指标的股票。")
@@ -379,6 +435,18 @@ class Main(Star):
             return max(minimum, min(int(self.config.get(key, default)), maximum))
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _session_count_from_config(config) -> int:
+        """Normalize the exact raw session count at the configuration boundary."""
+        settings = config if isinstance(config, dict) else {}
+        value = settings.get("tushare_raw_session_count")
+        if value in (None, ""):
+            value = settings.get("tushare_raw_lookback_days", 120)
+        try:
+            return max(1, min(int(value), 366))
+        except (TypeError, ValueError, OverflowError):
+            return 120
 
     def _float(self, key: str, default: float, minimum: float, maximum: float) -> float:
         try:
@@ -493,6 +561,392 @@ class Main(Star):
         labels = [f"{item.get('name') or '名称未知'}（{item.get('code') or '未知'}）" for item in matches[:10] if isinstance(item, dict)]
         return "股票名称有歧义，请改用代码或更完整名称：" + "、".join(labels)
 
+    def _tushare_mode(self) -> bool:
+        """A configured Tushare token selects the immutable raw-data path."""
+        return bool(str(getattr(self.quotes, "tushare_token", "") or "").strip())
+
+    def _raw_dataset(self) -> str:
+        return str(getattr(self, "raw_dataset_key", self.config.get("tushare_raw_dataset_key", "tushare_daily"))).strip() or "tushare_daily"
+
+    def _raw_stale_days(self) -> int:
+        return int(getattr(self, "raw_max_stale_trading_days", self._int("tushare_raw_max_stale_trading_days", 2, 0, 10)))
+
+    def _raw_chunk(self) -> int:
+        return max(1, int(getattr(self, "raw_chunk_size", self._int("tushare_raw_chunk_size", 500, 50, 2000))))
+
+    def _raw_lookback(self) -> int:
+        return int(getattr(self, "raw_session_count", getattr(self, "raw_lookback_days", self._int("tushare_raw_lookback_days", 120, 1, 366))))
+
+    @staticmethod
+    def _bulk_value(result, key: str, default=None):
+        if isinstance(result, dict):
+            return result.get(key, default)
+        return getattr(result, key, default)
+
+    @staticmethod
+    def _canonical_screen_date(value: str) -> str | None:
+        text = str(value or "").strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            digits = text.replace("-", "")
+        elif re.fullmatch(r"\d{8}", text):
+            digits = text
+        else:
+            return None
+        try:
+            return datetime.strptime(digits, "%Y%m%d").date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _raw_diagnostics(self, values: dict | None = None) -> dict[str, object]:
+        diagnostics = dict(values or {})
+        for key in ("network_failed", "history_invalid", "cache_basis_rejected"):
+            try:
+                diagnostics[key] = int(diagnostics.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                diagnostics[key] = 0
+        return diagnostics
+
+    def _read_fresh_raw_history(self, codes, as_of: str) -> tuple[dict[str, list[dict]], dict, str]:
+        """Read one active raw generation, never a legacy history table."""
+        raw_history = getattr(self.store, "raw_history", None)
+        read_active = getattr(self.store, "read_active_raw_bars", None)
+        active_lookup = getattr(self.store, "active_raw_batch", None)
+        active = None
+        if callable(active_lookup):
+            try:
+                active = active_lookup(
+                    self._raw_dataset(),
+                    as_of=as_of,
+                    max_stale_trading_days=self._raw_stale_days(),
+                )
+            except TypeError:
+                try:
+                    active = active_lookup(self._raw_dataset(), as_of=as_of)
+                except Exception:
+                    active = None
+            except Exception:
+                active = None
+        if active and active.get("fresh") is False:
+            basis = str(active.get("basis") or active.get("dataset_basis") or "").strip().lower()
+            return {}, active, "cache_basis_rejected" if basis and basis != "unadjusted" else "stale"
+        try:
+            if callable(raw_history):
+                try:
+                    value = raw_history(
+                        codes,
+                        as_of=as_of,
+                        dataset_key=self._raw_dataset(),
+                        max_stale_trading_days=self._raw_stale_days(),
+                    )
+                except TypeError:
+                    value = raw_history(codes, as_of=as_of)
+                if isinstance(value, tuple) and len(value) == 2:
+                    bars, provenance = value
+                else:
+                    bars, provenance = value, {}
+            elif callable(read_active):
+                try:
+                    bars = read_active(
+                        codes,
+                        as_of=as_of,
+                        dataset_key=self._raw_dataset(),
+                        max_stale_trading_days=self._raw_stale_days(),
+                    )
+                except TypeError:
+                    bars = read_active(codes, as_of=as_of)
+                provenance = {}
+            else:
+                return {}, active or {}, "unavailable"
+        except (RuntimeError, ValueError, TypeError, KeyError):
+            return {}, active or {}, "invalid"
+        if not isinstance(bars, dict):
+            return {}, provenance if isinstance(provenance, dict) else {}, "unavailable"
+        provenance = provenance if isinstance(provenance, dict) else {}
+        if active:
+            provenance = {**active, **provenance}
+        provenance_basis = str(provenance.get("basis") or provenance.get("price_basis") or "").strip().lower()
+        provenance_source = str(provenance.get("source") or "").strip().lower()
+        if provenance_basis and provenance_basis != "unadjusted":
+            return {}, provenance, "cache_basis_rejected"
+        if provenance_source and provenance_source != "tushare":
+            return {}, provenance, "invalid"
+        if not bars:
+            return {}, provenance, "unavailable"
+        return bars, provenance, "ok"
+
+    @staticmethod
+    def _raw_indicator_rows(rows, *, expected_code: str = "") -> tuple[list[dict], str | None]:
+        """Adapt raw rows to the indicator API while enforcing provenance."""
+        expected = str(expected_code or "").strip().lower()
+        if "." in expected:
+            expected = expected.split(".", 1)[0]
+        expected = normalize_code(expected)
+        if expected and not re.fullmatch(r"\d{6}", expected):
+            return [], "invalid"
+        normalized: list[dict] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                return [], "invalid"
+            basis = str(row.get("price_basis") or row.get("basis") or "").strip().lower()
+            source = str(row.get("source") or "").strip().lower()
+            if basis != "unadjusted":
+                return [], "basis"
+            if source != "tushare":
+                return [], "source"
+            trade_date = Main._canonical_screen_date(row.get("trade_date"))
+            raw_code = str(row.get("code") or row.get("ts_code") or "").strip().lower()
+            if "." in raw_code:
+                raw_code = raw_code.split(".", 1)[0]
+            code = normalize_code(raw_code)
+            if not trade_date or not re.fullmatch(r"\d{6}", code) or (expected and code != expected):
+                return [], "invalid"
+            try:
+                numeric = {
+                    "open": float(row.get("open")),
+                    "high": float(row.get("high")),
+                    "low": float(row.get("low")),
+                    "close": float(row.get("close")),
+                    "pre_close": float(row.get("pre_close") if row.get("pre_close") is not None else row.get("prev_close")),
+                    "pct_change": float(row.get("pct_change") if row.get("pct_change") is not None else row.get("pct_chg")),
+                    "volume": float(row.get("volume") if row.get("volume") is not None else row.get("vol") or 0),
+                    "amount": float(row.get("amount") or 0),
+                }
+            except (TypeError, ValueError, OverflowError):
+                return [], "invalid"
+            if (
+                not all(math.isfinite(value) for value in numeric.values())
+                or any(numeric[key] <= 0 for key in ("open", "high", "low", "close", "pre_close"))
+                or numeric["volume"] < 0
+                or numeric["amount"] < 0
+                or numeric["high"] < max(numeric["open"], numeric["close"])
+                or numeric["low"] > min(numeric["open"], numeric["close"])
+                or numeric["high"] < numeric["low"]
+                or abs(numeric["pct_change"] - (numeric["close"] / numeric["pre_close"] - 1) * 100) > 0.35
+            ):
+                return [], "invalid"
+            item = dict(row)
+            item["trade_date"] = trade_date
+            item["code"] = code
+            item["price_basis"] = "unadjusted"
+            item["source"] = "tushare"
+            normalized.append(item)
+        return normalized, None
+
+    @staticmethod
+    def _quotes_from_raw_bars(bars: dict[str, list[dict]], requested_date: str = "") -> tuple[list, str | None]:
+        requested = Main._canonical_screen_date(requested_date) if requested_date else ""
+        latest_by_code: dict[str, dict] = {}
+        for raw_code, rows in (bars or {}).items():
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                cleaned, rejection = Main._raw_indicator_rows([row], expected_code=raw_code)
+                if rejection or not cleaned:
+                    continue
+                row = cleaned[0]
+                trade_date = Main._canonical_screen_date(row.get("trade_date"))
+                code = normalize_code(str(row.get("code") or ""))
+                if not re.fullmatch(r"\d{6}", code):
+                    continue
+                if not trade_date or not code or (requested and trade_date > requested):
+                    continue
+                current = latest_by_code.get(code)
+                current_date = Main._canonical_screen_date(current.get("trade_date")) if current else None
+                if current is None or (current_date and current_date < trade_date):
+                    latest_by_code[code] = row
+        if not latest_by_code:
+            return [], None
+        actual_date = max(Main._canonical_screen_date(row.get("trade_date")) for row in latest_by_code.values())
+        now = datetime.now(CHINA_TZ)
+        quotes = []
+        for code, row in sorted(latest_by_code.items()):
+            if Main._canonical_screen_date(row.get("trade_date")) != actual_date:
+                continue
+            try:
+                quote = Quote(
+                    code,
+                    str(row.get("name") or code),
+                    float(row.get("close")),
+                    float(row.get("pre_close") or row.get("prev_close") or 0),
+                    float(row.get("amount") or 0),
+                    float(row.get("pct_change") if row.get("pct_change") is not None else row.get("pct_chg") or 0),
+                    float(row.get("volume") or row.get("vol") or 0),
+                    source="tushare",
+                    provider_ts=now,
+                    fetched_at=now,
+                    indicator_last_date=actual_date,
+                    indicator_last_close=float(row.get("close")),
+                    indicator_price_basis="unadjusted",
+                    indicator_source="tushare",
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            quotes.append(quote)
+        return quotes, actual_date
+
+    def _fresh_raw_snapshot(self, requested_date: str) -> tuple[list, str | None, dict, str]:
+        bars, provenance, state = self._read_fresh_raw_history(None, requested_date)
+        if state != "ok":
+            return [], None, provenance, state
+        quotes, actual_date = self._quotes_from_raw_bars(bars, requested_date)
+        return quotes, actual_date, provenance, "ok" if quotes else "unavailable"
+
+    async def _daily_snapshot_tushare(self, trade_date: str) -> tuple[list, bool, str]:
+        """Fetch/publish a raw batch, falling back only to a fresh raw generation."""
+        request_id = f"daily_snapshot:{trade_date}"
+        request = self.store.snapshot_request(request_id) or {}
+        gate, retry_at = self._snapshot_request_gate(request)
+
+        def cache_result() -> tuple[list, bool, str]:
+            quotes, actual_date, provenance, state = self._fresh_raw_snapshot(trade_date)
+            diagnostics = self._raw_diagnostics(self._last_screen_diagnostics)
+            provider_diagnostics = getattr(self.quotes, "last_diagnostics", None)
+            if isinstance(provider_diagnostics, dict):
+                provider_diagnostics = self._raw_diagnostics(provider_diagnostics)
+                for key, value in provider_diagnostics.items():
+                    if key not in diagnostics or value not in (None, 0, False, ""):
+                        diagnostics[key] = value
+            if state == "cache_basis_rejected":
+                diagnostics["cache_basis_rejected"] = int(diagnostics.get("cache_basis_rejected", 0)) + 1
+            if not quotes or not actual_date:
+                diagnostics["history_unavailable"] = True
+                self._last_screen_diagnostics = diagnostics
+                return [], False, trade_date
+            diagnostics.update({
+                "raw_cache": True,
+                "raw_batch_id": provenance.get("batch_id") or provenance.get("active_batch_id"),
+                "raw_generation": provenance.get("generation"),
+                "actual_trade_date": actual_date,
+            })
+            self._raw_screen_provenance = provenance
+            self._last_screen_diagnostics = diagnostics
+            try:
+                self.store.save_daily_quotes(trade_date=actual_date, quotes=quotes, keep_days=self._int("daily_cache_keep_days", 180, 7, 730))
+            except TypeError:
+                try:
+                    self.store.save_daily_quotes(actual_date, quotes, self._int("daily_cache_keep_days", 180, 7, 730))
+                except Exception:
+                    pass
+            try:
+                self.store.save_snapshot_meta(
+                    actual_date, "tushare", "cached", False, trade_date,
+                    "网络失败，仅使用不超过两个交易日的 raw 缓存",
+                    attempts=int(request.get("attempts") or 0), state="partial", terminal=False,
+                )
+                self.store.save_snapshot_request(
+                    request_id, trade_date, actual_trade_date=actual_date, state="retry",
+                    attempts=int(request.get("attempts") or 0), source="tushare", quality="cached",
+                    last_error="network failure; fresh raw cache used", next_retry_at=self._daily_retry_after.isoformat() if self._daily_retry_after else None,
+                    terminal=False,
+                )
+            except Exception:
+                pass
+            return quotes, False, actual_date
+
+        if gate != "allow":
+            self._daily_retry_after = retry_at or (datetime.now(CHINA_TZ) + timedelta(minutes=5))
+            return cache_result()
+        async with self._daily_snapshot_lock:
+            request = self.store.snapshot_request(request_id) or {}
+            gate, retry_at = self._snapshot_request_gate(request)
+            if gate != "allow":
+                self._daily_retry_after = retry_at or (datetime.now(CHINA_TZ) + timedelta(minutes=5))
+                return cache_result()
+            attempts = int(request.get("attempts") or 0) + 1
+            self.store.save_snapshot_request(request_id, trade_date, state="fetching", attempts=attempts, source="tushare", quality="unknown")
+            fetch_bulk = getattr(self.quotes, "fetch_bulk_daily_result", None)
+            result = None
+            try:
+                if not callable(fetch_bulk):
+                    raise TushareBulkError("Tushare bulk provider is unavailable")
+                result = await fetch_bulk(trade_date, session_count=int(getattr(self, "raw_session_count", 120)))
+            except (TushareCircuitOpen, httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
+                self._last_screen_diagnostics = {"network_failed": 1, "history_invalid": 0, "cache_basis_rejected": 0, "error": str(exc)[:240]}
+                self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                return cache_result()
+            except (TushareBulkError, ValueError, TypeError, KeyError) as exc:
+                self._last_screen_diagnostics = {"network_failed": 0, "history_invalid": 1, "cache_basis_rejected": 0, "error": str(exc)[:240]}
+                self.store.save_snapshot_request(request_id, trade_date, state="failed", attempts=attempts, source="tushare", quality="unknown", last_error=str(exc)[:240], next_retry_at=None, terminal=False)
+                return [], False, trade_date
+            except Exception as exc:
+                self._last_screen_diagnostics = {"network_failed": 1, "history_invalid": 0, "cache_basis_rejected": 0, "error": str(exc)[:240]}
+                self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                return cache_result()
+
+            diagnostics = self._raw_diagnostics(self._bulk_value(result, "diagnostics", {}))
+            quotes = list(self._bulk_value(result, "quotes", []) or [])
+            actual_date = self._canonical_screen_date(self._bulk_value(result, "trade_date", ""))
+            batch_id = self._bulk_value(result, "batch_id")
+            complete = bool(self._bulk_value(result, "complete", False)) and bool(batch_id)
+            if not quotes or not actual_date:
+                if diagnostics.get("network_failed"):
+                    self._last_screen_diagnostics = diagnostics
+                    self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
+                    return cache_result()
+                diagnostics["history_unavailable"] = True
+                self._last_screen_diagnostics = diagnostics
+                self.store.save_snapshot_request(request_id, trade_date, state="failed", attempts=attempts, source="tushare", quality="unknown", last_error="bulk result had no usable quotes", next_retry_at=None, terminal=False)
+                return [], False, trade_date
+            if actual_date > trade_date:
+                diagnostics["history_invalid"] = int(diagnostics.get("history_invalid", 0)) + 1
+                self._last_screen_diagnostics = diagnostics
+                return [], False, trade_date
+            if not complete:
+                diagnostics["history_unavailable"] = True
+                self._last_screen_diagnostics = diagnostics
+                self.store.save_snapshot_request(
+                    request_id, trade_date, state="failed", attempts=attempts, source="tushare", quality="unknown",
+                    last_error="raw batch was not completely published", next_retry_at=None, terminal=False,
+                )
+                return [], False, trade_date
+            # A shadow batch is validated storage, but it is deliberately not
+            # the active generation.  Do not combine its snapshot quotes with
+            # indicators read from the previous active generation; retry from
+            # that generation instead and keep the screening basis coherent.
+            shadow_value = diagnostics.get("shadow")
+            shadow = shadow_value is True or str(shadow_value or "").strip().lower() in {"1", "true", "yes", "shadow"}
+            if shadow:
+                diagnostics["history_invalid"] = int(diagnostics.get("history_invalid", 0) or 0) + 1
+                diagnostics["raw_shadow_rejected"] = True
+                self._last_screen_diagnostics = diagnostics
+                return cache_result()
+            generation = diagnostics.get("generation") or diagnostics.get("raw_generation")
+            dataset_id = diagnostics.get("dataset_id")
+            self._raw_screen_provenance = {
+                "batch_id": batch_id,
+                "dataset_id": dataset_id,
+                "generation": generation,
+                "source": "tushare",
+                "basis": "unadjusted",
+                "actual_trade_date": actual_date,
+            }
+            diagnostics.update({
+                "raw_cache": False,
+                "raw_batch_id": batch_id,
+                "raw_generation": generation,
+                "actual_trade_date": actual_date,
+                "history_unavailable": False,
+            })
+            self._last_screen_diagnostics = diagnostics
+            try:
+                self.store.save_daily_quotes(actual_date, quotes, self._int("daily_cache_keep_days", 180, 7, 730))
+                self.store.save_snapshot_meta(
+                    actual_date, "tushare", "good" if complete else "partial", complete and actual_date == trade_date,
+                    trade_date, "" if complete and actual_date == trade_date else "raw 批次未能完整发布或使用了较早交易日",
+                    attempts=attempts, state="complete" if complete and actual_date == trade_date else "partial", terminal=complete and actual_date == trade_date,
+                )
+                self.store.save_snapshot_request(
+                    request_id, trade_date, actual_trade_date=actual_date,
+                    state="complete" if complete and actual_date == trade_date else "partial", attempts=attempts,
+                    source="tushare", quality="good" if complete else "partial",
+                    next_retry_at=None if complete and actual_date == trade_date else (datetime.now(CHINA_TZ) + timedelta(minutes=5)).isoformat(),
+                    terminal=complete and actual_date == trade_date,
+                )
+            except Exception:
+                pass
+            self._daily_retry_after = None if complete and actual_date == trade_date else datetime.now(CHINA_TZ) + timedelta(minutes=5)
+            return quotes, bool(complete and actual_date == trade_date), actual_date
+
     async def _score_quotes(
         self,
         quotes,
@@ -515,60 +969,104 @@ class Main(Star):
         deep_limit = self._int("deep_screen_limit", 300, 1, 1000)
         enrich_targets = tradable[:deep_limit]
         before = as_of or datetime.now(CHINA_TZ).date().isoformat()
-        load_daily_bars = getattr(self.store, "latest_daily_bars", None)
-        persistent = load_daily_bars([q.code for q in enrich_targets], before_or_equal=before, limit=60) if enrich_targets and callable(load_daily_bars) else {}
-        if not isinstance(persistent, dict):
-            persistent = {}
         indicator_status: dict[str, str] = {}
-        network_targets = []
-        for quote in enrich_targets:
-            # Let the indicator calculator see the complete cached batch so a
-            # mixed basis/source set fails closed instead of being reduced to
-            # a seemingly valid subset first.
-            cached_rows = persistent.get(quote.code, [])
-            try:
-                bars = list(cached_rows or [])
-            except TypeError:
-                bars = []
-            if apply_daily_indicators(quote, bars):
-                indicator_status[quote.code] = "persistent_cache"
-            else:
-                network_targets.append(quote)
-        if network_targets:
-            concurrency = self._int("max_concurrency", 8, 1, 64)
-            try:
-                fetched = await self.quotes.enrich_indicators(network_targets, concurrency, as_of)
-            except TypeError as exc:
-                # Keep lightweight integrations written against the pre-v0.12
-                # two-argument provider API usable without hiding other errors.
+        persistent: dict[str, list[dict]] = {}
+        history_reason = ""
+        raw_mode = self._tushare_mode()
+        raw_diagnostics = self._raw_diagnostics(self._last_screen_diagnostics) if raw_mode else {}
+        prior_history_unavailable = bool(self._last_screen_diagnostics.get("history_unavailable")) if raw_mode else False
+        if raw_mode:
+            # Tushare mode has one historical source: the currently active,
+            # point-in-time raw generation.  Work in bounded chunks so a large
+            # market snapshot does not create one task or one temporary list
+            # per symbol, and never invoke the legacy per-symbol loader.
+            persistent, provenance, history_reason = self._read_fresh_raw_history(
+                [q.code for q in enrich_targets], before,
+            )
+            self._raw_screen_provenance = provenance
+            chunk_size = self._raw_chunk()
+            for offset in range(0, len(enrich_targets), chunk_size):
+                for quote in enrich_targets[offset:offset + chunk_size]:
+                    cached_rows = persistent.get(quote.code, [])
+                    bars, rejection = self._raw_indicator_rows(cached_rows, expected_code=quote.code)
+                    if rejection == "basis":
+                        history_reason = "cache_basis_rejected"
+                    elif rejection:
+                        history_reason = "invalid"
+                    if apply_daily_indicators(quote, bars):
+                        indicator_status[quote.code] = "raw_batch"
+                    else:
+                        indicator_status[quote.code] = "history_failed"
+        else:
+            load_daily_bars = getattr(self.store, "latest_daily_bars", None)
+            persistent = load_daily_bars([q.code for q in enrich_targets], before_or_equal=before, limit=60) if enrich_targets and callable(load_daily_bars) else {}
+            if not isinstance(persistent, dict):
+                persistent = {}
+            network_targets = []
+            for quote in enrich_targets:
+                # Let the indicator calculator see the complete cached batch so a
+                # mixed basis/source set fails closed instead of being reduced to
+                # a seemingly valid subset first.
+                cached_rows = persistent.get(quote.code, [])
                 try:
-                    fetched = await self.quotes.enrich_indicators(network_targets, concurrency)
+                    bars = list(cached_rows or [])
                 except TypeError:
-                    raise exc
-            if not isinstance(fetched, dict):
-                fetched = {}
-            for quote in network_targets:
-                indicator_status[quote.code] = fetched.get(quote.code, "failed")
-                history_bars = getattr(self.quotes, "history_bars", {})
-                bars = history_bars.get(quote.code, []) if isinstance(history_bars, dict) else []
-                save_daily_bars = getattr(self.store, "save_daily_bars", None)
-                if bars and callable(save_daily_bars):
-                    save_daily_bars(quote.code, bars, "eastmoney_indicator", "unadjusted")
+                    bars = []
+                if apply_daily_indicators(quote, bars):
+                    indicator_status[quote.code] = "persistent_cache"
+                else:
+                    network_targets.append(quote)
+            if network_targets:
+                concurrency = self._int("max_concurrency", 8, 1, 64)
+                try:
+                    fetched = await self.quotes.enrich_indicators(network_targets, concurrency, as_of)
+                except TypeError as exc:
+                    # Keep lightweight integrations written against the pre-v0.12
+                    # two-argument provider API usable without hiding other errors.
+                    try:
+                        fetched = await self.quotes.enrich_indicators(network_targets, concurrency)
+                    except TypeError:
+                        raise exc
+                if not isinstance(fetched, dict):
+                    fetched = {}
+                for quote in network_targets:
+                    indicator_status[quote.code] = fetched.get(quote.code, "failed")
+                    history_bars = getattr(self.quotes, "history_bars", {})
+                    bars = history_bars.get(quote.code, []) if isinstance(history_bars, dict) else []
+                    save_daily_bars = getattr(self.store, "save_daily_bars", None)
+                    if bars and callable(save_daily_bars):
+                        save_daily_bars(quote.code, bars, "eastmoney_indicator", "unadjusted")
         indicator_counts = {
             "network": sum(1 for value in indicator_status.values() if value == "network"),
             "memory_cache": sum(1 for value in indicator_status.values() if value == "memory_cache"),
             "persistent_cache": sum(1 for value in indicator_status.values() if value == "persistent_cache"),
-            "failed": sum(1 for value in indicator_status.values() if value not in {"network", "memory_cache", "persistent_cache"}),
+            "raw_batch": sum(1 for value in indicator_status.values() if value == "raw_batch"),
+            "failed": sum(1 for value in indicator_status.values() if value not in {"network", "memory_cache", "persistent_cache", "raw_batch"}),
         }
-        enriched = sum(indicator_counts[key] for key in ("network", "memory_cache", "persistent_cache"))
+        enriched = sum(indicator_counts[key] for key in ("network", "memory_cache", "persistent_cache", "raw_batch"))
         coverage = enriched / len(enrich_targets) if enrich_targets else 0.0
         self._last_screen_diagnostics = {
             "input": len(quotes), "tradable": len(tradable), "deep_screen_limit": deep_limit,
             "indicator_targets": len(enrich_targets), "indicator_network": indicator_counts["network"],
             "indicator_memory_cache": indicator_counts["memory_cache"], "indicator_persistent_cache": indicator_counts["persistent_cache"],
-            "indicator_failed": indicator_counts["failed"], "enriched": enriched,
+            "indicator_raw_batch": indicator_counts["raw_batch"], "indicator_failed": indicator_counts["failed"], "enriched": enriched,
             "indicator_coverage": round(coverage, 4),
         }
+        if raw_mode:
+            self._last_screen_diagnostics.update({
+                "raw_dataset_key": self._raw_dataset(),
+                "raw_batch_id": self._raw_screen_provenance.get("batch_id") or self._raw_screen_provenance.get("active_batch_id"),
+                "raw_generation": self._raw_screen_provenance.get("generation"),
+                "network_failed": int(raw_diagnostics.get("network_failed", 0) or 0),
+                "history_invalid": int(raw_diagnostics.get("history_invalid", 0) or 0),
+                "cache_basis_rejected": int(raw_diagnostics.get("cache_basis_rejected", 0) or 0),
+                "history_unavailable": prior_history_unavailable or (bool(enrich_targets) and (not bool(persistent) or not bool(enriched))),
+                "history_missing": max(0, len(enrich_targets) - enriched),
+            })
+            if history_reason == "cache_basis_rejected":
+                self._last_screen_diagnostics["cache_basis_rejected"] = int(self._last_screen_diagnostics.get("cache_basis_rejected", 0)) + 1
+            elif history_reason in {"invalid", "source"}:
+                self._last_screen_diagnostics["history_invalid"] = int(self._last_screen_diagnostics.get("history_invalid", 0)) + 1
         # Scores are only produced for deep-screen objects, never for the
         # entire cheap-filter universe.
         scored = []
@@ -761,12 +1259,25 @@ class Main(Star):
     async def _scan(self, codes: list[str], limit: int, *, record: bool = True, job_name: str = "manual_screen"):
         """Fetch and score one logical run; manual /选股 is durable too."""
         requested_date = datetime.now(CHINA_TZ).date().isoformat()
+        actual_date = requested_date
         quotes = []
         candidates = []
         status, quality, error = "completed", "partial", None
         try:
-            quotes = await self.quotes.fetch_quotes(codes)
-            candidates = await self._score_quotes(quotes, limit, requested_date, context="daily_close")
+            if self._tushare_mode():
+                quotes, _fetched, fetched_date = await self._daily_snapshot(requested_date)
+                requested_codes = set(parse_codes(codes))
+                if requested_codes:
+                    quotes = [quote for quote in quotes if quote.code in requested_codes]
+                actual_date = self._canonical_screen_date(fetched_date) or requested_date
+                if actual_date > requested_date:
+                    raise ValueError("snapshot actual date is after requested date")
+                if not quotes:
+                    self._last_screen_diagnostics.setdefault("history_unavailable", True)
+            else:
+                quotes = await self.quotes.fetch_quotes(codes)
+                actual_date = requested_date
+            candidates = await self._score_quotes(quotes, limit, actual_date, context="daily_close")
             floor = self._float("screen_min_indicator_coverage", 0.8, 0.0, 1.0)
             coverage = float(self._last_screen_diagnostics.get("indicator_coverage", 0.0) or 0.0)
             status = "completed" if coverage >= floor else "degraded"
@@ -775,9 +1286,13 @@ class Main(Star):
             status, quality, error = "failed", "unknown", str(exc)[:240]
             logger.exception("[%s] 选股行情抓取失败", PLUGIN_NAME)
         if record:
-            actual_date = self.store.latest_daily_trade_date(requested_date) or requested_date
+            cached_date = self.store.latest_daily_trade_date(requested_date)
+            if cached_date:
+                cached_date = self._canonical_screen_date(cached_date)
+                if cached_date and cached_date <= requested_date:
+                    actual_date = cached_date
             source = str(getattr(quotes[0], "source", "") if quotes else "") or "universe"
-            self._record_screen(requested_date, actual_date, source, quotes, candidates, status=status, quality=quality, error=error, job_name=job_name)
+            self._record_screen(requested_date, actual_date or requested_date, source, quotes, candidates, status=status, quality=quality, error=error, job_name=job_name)
         return candidates
 
     async def _annotate_batch(self, candidates):
@@ -960,6 +1475,8 @@ class Main(Star):
 
     async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
         """Return a snapshot, whether it was fetched now, and its actual trade date."""
+        if self._tushare_mode():
+            return await self._daily_snapshot_tushare(trade_date)
         request_id = f"daily_snapshot:{trade_date}"
         request = self.store.snapshot_request(request_id) or {}
         gate, retry_at = self._snapshot_request_gate(request)
@@ -1112,6 +1629,17 @@ class Main(Star):
             return self.store.daily_quotes(actual_date), fetched, actual_date
 
     async def _daily_candidates(self, limit: int):
+        if self._tushare_mode():
+            trade_date = datetime.now(CHINA_TZ).date().isoformat()
+            try:
+                cached, _, actual_date = await self._daily_snapshot(trade_date)
+            except Exception:
+                logger.exception("[%s] Tushare raw 快照失败", PLUGIN_NAME)
+                cached, actual_date = [], trade_date
+            if cached:
+                return await self._score_quotes(cached, limit, actual_date or trade_date, context="daily_close")
+            self._last_screen_diagnostics.setdefault("history_unavailable", True)
+            return []
         if self._bool("daily_cache_enabled", True):
             trade_date = datetime.now(CHINA_TZ).date().isoformat()
             try:
@@ -1137,6 +1665,14 @@ class Main(Star):
         *,
         job_name: str = "daily_screen",
     ) -> str:
+        requested_value = self._canonical_screen_date(requested_date)
+        actual_value = self._canonical_screen_date(actual_date) if actual_date else None
+        today_value = datetime.now(CHINA_TZ).date().isoformat()
+        if not requested_value or not actual_value:
+            raise ValueError("screen run dates must be canonical")
+        if requested_value > today_value or actual_value > today_value or actual_value > requested_value:
+            raise ValueError("screen run dates violate requested/actual bounds")
+        requested_date, actual_date = requested_value, actual_value
         run_id = uuid.uuid4().hex
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         diagnostics = dict(self._last_screen_diagnostics or {})
@@ -1470,7 +2006,10 @@ class Main(Star):
         limit = max(1, min(int(count or self._int("candidate_limit", 30, 1, 100)), 100))
         trade_date = datetime.now(CHINA_TZ).date().isoformat()
         try:
-            if self._bool("daily_cache_enabled", True):
+            if self._tushare_mode():
+                quotes, fetched, actual_date = await self._daily_snapshot(trade_date)
+                source = ("已同步交易日 " if fetched else "已使用交易日 ") + actual_date + " 全市场数据"
+            elif self._bool("daily_cache_enabled", True):
                 quotes, fetched, actual_date = await self._daily_snapshot(trade_date)
                 source = ("已同步交易日 " if fetched else "已使用交易日 ") + actual_date + " 全市场数据"
             else:
@@ -1680,10 +2219,46 @@ class Main(Star):
         evaluated = 0
         details = []
         returns = []
+        raw_mode = self._tushare_mode()
         load_base_quotes = getattr(self.store, "daily_quotes", None)
-        base = load_base_quotes(as_of) if callable(load_base_quotes) else []
+        base = load_base_quotes(as_of) if not raw_mode and callable(load_base_quotes) else []
         if not isinstance(base, list):
             base = []
+        evaluation_bars: dict[str, list[dict]] = {}
+        evaluation_available = False
+        evaluation_dataset_id = None
+        evaluation_batch_id = None
+        evaluation_generation = None
+        if raw_mode:
+            raw_codes = [str(row.get("code") or "").strip() for row in rows if str(row.get("code") or "").strip()]
+            fetch_evaluation = getattr(self.quotes, "fetch_evaluation_daily_result", None)
+            if not callable(fetch_evaluation):
+                fetch_evaluation = getattr(self.quotes, "fetch_evaluation_daily", None)
+            if callable(fetch_evaluation) and raw_codes:
+                try:
+                    try:
+                        evaluation = await fetch_evaluation(as_of, horizon, codes=raw_codes)
+                    except TypeError:
+                        evaluation = await fetch_evaluation(as_of, horizon)
+                    evaluation_diagnostics = self._raw_diagnostics(self._bulk_value(evaluation, "diagnostics", {}))
+                    evaluation_bars = self._bulk_value(evaluation, "bars", {}) or {}
+                    evaluation_dataset_id = evaluation_diagnostics.get("dataset_id") or self._bulk_value(evaluation, "dataset_id", None)
+                    evaluation_batch_id = evaluation_diagnostics.get("batch_id") or self._bulk_value(evaluation, "batch_id", None)
+                    evaluation_generation = evaluation_diagnostics.get("generation") or self._bulk_value(evaluation, "generation", None)
+                    evaluation_available = bool(self._bulk_value(evaluation, "complete", False)) and isinstance(evaluation_bars, dict)
+                    if str(evaluation_diagnostics.get("evaluation", "")).lower() not in {"true", "1"}:
+                        evaluation_available = False
+                    if not str(evaluation_diagnostics.get("dataset_key") or "").strip().lower().endswith("_evaluation"):
+                        evaluation_available = False
+                    try:
+                        evaluation_available = evaluation_available and bool(str(evaluation_dataset_id or "").strip()) and bool(str(evaluation_batch_id or "").strip()) and int(evaluation_generation) > 0
+                    except (TypeError, ValueError, OverflowError):
+                        evaluation_available = False
+                    if not evaluation_available:
+                        evaluation_bars = {}
+                except (TushareCircuitOpen, TushareBulkError, httpx.HTTPError, asyncio.TimeoutError, OSError, ValueError, TypeError, KeyError):
+                    evaluation_available = False
+                    evaluation_bars = {}
         for row in rows:
             plan = self._price_plan_from_payload(str(row.get("price_plan") or ""))
             if not price_plan_is_validated(plan):
@@ -1695,26 +2270,50 @@ class Main(Star):
             code = str(row.get("code") or "").strip()
             if not code:
                 continue
-            base_quote = next((q for q in base if getattr(q, "code", "") == code), None)
-            # This is deliberately evaluation-only. It never changes a prior screen.
-            if base_quote:
-                evaluation_end = (as_of_date + timedelta(days=horizon * 3 + 7)).isoformat()
+            if raw_mode:
+                # Replay the exact generation that produced the plan.  The
+                # active generation may have advanced since the original
+                # screen, and legacy daily_bars are not a valid substitute.
+                raw_batch_id = provenance.get("batch_id") or provenance.get("raw_batch_id")
+                load_raw_batch = getattr(self.store, "raw_batch_bars", None)
+                if not raw_batch_id or not callable(load_raw_batch):
+                    continue
                 try:
-                    await self.quotes.enrich_indicators([base_quote], 1, evaluation_end)
-                except TypeError as exc:
+                    base_rows = load_raw_batch(raw_batch_id, [code], before_or_equal=as_of)
+                    base_candidates, _ = self._quotes_from_raw_bars(base_rows, as_of)
+                    base_quote = next((item for item in base_candidates if item.code == code and item.indicator_last_date == as_of), None)
+                    # Future bars come from a separate evaluation generation;
+                    # the screening batch is immutable at the candidate date.
+                    raw_future = evaluation_bars.get(code, []) if evaluation_available else []
+                except (RuntimeError, ValueError, TypeError, KeyError):
+                    continue
+            else:
+                base_quote = next((q for q in base if getattr(q, "code", "") == code), None)
+                # This is deliberately evaluation-only. It never changes a prior screen.
+                if base_quote:
+                    evaluation_end = (as_of_date + timedelta(days=horizon * 3 + 7)).isoformat()
                     try:
-                        await self.quotes.enrich_indicators([base_quote], 1)
-                    except TypeError:
-                        raise exc
-                history_bars = getattr(self.quotes, "history_bars", {})
-                bars = self._unadjusted_bars(history_bars.get(base_quote.code, []) if isinstance(history_bars, dict) else [])
-                save_daily_bars = getattr(self.store, "save_daily_bars", None)
-                if bars and callable(save_daily_bars):
-                    save_daily_bars(base_quote.code, bars, "eastmoney_evaluation", "unadjusted")
-            load_future_bars = getattr(self.store, "daily_bars", None)
-            raw_future = load_future_bars(code, after=as_of) if callable(load_future_bars) else []
+                        await self.quotes.enrich_indicators([base_quote], 1, evaluation_end)
+                    except TypeError as exc:
+                        try:
+                            await self.quotes.enrich_indicators([base_quote], 1)
+                        except TypeError:
+                            raise exc
+                    history_bars = getattr(self.quotes, "history_bars", {})
+                    bars = self._unadjusted_bars(history_bars.get(base_quote.code, []) if isinstance(history_bars, dict) else [])
+                    save_daily_bars = getattr(self.store, "save_daily_bars", None)
+                    if bars and callable(save_daily_bars):
+                        save_daily_bars(base_quote.code, bars, "eastmoney_evaluation", "unadjusted")
+                load_future_bars = getattr(self.store, "daily_bars", None)
+                raw_future = load_future_bars(code, after=as_of) if callable(load_future_bars) else []
             future = []
-            for item in self._unadjusted_bars(raw_future):
+            future_rows = raw_future
+            if raw_mode:
+                future_rows, _ = self._raw_indicator_rows(raw_future, expected_code=code)
+            for item in self._unadjusted_bars(future_rows):
+                row_date = self._canonical_screen_date(item.get("trade_date")) if isinstance(item, dict) else None
+                if not row_date or row_date <= as_of or row_date > datetime.now(CHINA_TZ).date().isoformat():
+                    continue
                 try:
                     values = {key: float(item[key]) for key in ("open", "high", "low", "close")}
                     if not all(math.isfinite(value) and value > 0 for value in values.values()):
@@ -1754,12 +2353,21 @@ class Main(Star):
                     break
             save_evaluation = getattr(self.store, "save_result_evaluation", None)
             if callable(save_evaluation):
-                save_evaluation(f"{run_id}:{code}:{horizon}", run_id, code, as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), first_touch, True, "unadjusted", True)
+                values = (f"{run_id}:{code}:{horizon}", run_id, code, as_of, horizon, "complete", last["close"], ret, max(highs), min(lows), first_touch, True, "unadjusted", True)
+                try:
+                    save_evaluation(*values, evaluation_dataset_id=evaluation_dataset_id, evaluation_batch_id=evaluation_batch_id, evaluation_generation=evaluation_generation)
+                except TypeError:
+                    # Keep lightweight pre-v0.13 store adapters usable while
+                    # the built-in store records the full evaluation lineage.
+                    save_evaluation(*values)
             evaluated += 1
             returns.append(ret)
             details.append(f"{row.get('name') or code}（{code}）：{ret:+.2f}%｜最大浮盈{max(highs):+.2f}%｜最大回撤{min(lows):+.2f}%｜关键位{first_touch or '未触达'}")
         if not details:
-            yield event.plain_result(f"验证暂不可用：候选后续 K 线不足 {horizon} 个交易日。")
+            if raw_mode and not evaluation_available:
+                yield event.plain_result(f"验证暂不可用：未取得独立、已校验的未来 raw K 线，不能从筛选批次推断后续 {horizon} 个交易日。")
+            else:
+                yield event.plain_result(f"验证暂不可用：候选后续 K 线不足 {horizon} 个交易日。")
             return
         avg = sum(returns) / len(returns)
         yield event.plain_result(f"回放验证（仅研究）：基准日 {as_of}，周期 {horizon} 日，完成 {evaluated} 条，平均收益{avg:+.2f}%\n" + "\n".join(details[:20]))
@@ -1915,14 +2523,22 @@ class Main(Star):
             return
         try:
             quotes = await self.quotes.fetch_quotes(codes[:10])
-            concurrency = self._int("max_concurrency", 5, 1, 20)
-            try:
-                await self.quotes.enrich_indicators(quotes, concurrency)
-            except TypeError as exc:
+            if self._tushare_mode():
+                as_of = datetime.now(CHINA_TZ).date().isoformat()
+                bars, provenance, _history_state = self._read_fresh_raw_history([quote.code for quote in quotes], as_of)
+                self._raw_screen_provenance = provenance
+                for quote in quotes:
+                    rows, _rejection = self._raw_indicator_rows(bars.get(quote.code, []), expected_code=quote.code)
+                    apply_daily_indicators(quote, rows)
+            else:
+                concurrency = self._int("max_concurrency", 5, 1, 20)
                 try:
-                    await self.quotes.enrich_indicators(quotes, concurrency, "")
-                except TypeError:
-                    raise exc
+                    await self.quotes.enrich_indicators(quotes, concurrency)
+                except TypeError as exc:
+                    try:
+                        await self.quotes.enrich_indicators(quotes, concurrency, "")
+                    except TypeError:
+                        raise exc
             load_candidates = getattr(self.store, "latest_screen_candidates", None)
             rows = load_candidates(self._int("candidate_limit", 30, 1, 100)) if callable(load_candidates) else []
             if not isinstance(rows, list):

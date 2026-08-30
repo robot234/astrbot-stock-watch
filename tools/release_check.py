@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
-EXPECTED_VERSION = "0.12.1"
+EXPECTED_VERSION = "0.13.0"
 TEXT_SUFFIXES = (".py", ".json", ".yaml", ".yml", ".md")
 FORBIDDEN_PATH_PARTS = (
     "tests/",
@@ -79,8 +79,8 @@ def main() -> int:
         return 1
     storage = (ROOT / "storage.py").read_text(encoding="utf-8")
     schema_match = re.search(r"^LATEST_SCHEMA_VERSION\s*=\s*(\d+)\s*$", storage, re.MULTILINE)
-    if not schema_match or schema_match.group(1) != "13":
-        print("FAIL expected LATEST_SCHEMA_VERSION=13")
+    if not schema_match or schema_match.group(1) != "14":
+        print("FAIL expected LATEST_SCHEMA_VERSION=14")
         return 1
 
     tracked = [name.replace("\\", "/") for name in run("git", "ls-files").splitlines() if name]

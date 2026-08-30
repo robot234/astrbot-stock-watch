@@ -9,7 +9,8 @@
 - Tushare 当天暂无数据时自动寻找最近有数据的交易日
 - 盘中轮询自选股，触发信号后推送提醒
 - 盘中行情按会话合并抓取，信号冷却状态持久化到 SQLite
-- SQLite 使用可重复执行的 v7→v13 迁移；交易日、快照请求、候选运行、价位来源和事件均保留状态
+- SQLite 使用可重复执行的 v7→v14 迁移；交易日、快照请求、候选运行、价位来源和事件均保留状态
+- v0.13 的 Tushare 日线采用 append-only raw 批次、活动 generation 和读取 provenance；未完成或校验失败的批次不会切换活动数据
 - 技术指标只使用明确标记为未复权的日线；只有通过交易日、收盘价偏差和价位顺序校验的收盘计划才会用于告警和回放
 - 股票代码和名称共享本地索引；`/行情`、`/自选` 支持已同步名称，名称有歧义时会要求改用更完整名称或代码
 - 连续确认状态持久化到 SQLite，插件重启后可继续累计
@@ -58,6 +59,12 @@
 - `daily_market_url`：自定义全市场快照接口。留空使用东方财富；自定义接口需要返回兼容格式的 JSON，并支持 `pn`、`pz`、`fs`、`fields` 分页参数。
 - `tushare_url`：Tushare Pro 接口地址，通常留空即可，默认使用 `https://api.tushare.pro`。
 - `tushare_token`：Tushare Pro Token。填写后每日快照优先调用 Tushare `daily` 接口；留空则不调用 Tushare，使用东方财富。
+- `tushare_bulk_page_size` / `tushare_retry_attempts`：Tushare `daily` 分页大小和网络/限流重试次数，默认 6000/3。
+- `tushare_bj_calendar_policy`：raw universe 的北交所市场策略。`require_bse` 要求独立 universe 同时包含 `SH`、`SZ`、`BJ`；`sse_fallback` 也保留三市场 universe，但交易日证据统一使用公共 SSE 日历；`exclude` 只允许 `SH`、`SZ` 并过滤 BJ 行。交易日历请求本身使用 SSE 作为公共会话证据，不会因为 `require_bse` 额外探测 BSE。
+- `tushare_raw_dataset_key`：raw 日线数据集标识，默认 `tushare_daily`。
+- `tushare_raw_session_count`：每个 raw 批次保留的目标交易日数量，默认 120；日历查询会按周末和节假日扩展自然日包络。`tushare_raw_lookback_days` 已弃用，仅作为旧配置的交易日数量别名，不再表示自然日范围。`tushare_raw_max_stale_trading_days`：网络失败时允许读取活动 raw 缓存的最大交易日年龄，默认 2 天。
+- `tushare_raw_chunk_size`：raw 历史指标的分块处理大小，默认 500 只。
+- `tushare_raw_min_overall_coverage` / `tushare_raw_min_market_coverage` / `tushare_raw_min_market_median_ratio`：raw 批次全市场和单市场覆盖率门槛，默认 97%/95%/95%；每日数量低于窗口中位数门槛的批次会整体拒绝，不会切换 active generation。每个 raw/evaluation 批次都必须有独立 universe 证据，不能仅凭当前 raw 分区行数自证完整。留空 `tushare_raw_universe_counts` 时，插件会独立读取 Tushare `stock_basic` 的 `L`/`D`/`P` 列表，按目标交易日计算有效 membership，并记录版本、有效日期、市场计数、状态计数、BJ 日历策略、`suspension_method=not_available_ratios_only` 和 canonical digest；这表示暂停状态未单独取得，只能按数量比率做覆盖判断。`tushare_raw_universe_version` 可限制允许的证据版本，留空时使用观测生成的版本；`tushare_raw_require_universe_evidence` 保留为兼容配置，但设为 `false` 也不会关闭 fail-closed 保护。
 - `quote_interval_seconds`：盘中自选股行情轮询间隔，默认 30 秒。
 - `minute_enabled`：是否记录盘中一分钟聚合行情，默认开启；只用于观测和后续指标，不改变现有评分。成交量/额按行情源累计值计算为分钟增量，开始监听前的累计部分不会回溯。
 - `minute_bar_history`：每只股票保留的已完成分钟线数量，默认 120 根。
@@ -105,7 +112,7 @@
 
 - `push_whitelist`：填写 `unified_msg_origin`，多个值用逗号或换行分隔。留空时默认不发送后台推送。
 - `push_max_chars`：单次后台推送的最大字符数，超出时按行拆分发送，默认 3500。
-- `daily_snapshot_min_size`：判定完整收盘快照的最少有效股票数，默认 4000；不足会标为 `partial` 并等待后续补抓。
+- `daily_snapshot_min_size`：判定完整收盘快照的最少有效股票数，默认 4000；Tushare raw 任一交易日低于此数量会整体拒绝并等待后续补抓。
 - `report_candidate_limit`：全市场选股报告默认展示的候选数量，默认 10；完整候选仍可用 `/候选池` 查看。
 - `/候选池 [数量]`：读取当前 active 候选运行，默认展示配置数量、最多 100 只；当前行业按东方财富分类分组，只有带当前分类的记录才使用该标签，旧 `industry_name` 会标为“候选快照行业”，全局编号且每只固定三行。行业标签仅为当前展示分类，不回写历史行业因子；行情涨跌优先按候选实际交易日回补，找不到时显示“涨跌未记录”。
 - 候选池顶部会标注“东方财富当前行业分类，仅展示，非历史因子”、旧记录标注语义和数据日期；长消息按 `push_max_chars` 分段，板块标题会在跨段时重复。
@@ -130,15 +137,15 @@
 ## 数据源说明
 
 - 每日全市场快照默认使用东方财富公开接口，也可以通过 `daily_market_url` 替换。
-- 配置 `tushare_token` 后，每日全市场快照优先使用 Tushare Pro；Tushare 请求失败会退回东方财富。
+- 配置 `tushare_token` 后，每日全市场快照和技术历史只使用 Tushare raw 批次；请求失败时仅在活动 raw generation 不超过 2 个交易日且口径仍为未复权时使用缓存，不会退回东方财富、Tencent 或 legacy `daily_bars`。
 - 盘中自选股默认使用新浪批量行情接口，适合少量自选股轮询。
-- 历史日线和技术指标使用东方财富接口。
+- 未配置 `tushare_token` 时，历史日线仍按兼容旧版路径使用东方财富接口；配置 token 后，历史指标只从活动 Tushare raw generation 计算。
 - 东方财富因子字段仅用于当前研究报告，包含行业标签和部分估值/ROE，质量会标为 `partial`；它不作为历史回放的完整基本面真值。
 - 历史交易日不会使用东方财富的当前财务字段倒灌；插件会优先读取该日期已缓存的因子快照，否则标为未知。
 - `candidate_plan_valid_days`：收盘候选价位计划用于盘中监听的有效天数，默认 10 天。
 - `price_plan_close_tolerance_pct`：收盘计划参考价与未复权日线最后收盘价允许的最大偏差，默认 1%。偏差、日期、口径或价位顺序校验失败时，计划只保留为不可用记录，不会触发价位告警或回放。
 - 盘中价位使用最近一次通过校验的收盘候选保存的价位计划，不会随着盘中重新计算而移动。
-- `/验证 [天数]` 只在验证阶段补抓未复权候选后续 K 线；同一日同时触达多个关键价位时会明确标为“日线无法判断先后”。没有明确校验标记的历史计划不会回放；`/结果` 只展示未复权且校验通过的回放记录。
+- `/验证 [天数]` 从与筛选 generation 隔离的 Tushare evaluation raw 批次读取基准日之后的已完成交易日，不读取 screening batch 的未来行，也不混用 legacy/复权数据；网络和 evaluation 缓存都不可用时会明确报告样本不足。没有明确校验标记的历史计划不会回放；`/结果` 只展示未复权且校验通过的回放记录。
 - 行业强弱由同批已补齐日线的股票计算行业 5 日相对动量、上涨占比和成交活跃度；样本不足会标为未知，不强行加分。
 - Tushare Pro 更适合每日和历史数据，不建议用于高频盘中监听。Token 只填入 AstrBot 配置或环境变量，不要放进 URL 或提交到 GitHub。
 
