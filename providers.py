@@ -40,6 +40,44 @@ class MarketSnapshotResult:
 
 
 @dataclass(slots=True)
+class EastmoneyFallbackResult:
+    """An in-memory, date-verified Eastmoney preview result.
+
+    This result is deliberately separate from ``MarketSnapshotResult`` so a
+    transient fallback cannot be mistaken for a cacheable complete snapshot.
+    Its bars are fetched from the same Eastmoney endpoint family as the
+    quotes and are never handed to ``StockStore`` by the provider.
+    """
+
+    quotes: list[Quote]
+    trade_date: str | None
+    requested_date: str | None = None
+    source: str = "eastmoney"
+    quality: str = "degraded"
+    complete: bool = False
+    diagnostics: dict[str, object] = field(default_factory=dict)
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(CHINA_TZ))
+
+    @property
+    def actual_date(self) -> str | None:
+        """Compatibility spelling used by screen coordinators."""
+        return self.trade_date
+
+    @property
+    def actual_trade_date(self) -> str | None:
+        return self.trade_date
+
+    @property
+    def data_mode(self) -> str:
+        return "eastmoney_transient"
+
+
+# Public aliases keep integrations readable while allowing older callers to
+# discover the result under either the provider or fallback terminology.
+EastmoneySnapshotResult = EastmoneyFallbackResult
+
+
+@dataclass(slots=True)
 class BulkDailyResult:
     """Result of one immutable Tushare raw batch build."""
 
@@ -1957,6 +1995,7 @@ class SinaQuoteProvider:
         self.http = http_runtime or HttpRuntime(timeout, max_concurrency)
         self._indicator_cache: dict[str, tuple[datetime, dict[str, float | None]]] = {}
         self.history_bars: dict[str, list[dict[str, float | str]]] = {}
+        self.last_diagnostics: dict[str, object] = {}
         self._last_tushare_date: str | None = None
         self._tushare_names: dict[str, str] = {}
         self.symbol_store = symbol_store
@@ -2053,7 +2092,9 @@ class SinaQuoteProvider:
         """Expose the immutable Tushare bulk loader to the screen coordinator."""
         if not self.tushare_token:
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics={"network_failed": 0})
-        return await self.bulk_provider.fetch_bulk_daily_result(trade_date, **kwargs)
+        result = await self.bulk_provider.fetch_bulk_daily_result(trade_date, **kwargs)
+        self.last_diagnostics = dict(result.diagnostics or {}) if isinstance(result, BulkDailyResult) else {}
+        return result
 
     async def fetch_bulk_daily(self, trade_date: str = "", **kwargs) -> BulkDailyResult:
         return await self.fetch_bulk_daily_result(trade_date, **kwargs)
@@ -2072,11 +2113,122 @@ class SinaQuoteProvider:
         async with self.http.slot() as client:
             response = await client.get("https://push2his.eastmoney.com/api/qt/stock/kline/get", params=params)
             response.raise_for_status()
-            rows = ((response.json().get("data") or {}).get("klines") or [])
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Eastmoney index response is not an object")
+            data = payload.get("data") or {}
+            if not isinstance(data, dict):
+                raise ValueError("Eastmoney index data is not an object")
+            rows = data.get("klines") or []
         if not rows:
             return None
-        value = str(rows[-1]).split(",", 1)[0].strip()
-        return self._normalize_trade_date(value) if re.fullmatch(r"\d{4}-?\d{2}-?\d{2}", value) else None
+        dates = []
+        for row in rows:
+            value = str(row or "").split(",", 1)[0].strip()
+            canonical = self._canonical_eastmoney_date(value)
+            if canonical:
+                dates.append(canonical)
+        return max(dates) if dates else None
+
+    @staticmethod
+    def _canonical_eastmoney_date(value: str, *, allow_empty: bool = False) -> str | None:
+        text = str(value or "").strip().replace("-", "")
+        if not text:
+            return "" if allow_empty else None
+        if not re.fullmatch(r"\d{8}", text):
+            return None
+        try:
+            parsed = datetime.strptime(text, "%Y%m%d").date()
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed.isoformat()
+
+    async def fetch_eastmoney_fallback_result(
+        self,
+        trade_date: str = "",
+        daily_market_url: str = "",
+    ) -> EastmoneyFallbackResult:
+        """Fetch an EM-only snapshot with a stable, verified actual date.
+
+        The token is intentionally ignored.  The latest Shanghai index bar is
+        observed before and after the snapshot.  A single extra observation
+        is allowed when the two observations race; an unstable or missing
+        date is returned as unusable rather than guessed from a weekday.
+        """
+        requested = self._canonical_eastmoney_date(
+            trade_date or datetime.now(CHINA_TZ).date().isoformat()
+        )
+        if not requested:
+            raise ValueError("Eastmoney fallback requested date is invalid")
+
+        diagnostics: dict[str, object] = {
+            "date_verified": False,
+            "date_observations": 0,
+            "date_race": False,
+            "snapshot_source": "eastmoney",
+        }
+
+        async def observe() -> str | None:
+            diagnostics["date_observations"] = int(diagnostics.get("date_observations", 0) or 0) + 1
+            value = await self.fetch_eastmoney_latest_trade_date()
+            return self._canonical_eastmoney_date(value)
+
+        before = await observe()
+        quotes = await self._fetch_eastmoney_snapshot(daily_market_url)
+        after = await observe()
+        actual = before if before and before == after else None
+        if before != after:
+            diagnostics["date_race"] = True
+            # One bounded re-observation is enough to distinguish a moving
+            # index from a transient HTTP/JSON miss without looping forever.
+            retry = await observe()
+            if retry and retry == after:
+                actual = retry
+
+        if actual and actual > requested:
+            diagnostics["future_date"] = True
+            diagnostics["date_error"] = "verified actual date is after requested date"
+            return EastmoneyFallbackResult(
+                [], None, requested, "eastmoney", "unknown", False, diagnostics
+            )
+        if not actual:
+            diagnostics["date_unverified"] = True
+            diagnostics["degraded_unavailable"] = True
+            return EastmoneyFallbackResult(
+                [], None, requested, "eastmoney", "unknown", False, diagnostics
+            )
+        diagnostics.update({"date_verified": True, "actual_trade_date": actual})
+        for quote in quotes:
+            # Keep the provider provenance explicit.  The main coordinator
+            # may relabel the in-memory quote as ``eastmoney_fallback`` for
+            # the preview report without changing its history source.
+            quote.source = "eastmoney"
+        return EastmoneyFallbackResult(
+            quotes,
+            actual,
+            requested,
+            "eastmoney",
+            "degraded",
+            False,
+            diagnostics,
+        )
+
+    async def fetch_eastmoney_snapshot_result(
+        self,
+        trade_date: str = "",
+        daily_market_url: str = "",
+    ) -> EastmoneyFallbackResult:
+        """Public alias for the EM-only transient snapshot contract."""
+        # Accept the historical URL-first shape when an integration passes a
+        # custom endpoint positionally.
+        if str(trade_date or "").strip().lower().startswith(("http://", "https://")):
+            old_url = str(trade_date)
+            trade_date, daily_market_url = (str(daily_market_url), old_url) if daily_market_url else ("", old_url)
+        return await self.fetch_eastmoney_fallback_result(trade_date, daily_market_url)
+
+    fetch_eastmoney_preview_result = fetch_eastmoney_fallback_result
+    fetch_eastmoney_fallback_snapshot_result = fetch_eastmoney_fallback_result
+    fetch_eastmoney_transient_snapshot_result = fetch_eastmoney_fallback_result
 
     async def fetch_market_snapshot_result(self, daily_market_url: str = "", trade_date: str = "") -> MarketSnapshotResult:
         """Fetch a snapshot and report the actual trading date represented by the data."""
@@ -2298,7 +2450,12 @@ class SinaQuoteProvider:
                             },
                         )
                         response.raise_for_status()
-                        data = response.json().get("data") or {}
+                        payload = response.json()
+                        if not isinstance(payload, dict):
+                            raise ValueError("Eastmoney snapshot response is not an object")
+                        data = payload.get("data") or {}
+                        if not isinstance(data, dict):
+                            raise ValueError("Eastmoney snapshot data is not an object")
                         break
                     except (httpx.HTTPError, ValueError):
                         if attempt == 2:
@@ -2320,6 +2477,8 @@ class SinaQuoteProvider:
 
     @staticmethod
     def _snapshot_row(row: dict) -> Quote | None:
+        if not isinstance(row, dict):
+            return None
         code = str(row.get("f12") or "").zfill(6)
         if not code.isdigit() or len(code) != 6:
             return None
@@ -2666,6 +2825,102 @@ class SinaQuoteProvider:
                 result.pop(code, None)
         return result
 
+    @staticmethod
+    def _parse_eastmoney_daily_history(payload: dict, as_of: str = "", limit: int = 60) -> list[dict]:
+        """Extract validated unadjusted EM daily bars from one response."""
+        cutoff = SinaQuoteProvider._canonical_eastmoney_date(as_of, allow_empty=True)
+        if cutoff is None:
+            raise ValueError("Eastmoney history cutoff date is invalid")
+        rows = ((payload.get("data") or {}).get("klines") or []) if isinstance(payload, dict) else []
+        parsed: list[dict] = []
+        seen: set[str] = set()
+        for raw in rows:
+            fields = str(raw or "").split(",")
+            if len(fields) <= 6:
+                continue
+            row_date = SinaQuoteProvider._canonical_eastmoney_date(fields[0])
+            if not row_date or (cutoff and row_date > cutoff) or row_date in seen:
+                continue
+            try:
+                values = {
+                    "open": float(fields[1]),
+                    "close": float(fields[2]),
+                    "high": float(fields[3]),
+                    "low": float(fields[4]),
+                    "volume": float(fields[5]),
+                    "amount": float(fields[6]) if len(fields) > 6 else 0.0,
+                }
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                not all(math.isfinite(value) for value in values.values())
+                or any(values[key] <= 0 for key in ("open", "close", "high", "low"))
+                or values["volume"] < 0
+                or values["amount"] < 0
+                or values["high"] < max(values["open"], values["close"])
+                or values["low"] > min(values["open"], values["close"])
+                or values["high"] < values["low"]
+            ):
+                continue
+            parsed.append({
+                "trade_date": row_date,
+                **values,
+                "price_basis": "unadjusted",
+                "source": "eastmoney",
+            })
+            seen.add(row_date)
+        parsed.sort(key=lambda row: row["trade_date"])
+        return parsed[-max(1, min(int(limit), 1000)):]
+
+    async def fetch_eastmoney_daily_history(
+        self,
+        code: str,
+        as_of: str = "",
+        *,
+        limit: int = 60,
+        client=None,
+    ) -> list[dict]:
+        """Fetch one EM-only, unadjusted daily history up to ``as_of``.
+
+        This is the public history primitive used by ``enrich_indicators``;
+        the transient fallback therefore cannot accidentally gain a second
+        parser or a Tushare/legacy history path.
+        """
+        normalized = normalize_code(code)
+        if not re.fullmatch(r"\d{6}", normalized):
+            raise ValueError("Eastmoney history code is invalid")
+        cutoff = self._canonical_eastmoney_date(
+            as_of or datetime.now(CHINA_TZ).date().isoformat()
+        )
+        if not cutoff:
+            raise ValueError("Eastmoney history date is invalid")
+        params = {
+            "secid": self._eastmoney_secid(normalized),
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "fqt": "0",
+            "beg": "0",
+            "end": cutoff.replace("-", ""),
+            "lmt": str(max(1, min(int(limit), 1000))),
+        }
+        async def request(shared_client):
+            response = await shared_client.get(
+                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+        if client is None:
+            async with self.http.slot() as shared_client:
+                payload = await request(shared_client)
+        else:
+            payload = await request(client)
+        return self._parse_eastmoney_daily_history(payload, cutoff, limit)
+
+    fetch_eastmoney_history = fetch_eastmoney_daily_history
+
     async def enrich_indicators(self, quotes: list[Quote], max_concurrency: int = 5, as_of: str = "") -> dict[str, str]:
         """Fetch bounded daily history with one shared client and worker set."""
         if not quotes:
@@ -2705,40 +2960,10 @@ class SinaQuoteProvider:
             # stale indicators if the replacement request fails.
             self._clear_indicator_state(quote)
             self.history_bars.pop(quote.code, None)
-            secid = ("1." if quote.code.startswith(("6", "68", "9")) else "0.") + quote.code
-            url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-            params = {
-                "secid": secid,
-                "ut": "fa5fd1943c7b386f172d6893dbfba10b",
-                "fields1": "f1,f2,f3,f4,f5,f6",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                "klt": "101",
-                # Technical history and replay are strictly unadjusted.
-                "fqt": "0",
-                "beg": "0",
-                "end": str(as_of or "20500101").replace("-", ""),
-                "lmt": "60",
-            }
             try:
-                async with self.http.slot() as shared_client:
-                    response = await shared_client.get(url, params=params)
-                    response.raise_for_status()
-                    payload = response.json()
-                klines = ((payload.get("data") or {}).get("klines") or [])
-                parsed = []
-                cutoff = str(as_of or "").replace("-", "")
-                for row in klines:
-                    fields = str(row).split(",")
-                    if len(fields) <= 6:
-                        continue
-                    row_date = fields[0].replace("-", "").strip()
-                    if cutoff and len(row_date) == 8 and row_date > cutoff:
-                        continue
-                    try:
-                        parsed.append((row_date, float(fields[1]), float(fields[3]), float(fields[4]), float(fields[2]), float(fields[5]), float(fields[6]) if len(fields) > 6 else 0.0))
-                    except (TypeError, ValueError):
-                        continue
-                history = [{"trade_date": f"{item[0][:4]}-{item[0][4:6]}-{item[0][6:8]}", "open": item[1], "high": item[2], "low": item[3], "close": item[4], "volume": item[5], "amount": item[6], "price_basis": "unadjusted", "source": "eastmoney"} for item in parsed]
+                history = await self.fetch_eastmoney_daily_history(
+                    quote.code, as_of, limit=60, client=client
+                )
                 self.history_bars[quote.code] = history
                 values = calculate_daily_indicators(history)
                 quote.indicator_last_date = str(values.get("indicator_last_date") or "")
