@@ -104,6 +104,43 @@ class TushareRateLimitError(TushareBulkError):
     """A request remained rate limited after its one delayed retry."""
 
 
+class TushareNetworkError(TushareBulkError):
+    """A typed provider network failure eligible for a transient fallback."""
+
+
+class TushareCalendarError(TushareBulkError):
+    """The completed-session calendar could not be verified."""
+
+    def __init__(
+        self,
+        message: str = "Tushare calendar could not be verified",
+        *,
+        available_dates=None,
+        required_sessions: int | None = None,
+        legacy_lookback: bool = False,
+    ):
+        super().__init__(message)
+        self.available_dates = list(available_dates or [])
+        self.required_sessions = required_sessions
+        self.legacy_lookback = bool(legacy_lookback)
+
+
+class TushareNotPublishedError(TushareBulkError):
+    """The provider explicitly reported that the requested data is not published."""
+
+
+class TusharePublishError(TushareBulkError):
+    """A validated raw batch could not be published."""
+
+
+class TushareCoverageError(TushareBulkError):
+    """A raw batch failed its explicit coverage contract."""
+
+
+class TushareHistoryError(TushareBulkError):
+    """A provider explicitly reported invalid or unavailable history."""
+
+
 class TushareRequestGateway:
     """Shared, cancellable and persisted gateway for Tushare requests.
 
@@ -779,9 +816,9 @@ class TushareBulkDailyProvider:
             if len(items) < limit:
                 self._record_success("calendar")
                 return result
-        raise TushareBulkError("Tushare trade_cal pagination exceeded max_pages")
+        raise TushareCalendarError("Tushare trade_cal pagination exceeded max_pages")
 
-    async def fetch_completed_trade_dates(
+    async def _fetch_completed_trade_dates(
         self,
         end_date: str,
         lookback_days: int | None = None,
@@ -819,10 +856,36 @@ class TushareBulkDailyProvider:
         completed = sorted(dates, reverse=True)
         self._last_completed_calendar_dates = list(completed)
         if len(completed) < requested_sessions:
-            raise TushareBulkError(
-                f"Tushare trade calendar returned only {len(completed)} completed sessions; {requested_sessions} required"
+            raise TushareCalendarError(
+                f"Tushare trade calendar returned only {len(completed)} completed sessions; {requested_sessions} required",
+                available_dates=completed,
+                required_sessions=requested_sessions,
+                legacy_lookback=lookback_days is not None and session_count is None,
             )
         return completed[:requested_sessions]
+
+    async def fetch_completed_trade_dates(
+        self,
+        end_date: str,
+        lookback_days: int | None = None,
+        *,
+        session_count: int | None = None,
+    ) -> list[str]:
+        """Return completed sessions with a typed calendar failure boundary."""
+        try:
+            return await self._fetch_completed_trade_dates(
+                end_date,
+                lookback_days=lookback_days,
+                session_count=session_count,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
+            raise
+        except (httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
+            raise TushareNetworkError(str(exc)) from exc
+        except TushareCalendarError:
+            raise
 
     fetch_trade_dates = fetch_completed_trade_dates
 
@@ -1134,7 +1197,7 @@ class TushareBulkDailyProvider:
             universe_version=self._configured_universe_version,
         )
         if errors:
-            raise TushareBulkError("; ".join(dict.fromkeys(errors)))
+            raise TushareHistoryError("; ".join(dict.fromkeys(errors)))
         return evidence
 
     async def _fetch_stock_basic_status(self, status: str, *, client=None, max_pages: int = 1000) -> list[dict]:
@@ -1226,7 +1289,7 @@ class TushareBulkDailyProvider:
             if len(items) < size:
                 remember_metadata()
                 return rows
-        raise TushareBulkError("Tushare stock_basic pagination exceeded max_pages")
+        raise TushareHistoryError("Tushare stock_basic pagination exceeded max_pages")
 
     async def fetch_universe_evidence(self, trade_date: str, *, client=None, max_pages: int = 1000) -> dict:
         """Build independent eligible-universe evidence for one trade date.
@@ -1272,7 +1335,7 @@ class TushareBulkDailyProvider:
         if not self.token:
             raise TushareBulkError("Tushare token is required for universe evidence")
         if not self._bj_calendar_available:
-            raise TushareBulkError("Tushare session calendar evidence is unavailable for universe date")
+            raise TushareCalendarError("Tushare session calendar evidence is unavailable for universe date")
 
         batch_id: str | None = None
         batch: dict = {}
@@ -1359,7 +1422,7 @@ class TushareBulkDailyProvider:
                         await load_status(status, client)
 
             if not all_rows:
-                raise TushareBulkError("Tushare stock_basic returned no universe rows")
+                raise TushareHistoryError("Tushare stock_basic returned no universe rows")
 
             eligible = []
             for row in all_rows.values():
@@ -1373,7 +1436,7 @@ class TushareBulkDailyProvider:
                     continue
                 eligible.append(row)
             if not eligible:
-                raise TushareBulkError("Tushare stock_basic has no eligible universe rows")
+                raise TushareHistoryError("Tushare stock_basic has no eligible universe rows")
 
             markets: dict[str, int] = {}
             status_counts: dict[str, int] = {}
@@ -1385,7 +1448,7 @@ class TushareBulkDailyProvider:
             if self.bj_calendar_policy in {"require_bse", "sse_fallback"}:
                 required_markets.add("BJ")
             if set(eligible_markets) != required_markets:
-                raise TushareBulkError("universe evidence market set does not match BJ policy")
+                raise TushareHistoryError("universe evidence market set does not match BJ policy")
             memberships = [
                 {
                     "code": row["code"],
@@ -1458,6 +1521,7 @@ class TushareBulkDailyProvider:
         requested = self._date(trade_date or datetime.now(CHINA_TZ).date().isoformat())
         if not requested:
             raise ValueError("trade_date must be YYYY-MM-DD")
+        original_requested = requested
         self._check_breaker()
         diagnostics: dict[str, object] = {
             "requested_date": requested,
@@ -1476,27 +1540,48 @@ class TushareBulkDailyProvider:
             # Keep the production path on the authoritative session-count
             # contract.  ``lookback_days`` remains accepted only at the
             # public compatibility boundary below.
-            dates = await self.fetch_completed_trade_dates(requested, session_count=target_sessions)
-        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError):
+            calendar_kwargs = (
+                {"session_count": target_sessions}
+                if session_count is not None or lookback_days is None
+                else {"lookback_days": target_sessions}
+            )
+            dates = await self.fetch_completed_trade_dates(requested, **calendar_kwargs)
+        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
             diagnostics["network_failed"] = 1
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
-        except TushareBulkError as exc:
-            # ``lookback_days`` is the pre-v0.13 compatibility argument.  A
-            # legacy caller historically accepted a short calendar window;
-            # keep that adapter local while the public calendar method remains
-            # exact-count and fail-closed for new session-count callers.
-            available = list(getattr(self, "_last_completed_calendar_dates", []) or [])
-            if session_count is None and lookback_days is not None and "only" in str(exc).lower() and available:
+        except TushareCalendarError as exc:
+            # The deprecated lookback adapter may use the explicitly typed
+            # short-calendar result, but never classifies an error by message.
+            available = list(getattr(exc, "available_dates", []) or [])
+            if (
+                session_count is None
+                and lookback_days is not None
+                and bool(getattr(exc, "legacy_lookback", False))
+                and available
+            ):
                 dates = available[:target_sessions]
             else:
-                diagnostics["history_invalid"] = 1
+                diagnostics.update({
+                    "calendar_unavailable": 1,
+                    "failure_kind": "calendar",
+                    "error": str(exc)[:240],
+                })
                 self.last_diagnostics = diagnostics
                 return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
-        except (ValueError, TypeError, KeyError, TushareBulkError):
-            diagnostics["history_invalid"] = 1
-            self.last_diagnostics = diagnostics
-            return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+
+        # Calendar lookup is the authority for the latest completed session.
+        # Resolve weekends, holidays, and pre-close requests before creating a
+        # raw batch so its requested date can be published as a complete
+        # snapshot instead of looking like a failed same-day acquisition.
+        if dates:
+            requested = dates[0]
+            completed_end = requested
+            diagnostics.update({
+                "requested_date": original_requested,
+                "acquisition_date": requested,
+                "effective_trade_date": requested,
+            })
 
         if any(self._date(value) != value or value > completed_end or value > requested for value in dates):
             diagnostics["history_invalid"] = 1
@@ -1521,12 +1606,24 @@ class TushareBulkDailyProvider:
         diagnostics["dates_requested"] = len(dates)
         try:
             universe_evidence = await self.fetch_universe_evidence(dates[0], max_pages=max_pages)
-        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError):
+        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
             diagnostics["network_failed"] = 1
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
-        except (ValueError, TypeError, KeyError, TushareBulkError):
-            diagnostics["history_invalid"] = 1
+        except TushareCalendarError as exc:
+            diagnostics.update({
+                "calendar_unavailable": 1,
+                "failure_kind": "calendar",
+                "error": str(exc)[:240],
+            })
+            self.last_diagnostics = diagnostics
+            return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+        except TushareHistoryError as exc:
+            diagnostics.update({
+                "history_invalid": 1,
+                "failure_kind": "history_invalid",
+                "error": str(exc)[:240],
+            })
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
         diagnostics.update({
@@ -1542,27 +1639,30 @@ class TushareBulkDailyProvider:
         batch_id = None
         batch_record: dict = {}
         if self.storage is not None:
-            try:
-                # Publish only a complete calendar window.  A calendar session
-                # with no daily rows is an incomplete batch, never a usable
-                # generation.
-                batch_id, batch_record = self._begin_raw_batch(requested, dates, universe_evidence)
-            except (ValueError, TypeError, KeyError, RuntimeError):
-                diagnostics["history_invalid"] = 1
-                self.last_diagnostics = diagnostics
-                return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+            # Publish only a complete calendar window.  A calendar session
+            # with no daily rows is an incomplete batch, never a usable
+            # generation.  Storage errors are internal failures and must not
+            # be reclassified as transient history problems.
+            batch_id, batch_record = self._begin_raw_batch(requested, dates, universe_evidence)
+
+        staging_cleanup_attempted = False
 
         def fail_staging(error: str) -> None:
+            nonlocal staging_cleanup_attempted
+            if staging_cleanup_attempted:
+                return
+            staging_cleanup_attempted = True
             if batch_id is None:
                 return
             fail_batch = getattr(self.storage, "fail_raw_batch", None)
             if callable(fail_batch):
                 try:
                     fail_batch(batch_id, error)
-                except Exception:
+                except Exception as cleanup_exc:
                     # The original fetch/validation error is the useful
                     # diagnostic; cleanup failure must not mask it.
-                    pass
+                    diagnostics["staging_cleanup_failed"] = True
+                    diagnostics["staging_cleanup_error_type"] = type(cleanup_exc).__name__
 
         try:
             async with self.http.slot() as client:
@@ -1627,7 +1727,7 @@ class TushareBulkDailyProvider:
                                 source="tushare",
                             )
                     if not rows:
-                        raise TushareBulkError("Tushare daily returned no rows for a completed session")
+                        raise TushareNotPublishedError("Tushare daily returned no rows for a completed session")
                     seen = set()
                     for row in rows:
                         if row["code"] in seen:
@@ -1637,44 +1737,74 @@ class TushareBulkDailyProvider:
         except asyncio.CancelledError:
             fail_staging("raw fetch cancelled")
             raise
-        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError):
+        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
             diagnostics["network_failed"] = 1
             fail_staging("network failure while fetching raw partitions")
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
-        except (ValueError, TypeError, KeyError, TushareBulkError):
+        except TushareNotPublishedError as exc:
+            diagnostics.update({
+                "not_published": 1,
+                "failure_kind": "not_published",
+                "error": str(exc)[:240],
+            })
+            fail_staging("raw endpoint has not published a completed session")
+            self.last_diagnostics = diagnostics
+            return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+        except TushareHistoryError as exc:
             diagnostics["history_invalid"] = 1
+            diagnostics.update({"failure_kind": "history_invalid", "error": str(exc)[:240]})
             fail_staging("raw partition validation or pagination failed")
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+        except Exception:
+            # Preserve the original programming/storage error while ensuring
+            # a partially staged generation cannot remain publishable.
+            fail_staging("raw partition fetch failed unexpectedly")
+            self.last_diagnostics = diagnostics
+            raise
 
-        if not all_rows:
-            fail_staging("raw endpoint returned no usable rows")
+        try:
+            if not all_rows:
+                fail_staging("raw endpoint returned no usable rows")
+                self.last_diagnostics = diagnostics
+                return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+            loaded_dates = sorted(all_rows, reverse=True)
+            diagnostics["dates_loaded"] = len(loaded_dates)
+            diagnostics["rows"] = sum(len(rows) for rows in all_rows.values())
+            coverage = self._coverage_metrics(all_rows, requested_date=requested, actual_trade_date=loaded_dates[0])
+            diagnostics.update({
+                "coverage_version": coverage.get("coverage_version", 1),
+                "universe_version": coverage.get("universe_version", self.universe_version),
+                "overall_coverage": coverage.get("overall_coverage", 0.0),
+                "market_coverage": coverage.get("market_coverage", {}),
+                "window_median": coverage.get("window_median", 0.0),
+                "market_medians": coverage.get("market_medians", {}),
+                "daily_counts": coverage.get("daily_counts", {}),
+                "coverage_ok": bool(coverage.get("coverage_ok")),
+                "coverage_errors": coverage.get("errors", []),
+                "coverage_universe_evidence": coverage.get("universe_evidence"),
+                "coverage_universe_digest": coverage.get("universe_digest"),
+                "coverage_eligible_markets": coverage.get("eligible_markets", []),
+            })
+            if not coverage.get("coverage_ok"):
+                diagnostics.update({
+                    "coverage_failed": 1,
+                    "failure_kind": "coverage",
+                })
+                fail_staging("raw batch coverage below configured floor")
+                self.last_diagnostics = diagnostics
+                return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+        except asyncio.CancelledError:
+            fail_staging("raw post-partition validation cancelled")
+            raise
+        except Exception:
+            # Coverage and all post-partition checks share the same cleanup
+            # boundary as partition fetches.  Keep the original exception
+            # visible after best-effort staging failure.
+            fail_staging("raw post-partition validation failed unexpectedly")
             self.last_diagnostics = diagnostics
-            return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
-        loaded_dates = sorted(all_rows, reverse=True)
-        diagnostics["dates_loaded"] = len(loaded_dates)
-        diagnostics["rows"] = sum(len(rows) for rows in all_rows.values())
-        coverage = self._coverage_metrics(all_rows, requested_date=requested, actual_trade_date=loaded_dates[0])
-        diagnostics.update({
-            "coverage_version": coverage.get("coverage_version", 1),
-            "universe_version": coverage.get("universe_version", self.universe_version),
-            "overall_coverage": coverage.get("overall_coverage", 0.0),
-            "market_coverage": coverage.get("market_coverage", {}),
-            "window_median": coverage.get("window_median", 0.0),
-            "market_medians": coverage.get("market_medians", {}),
-            "daily_counts": coverage.get("daily_counts", {}),
-            "coverage_ok": bool(coverage.get("coverage_ok")),
-            "coverage_errors": coverage.get("errors", []),
-            "coverage_universe_evidence": coverage.get("universe_evidence"),
-            "coverage_universe_digest": coverage.get("universe_digest"),
-            "coverage_eligible_markets": coverage.get("eligible_markets", []),
-        })
-        if not coverage.get("coverage_ok"):
-            diagnostics["history_invalid"] = int(diagnostics.get("history_invalid", 0) or 0) + 1
-            fail_staging("raw batch coverage below configured floor")
-            self.last_diagnostics = diagnostics
-            return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+            raise
         complete = False
         if self.storage is not None:
             try:
@@ -1688,16 +1818,54 @@ class TushareBulkDailyProvider:
                 )
                 complete = isinstance(published, dict) and str(published.get("status") or "") == "published"
                 if not complete:
-                    raise RuntimeError("raw batch publication did not return published status")
+                    raise TusharePublishError("raw batch publication did not return published status")
                 diagnostics["batch_id"] = batch_id
                 diagnostics["dataset_id"] = published.get("dataset_id")
                 diagnostics["generation"] = published.get("generation")
                 diagnostics["shadow"] = bool(published.get("shadow"))
-            except Exception:
-                diagnostics["history_invalid"] = 1
+                configured_shadow = not self.raw_publish_enabled
+                if configured_shadow or diagnostics["shadow"]:
+                    diagnostics.update({
+                        "configured_shadow": True,
+                        "shadow_only": True,
+                        "publication_mode": "shadow",
+                        "data_mode": "configured_shadow",
+                        "fallback_allowed": False,
+                    })
+                else:
+                    diagnostics.update({
+                        "configured_shadow": False,
+                        "shadow_only": False,
+                        "publication_mode": "active",
+                        "data_mode": "tushare_raw",
+                    })
+            except asyncio.CancelledError:
+                fail_staging("raw batch publication cancelled")
+                raise
+            except TusharePublishError as exc:
+                diagnostics.update({
+                    "publish_failed": 1,
+                    "failure_kind": "publish",
+                    "error": str(exc)[:240],
+                })
                 fail_staging("raw batch publication failed")
                 self.last_diagnostics = diagnostics
                 return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+            except Exception:
+                # Do not turn a storage/programming failure into a fallback
+                # result.  Cleanup is best effort, then the original error
+                # remains visible to the coordinator.
+                fail_staging("raw batch publication failed unexpectedly")
+                self.last_diagnostics = diagnostics
+                raise
+        elif not self.raw_publish_enabled:
+            diagnostics.update({
+                "configured_shadow": True,
+                "shadow_only": True,
+                "publication_mode": "shadow",
+                "data_mode": "configured_shadow",
+                "fallback_allowed": False,
+            })
         latest = loaded_dates[0]
         bars: dict[str, list[dict]] = {}
         for date in sorted(loaded_dates):
@@ -2095,6 +2263,22 @@ class SinaQuoteProvider:
         result = await self.bulk_provider.fetch_bulk_daily_result(trade_date, **kwargs)
         self.last_diagnostics = dict(result.diagnostics or {}) if isinstance(result, BulkDailyResult) else {}
         return result
+
+    async def fetch_completed_trade_dates(
+        self,
+        end_date: str,
+        lookback_days: int | None = None,
+        *,
+        session_count: int | None = None,
+    ) -> list[str]:
+        """Expose the bulk provider's gateway-backed completed-session calendar."""
+        if not self.tushare_token:
+            raise TushareCalendarError("Tushare token is required for the completed-session calendar")
+        return await self.bulk_provider.fetch_completed_trade_dates(
+            end_date,
+            lookback_days=lookback_days,
+            session_count=session_count,
+        )
 
     async def fetch_bulk_daily(self, trade_date: str = "", **kwargs) -> BulkDailyResult:
         return await self.fetch_bulk_daily_result(trade_date, **kwargs)

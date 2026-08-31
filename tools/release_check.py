@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
-EXPECTED_VERSION = "0.13.1"
+EXPECTED_VERSION = "0.13.2"
 TEXT_SUFFIXES = (".py", ".json", ".yaml", ".yml", ".md")
 FORBIDDEN_PATH_PARTS = (
     "tests/",

@@ -21,7 +21,7 @@
   "tushare_raw_dataset_key": {"type": "string", "description": "raw 日线数据集标识", "default": "tushare_daily"},
   "tushare_raw_session_count": {"type": "int", "description": "每个 raw 批次保留的目标交易日数量；兼容旧 tushare_raw_lookback_days", "default": 120},
   "tushare_raw_lookback_days": {"type": "int", "description": "已弃用的交易日数量别名；不再表示自然日范围", "default": 60},
-  "tushare_raw_publish_enabled": {"type": "bool", "description": "是否将完成校验的 raw 批次切换为 active；关闭时只做 shadow 发布", "default": false},
+  "tushare_raw_publish_enabled": {"type": "bool", "description": "是否将完成校验的 raw 批次切换为 active；明确关闭时仅做 shadow 发布且不会用于当前筛选", "default": true},
   "tushare_raw_max_stale_trading_days": {"type": "int", "description": "网络失败时允许使用的 raw 缓存最大交易日年龄", "default": 2},
   "tushare_raw_chunk_size": {"type": "int", "description": "raw 历史指标分块处理大小", "default": 500},
   "tushare_raw_min_overall_coverage": {"type": "float", "description": "raw 批次全市场相对窗口中位数的最低覆盖率", "default": 0.97},
