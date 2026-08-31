@@ -18,8 +18,8 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .core import CHINA_TZ, Candidate, FactorOverlay, MinuteBarAggregator, PricePlan, Quote, apply_daily_indicators, assess_market_context, build_price_plan, format_candidate, format_compact_candidate, format_stored_compact_candidate, in_trading_session, is_tradable, normalize_code, parse_codes, price_plan_is_validated, risk_label, review_risk, score_quote
 from .factors import fundamental_score, industry_strength, market_adjustment
-from .providers import BulkDailyResult, EastmoneyFallbackResult, HttpRuntime, OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, TushareBulkError, TushareCalendarError, TushareCircuitOpen, TushareCoverageError, TushareHistoryError, TushareNetworkError, TushareNotPublishedError, TusharePublishError, TushareRateLimitError, TushareRequestGateway, news_fingerprint
-from .storage import StockStore
+from .providers import BulkDailyResult, EastmoneyFallbackResult, HttpRuntime, OpenAICompatibleClient, RssNewsProvider, SinaQuoteProvider, TushareBulkError, TushareCalendarError, TushareCircuitOpen, TushareCoverageError, TushareHistoryError, TushareNetworkError, TushareNotPublishedError, TusharePermissionError, TushareProviderUnknownError, TusharePublishError, TushareRateLimitError, TushareRequestGateway, news_fingerprint
+from .storage import SnapshotLeaseCapabilityError, SnapshotLeaseError, SnapshotLeaseLostError, StockStore
 
 PLUGIN_NAME = "astrbot_stock_watch"
 
@@ -58,8 +58,13 @@ _TUSHARE_FALLBACK_FAILURE_KINDS = {
 }
 
 
-@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.13.2")
+@register(PLUGIN_NAME, "DIO", "A股收盘选股与自选股监听", "0.13.3")
 class Main(Star):
+    # Calendar calls are immutable for a completed date/range.  Keep one
+    # in-flight future per provider identity and event loop so concurrent
+    # Main instances do not create duplicate upstream requests.
+    _calendar_inflight: dict[tuple, dict] = {}
+
     def __init__(self, context: Context, config=None, **kwargs):
         super().__init__(context, config=config)
         self.context, self.config = context, config or {}
@@ -123,6 +128,8 @@ class Main(Star):
         self.tasks: list[asyncio.Task] = []
         self.last_daily_scan: str | None = None
         self._daily_snapshot_lock = asyncio.Lock()
+        self._snapshot_fallback_owner: str | None = None
+        self._authorized_fallback_owner: str | None = None
         self._daily_date_alias: dict[str, str] = {}
         self._daily_retry_after: datetime | None = None
         self._annotation_task: asyncio.Task | None = None
@@ -717,11 +724,30 @@ class Main(Star):
             return "timeout" if isinstance(exc, asyncio.TimeoutError) else "network"
         return None
 
+    def _record_tushare_failure_diagnostics(self, exc: BaseException, *, stage: str = "daily") -> dict:
+        """Expose typed non-fallback failures without persisting provider text."""
+        diagnostics = self._raw_diagnostics(self._last_screen_diagnostics)
+        diagnostics["failure_stage"] = str(stage or "daily")[:32]
+        if isinstance(exc, TusharePermissionError):
+            diagnostics.update({"permission_denied": 1, "failure_kind": "permission_denied", "fallback_allowed": False})
+        elif isinstance(exc, TushareProviderUnknownError):
+            diagnostics.update({"provider_unknown": 1, "failure_kind": "provider_unknown", "fallback_allowed": False})
+        elif isinstance(exc, SnapshotLeaseLostError):
+            diagnostics.update({"lease_lost": 1, "failure_kind": "lease_lost", "fallback_allowed": False})
+        elif isinstance(exc, SnapshotLeaseError):
+            diagnostics.update({"lease_error": 1, "failure_kind": "lease_error", "fallback_allowed": False})
+        self._last_screen_diagnostics = diagnostics
+        return diagnostics
+
     def _mark_tushare_fallback(self, reason: str, diagnostics: dict | None = None) -> dict:
         values = dict(diagnostics or {})
         values["fallback_allowed"] = True
         values["fallback_reason"] = str(reason or "transient")
         values["data_mode"] = "tushare_transient_failure"
+        owner = getattr(self, "_snapshot_fallback_owner", None)
+        if owner:
+            values["fallback_owner"] = str(owner)
+            self._authorized_fallback_owner = str(owner)
         self._last_screen_diagnostics = self._raw_diagnostics(values)
         return self._last_screen_diagnostics
 
@@ -954,6 +980,169 @@ class Main(Star):
         # making exactly one invocation.
         return (requested_date,), {}
 
+    @staticmethod
+    def _compatible_kwargs(helper, args: tuple, values: dict) -> dict:
+        """Select optional keyword arguments without probing execution."""
+        try:
+            signature = inspect.signature(helper)
+        except (TypeError, ValueError):
+            return dict(values)
+        selected: dict = {}
+        for key, value in values.items():
+            candidate = {**selected, key: value}
+            try:
+                signature.bind(*args, **candidate)
+            except TypeError:
+                continue
+            selected = candidate
+        return selected
+
+    @staticmethod
+    def _snapshot_lease_capability(store) -> dict:
+        """Select the durable lease API before invoking any of its methods.
+
+        A store with no lease surface at all is the explicit compatibility
+        case for old test/integration adapters.  A partial surface, an
+        uninspectable callable, or a missing atomic result writer is instead
+        an unsafe durable configuration and must fail closed.
+        """
+        required_names = (
+            "claim_snapshot_lease",
+            "snapshot_lease_state",
+            "renew_snapshot_lease",
+            "release_snapshot_lease",
+            "save_snapshot_request_owned",
+        )
+        atomic_names = (
+            "save_tushare_snapshot_owned",
+            "persist_tushare_snapshot_owned",
+            "save_snapshot_result_owned",
+            "persist_snapshot_result_owned",
+        )
+        methods: dict[str, object] = {}
+        present = False
+        for name in (*required_names, *atomic_names):
+            try:
+                value = getattr(store, name, None)
+            except Exception as exc:
+                return {
+                    "supported": False,
+                    "legacy": False,
+                    "reason": "uninspectable",
+                    "error_type": type(exc).__name__,
+                }
+            if value is not None:
+                present = True
+            if callable(value):
+                methods[name] = value
+        if not present:
+            return {"supported": False, "legacy": True, "reason": "absent"}
+
+        missing = [name for name in required_names if name not in methods]
+        atomic_name = next((name for name in atomic_names if name in methods), None)
+        if missing or atomic_name is None:
+            return {
+                "supported": False,
+                "legacy": False,
+                "reason": "incomplete",
+                "missing": [*missing, *([] if atomic_name else ["atomic_snapshot_result"])],
+            }
+
+        probes = (
+            ("claim", methods["claim_snapshot_lease"], ("daily_snapshot:2026-08-28", "2026-08-28", "owner"), {"ttl_seconds": 30}),
+            ("state", methods["snapshot_lease_state"], ("daily_snapshot:2026-08-28",), {}),
+            ("renew", methods["renew_snapshot_lease"], ("daily_snapshot:2026-08-28", "owner", 1), {"ttl_seconds": 30}),
+            ("release", methods["release_snapshot_lease"], ("daily_snapshot:2026-08-28", "owner", 1), {}),
+            (
+                "owned_save",
+                methods["save_snapshot_request_owned"],
+                ("daily_snapshot:2026-08-28", "2026-08-28", "owner", 1),
+                {"state": "fetching", "attempts": 1, "source": "tushare", "quality": "unknown", "failure_kind": "", "calendar_evidence": {}, "provenance": {}},
+            ),
+            (
+                "atomic",
+                methods[atomic_name],
+                ("daily_snapshot:2026-08-28", "2026-08-28", "owner", 1),
+                {"quotes": [], "actual_trade_date": "2026-08-28", "source": "tushare", "quality": "good", "complete": True, "state": "complete", "attempts": 1, "terminal": True},
+            ),
+        )
+        for label, method, args, kwargs in probes:
+            try:
+                signature = inspect.signature(method)
+            except (TypeError, ValueError) as exc:
+                return {
+                    "supported": False,
+                    "legacy": False,
+                    "reason": "signature_unavailable",
+                    "method": label,
+                    "error_type": type(exc).__name__,
+                }
+            try:
+                signature.bind(*args, **kwargs)
+            except TypeError:
+                return {
+                    "supported": False,
+                    "legacy": False,
+                    "reason": "signature_incompatible",
+                    "method": label,
+                }
+        return {
+            "supported": True,
+            "legacy": False,
+            "reason": "supported",
+            "claim": methods["claim_snapshot_lease"],
+            "state": methods["snapshot_lease_state"],
+            "renew": methods["renew_snapshot_lease"],
+            "release": methods["release_snapshot_lease"],
+            "owned_save": methods["save_snapshot_request_owned"],
+            "atomic": methods[atomic_name],
+            "atomic_name": atomic_name,
+        }
+
+    @staticmethod
+    def _calendar_provider_identity(helper) -> int:
+        target = getattr(helper, "__self__", None)
+        gateway = getattr(target, "gateway", None)
+        return id(gateway or target or helper)
+
+    @classmethod
+    async def _calendar_singleflight(cls, key: tuple, operation) :
+        """Share one calendar operation while keeping cancellation isolated."""
+        loop = asyncio.get_running_loop()
+        inflight_key = (*key, loop)
+        entry = cls._calendar_inflight.get(inflight_key)
+        if entry is not None:
+            future = entry.get("future")
+            if entry.get("loop") is loop and isinstance(future, asyncio.Future) and not future.done():
+                return await asyncio.shield(future)
+            if cls._calendar_inflight.get(inflight_key) is entry:
+                cls._calendar_inflight.pop(inflight_key, None)
+
+        future = loop.create_future()
+        entry = {"loop": loop, "future": future}
+        cls._calendar_inflight[inflight_key] = entry
+
+        async def perform() -> None:
+            try:
+                result = await operation()
+                if not future.done():
+                    future.set_result(result)
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                    future.add_done_callback(lambda item: item.exception() if not item.cancelled() else None)
+            finally:
+                if cls._calendar_inflight.get(inflight_key) is entry:
+                    cls._calendar_inflight.pop(inflight_key, None)
+
+        try:
+            entry["task"] = asyncio.create_task(perform(), name="astrbot_stock_watch:calendar")
+        except BaseException:
+            if cls._calendar_inflight.get(inflight_key) is entry:
+                cls._calendar_inflight.pop(inflight_key, None)
+            raise
+        return await asyncio.shield(future)
+
     async def _resolve_tushare_completed_session(self, requested_date: str) -> tuple[str, dict]:
         """Resolve the requested date through the provider's calendar gateway."""
         helper = getattr(self.quotes, "fetch_completed_trade_dates", None)
@@ -966,15 +1155,39 @@ class Main(Star):
                 requested_date,
                 int(getattr(self, "raw_session_count", 120)),
             )
-            dates = await helper(*args, **kwargs)
-            if isinstance(dates, str):
-                dates = [dates]
-            if not isinstance(dates, (list, tuple)) or not dates:
-                raise TushareCalendarError("completed-session calendar returned no dates")
-            target = self._canonical_screen_date(dates[0])
-            if not target or target > requested_date:
-                raise TushareCalendarError("completed-session calendar returned an invalid target")
-            return target, {"calendar_resolved": True, "calendar_target_date": target}
+            async def resolve():
+                dates = await helper(*args, **kwargs)
+                if isinstance(dates, str):
+                    dates = [dates]
+                if not isinstance(dates, (list, tuple)) or not dates:
+                    raise TushareCalendarError("completed-session calendar returned no dates")
+                normalized: list[str] = []
+                seen: set[str] = set()
+                for value in dates:
+                    target_date = self._canonical_screen_date(value)
+                    if not target_date or target_date in seen or target_date > requested_date:
+                        raise TushareCalendarError("completed-session calendar returned an invalid target")
+                    seen.add(target_date)
+                    normalized.append(target_date)
+                if normalized != sorted(normalized, reverse=True):
+                    raise TushareCalendarError("completed-session calendar returned unordered dates")
+                target = normalized[0]
+                return target, {
+                    "calendar_resolved": True,
+                    "calendar_target_date": target,
+                    "calendar_dates": normalized,
+                    "calendar_session_count": len(normalized),
+                    "calendar_source": "tushare",
+                    "calendar_policy": "sse_fallback",
+                }
+
+            key = (
+                self._calendar_provider_identity(helper),
+                "completed_sessions",
+                requested_date,
+                int(getattr(self, "raw_session_count", 120)),
+            )
+            return await self._calendar_singleflight(key, resolve)
 
         # Older test/integration doubles may not expose the calendar helper.
         # Weekend arithmetic is an explicit compatibility fallback; a weekday
@@ -986,6 +1199,120 @@ class Main(Star):
         return requested_date, {"calendar_resolved": False, "calendar_fallback": "provider_unavailable"}
 
     async def _daily_snapshot_tushare(self, trade_date: str) -> tuple[list, bool, str]:
+        """Coordinate one durable owner and keep waiters provider-free."""
+        canonical_trade_date = self._canonical_screen_date(trade_date)
+        today = datetime.now(CHINA_TZ).date().isoformat()
+        if not canonical_trade_date or canonical_trade_date > today:
+            self._last_screen_diagnostics = {
+                "invalid_date": True,
+                "future_date": bool(canonical_trade_date and canonical_trade_date > today),
+                "fallback_allowed": False,
+            }
+            raise ValueError("Tushare snapshot requested date is invalid or in the future")
+        trade_date = canonical_trade_date
+        request_id = f"daily_snapshot:{trade_date}"
+        lease_capability = self._snapshot_lease_capability(self.store)
+        if not lease_capability.get("supported") and not lease_capability.get("legacy"):
+            detail = str(lease_capability.get("reason") or "unsupported")
+            raise SnapshotLeaseCapabilityError(f"durable snapshot lease capability is unsafe: {detail}")
+        request = self.store.snapshot_request(request_id) or {}
+        gate, retry_at = self._snapshot_request_gate(request)
+        if gate != "allow":
+            self._daily_retry_after = retry_at or (datetime.now(CHINA_TZ) + timedelta(minutes=5))
+            return await self._daily_snapshot_tushare_body(trade_date, allow_network=False)
+
+        if lease_capability.get("legacy"):
+            # Keep older storage shims usable; the in-process lock remains the
+            # only coordination mechanism on those integrations.
+            return await self._daily_snapshot_tushare_body(trade_date)
+
+        owner = f"{PLUGIN_NAME}:{uuid.uuid4().hex}"
+        ttl_seconds = self._snapshot_lease_ttl()
+        try:
+            claim = await self._wait_snapshot_lease(request_id, trade_date, owner, ttl_seconds, lease_capability)
+        except asyncio.CancelledError:
+            raise
+        except SnapshotLeaseError:
+            raise
+        except Exception as exc:
+            raise SnapshotLeaseError("durable snapshot lease claim failed") from exc
+        if not self._lease_acquired(claim):
+            self._daily_retry_after = retry_at or (datetime.now(CHINA_TZ) + timedelta(minutes=5))
+            return await self._daily_snapshot_tushare_body(trade_date, allow_network=False)
+
+        context = {
+            "request_id": request_id,
+            "owner": str(claim.get("owner") or owner),
+            "fence": int(claim.get("fence") or 0),
+            "ttl_seconds": ttl_seconds,
+            "claim_method": lease_capability["claim"],
+            "state_method": lease_capability["state"],
+            "renew_method": lease_capability["renew"],
+            "release_method": lease_capability["release"],
+            "owned_save_method": lease_capability["owned_save"],
+            "atomic_method": lease_capability["atomic"],
+        }
+        lost = asyncio.Event()
+        renew_task = asyncio.create_task(self._snapshot_lease_renewer(context, lost))
+        self._snapshot_fallback_owner = context["owner"]
+        try:
+            return await self._daily_snapshot_tushare_body(
+                trade_date,
+                lease=context,
+                lease_guard=lambda: self._snapshot_lease_guard(context, lost),
+            )
+        except asyncio.CancelledError:
+            try:
+                context["owned_save_method"](
+                    request_id,
+                    trade_date,
+                    context["owner"],
+                    context["fence"],
+                    state="cancelled",
+                    attempts=int((self.store.snapshot_request(request_id) or {}).get("attempts") or 0),
+                    source="tushare",
+                    quality="unknown",
+                    last_error="snapshot acquisition cancelled",
+                    next_retry_at=None,
+                    terminal=False,
+                    failure_kind="cancelled",
+                    lease_ttl_seconds=ttl_seconds,
+                )
+            except (SnapshotLeaseError, ValueError, TypeError, OSError):
+                pass
+            raise
+        except SnapshotLeaseLostError:
+            self._last_screen_diagnostics = {
+                **self._raw_diagnostics(self._last_screen_diagnostics),
+                "lease_lost": True,
+                "fallback_allowed": False,
+                "failure_kind": "lease_lost",
+            }
+            return [], False, trade_date
+        finally:
+            if renew_task is not None:
+                renew_task.cancel()
+                try:
+                    await renew_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            try:
+                context["release_method"](request_id, context["owner"], context["fence"])
+            except (SnapshotLeaseError, ValueError, TypeError, OSError):
+                pass
+            if getattr(self, "_snapshot_fallback_owner", None) == context["owner"]:
+                self._snapshot_fallback_owner = None
+
+    async def _daily_snapshot_tushare_body(
+        self,
+        trade_date: str,
+        *,
+        lease: dict | None = None,
+        lease_guard=None,
+        allow_network: bool = True,
+    ) -> tuple[list, bool, str]:
         """Fetch/publish a raw batch, falling back only to a fresh raw generation."""
         canonical_trade_date = self._canonical_screen_date(trade_date)
         today = datetime.now(CHINA_TZ).date().isoformat()
@@ -1002,6 +1329,46 @@ class Main(Star):
         gate, retry_at = self._snapshot_request_gate(request)
 
         calendar_diagnostics: dict[str, object] = {}
+
+        if not allow_network:
+            # Waiters and backoff callers are deliberately cache-only.  They
+            # must not probe either Tushare or Eastmoney while another owner
+            # is still working on this request.
+            return await self._cache_only_tushare_snapshot(trade_date)
+
+        def save_request(**kwargs):
+            if lease is not None:
+                try:
+                    return lease["owned_save_method"](
+                        request_id,
+                        trade_date,
+                        lease["owner"],
+                        lease["fence"],
+                        **kwargs,
+                    )
+                except SnapshotLeaseError:
+                    raise
+                except Exception as exc:
+                    raise SnapshotLeaseError("durable snapshot request persistence failed") from exc
+            return self.store.save_snapshot_request(request_id, trade_date, **kwargs)
+
+        def save_owned_result(actual_date: str, quotes, **kwargs):
+            if lease is None:
+                raise SnapshotLeaseCapabilityError("fenced Tushare snapshot persistence requires a lease")
+            try:
+                return lease["atomic_method"](
+                    request_id,
+                    trade_date,
+                    lease["owner"],
+                    lease["fence"],
+                    quotes=quotes,
+                    actual_trade_date=actual_date,
+                    **kwargs,
+                )
+            except SnapshotLeaseError:
+                raise
+            except Exception as exc:
+                raise SnapshotLeaseError("durable Tushare snapshot persistence failed") from exc
 
         def cache_result() -> tuple[list, bool, str]:
             quotes, actual_date, provenance, state = self._fresh_raw_snapshot(
@@ -1032,35 +1399,79 @@ class Main(Star):
             self._raw_screen_provenance = provenance
             self._last_screen_diagnostics = diagnostics
             try:
-                self.store.save_daily_quotes(trade_date=actual_date, quotes=quotes, keep_days=self._int("daily_cache_keep_days", 180, 7, 730))
-            except TypeError:
-                try:
-                    self.store.save_daily_quotes(actual_date, quotes, self._int("daily_cache_keep_days", 180, 7, 730))
-                except Exception:
-                    pass
-            try:
-                self.store.save_snapshot_meta(
-                    actual_date, "tushare", "cached", False, trade_date,
-                    "网络失败，仅使用不超过两个交易日的 raw 缓存",
-                    attempts=int(request.get("attempts") or 0), state="partial", terminal=False,
-                )
-                self.store.save_snapshot_request(
-                    request_id, trade_date, actual_trade_date=actual_date, state="retry",
-                    attempts=int(request.get("attempts") or 0), source="tushare", quality="cached",
-                    last_error="network failure; fresh raw cache used", next_retry_at=self._daily_retry_after.isoformat() if self._daily_retry_after else None,
-                    terminal=False,
-                )
-            except Exception:
-                pass
+                retry_at = self._daily_retry_after.isoformat() if self._daily_retry_after else None
+                attempts = int(request.get("attempts") or 0)
+                if lease is not None:
+                    save_owned_result(
+                        actual_date,
+                        quotes,
+                        source="tushare",
+                        quality="cached",
+                        complete=False,
+                        note="网络失败，仅使用不超过两个交易日的 raw 缓存",
+                        keep_days=self._int("daily_cache_keep_days", 180, 7, 730),
+                        state="partial",
+                        attempts=attempts,
+                        last_error=None,
+                        next_retry_at=retry_at,
+                        terminal=False,
+                        failure_kind="network",
+                        calendar_evidence=calendar_diagnostics,
+                        provenance=provenance,
+                        request_state="retry",
+                        request_source="tushare",
+                        request_quality="cached",
+                        request_last_error="network failure; fresh raw cache used",
+                        request_next_retry_at=retry_at,
+                        request_terminal=False,
+                        request_failure_kind="network",
+                    )
+                else:
+                    try:
+                        self.store.save_daily_quotes(
+                            trade_date=actual_date,
+                            quotes=quotes,
+                            keep_days=self._int("daily_cache_keep_days", 180, 7, 730),
+                        )
+                    except TypeError:
+                        self.store.save_daily_quotes(
+                            actual_date,
+                            quotes,
+                            self._int("daily_cache_keep_days", 180, 7, 730),
+                        )
+                    self.store.save_snapshot_meta(
+                        actual_date, "tushare", "cached", False, trade_date,
+                        "网络失败，仅使用不超过两个交易日的 raw 缓存",
+                        attempts=attempts, state="partial", terminal=False,
+                    )
+                    save_request(
+                        actual_trade_date=actual_date, state="retry",
+                        attempts=attempts, source="tushare", quality="cached",
+                        last_error="network failure; fresh raw cache used", next_retry_at=retry_at,
+                        terminal=False, failure_kind="network", calendar_evidence=calendar_diagnostics,
+                        provenance=provenance,
+                    )
+            except SnapshotLeaseError:
+                raise
+            except Exception as exc:
+                if lease is not None:
+                    raise SnapshotLeaseError("durable cached snapshot persistence failed") from exc
             return quotes, False, actual_date
 
         try:
+            if lease_guard is not None:
+                await lease_guard()
             target_session, calendar_diagnostics = await self._resolve_tushare_completed_session(trade_date)
+            if lease_guard is not None:
+                await lease_guard()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if isinstance(exc, SnapshotLeaseLostError):
+                raise
             reason = self._tushare_exception_fallback_reason(exc)
             if reason is None:
+                self._record_tushare_failure_diagnostics(exc, stage="calendar")
                 raise
             diagnostics = {
                 "network_failed": int(reason in {"network", "timeout"}),
@@ -1111,17 +1522,35 @@ class Main(Star):
             if gate != "allow":
                 self._daily_retry_after = retry_at or (datetime.now(CHINA_TZ) + timedelta(minutes=5))
                 return cache_result()
-            attempts = int(request.get("attempts") or 0) + 1
-            self.store.save_snapshot_request(request_id, trade_date, state="fetching", attempts=attempts, source="tushare", quality="unknown")
+            attempts = int(request.get("attempts") or 0)
+            if lease is None:
+                attempts += 1
+            save_request(state="fetching", attempts=attempts, source="tushare", quality="unknown", failure_kind="", calendar_evidence={}, provenance={})
             fetch_bulk = getattr(self.quotes, "fetch_bulk_daily_result", None)
             result = None
             try:
                 if not callable(fetch_bulk):
                     raise TushareBulkError("Tushare bulk provider is unavailable")
-                result = await fetch_bulk(trade_date, session_count=int(getattr(self, "raw_session_count", 120)))
+                if lease_guard is not None:
+                    await lease_guard()
+                bulk_args = (trade_date,)
+                bulk_kwargs = self._compatible_kwargs(
+                    fetch_bulk,
+                    bulk_args,
+                    {
+                        "session_count": int(getattr(self, "raw_session_count", 120)),
+                        "calendar_evidence": calendar_diagnostics,
+                        "lease_guard": lease_guard,
+                        "snapshot_lease": lease,
+                    },
+                )
+                result = await fetch_bulk(*bulk_args, **bulk_kwargs)
+                if lease_guard is not None:
+                    await lease_guard()
             except (TushareCircuitOpen, httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
                 reason = self._tushare_exception_fallback_reason(exc)
                 if reason is None:
+                    self._record_tushare_failure_diagnostics(exc, stage="daily")
                     raise
                 diagnostics = {"network_failed": int(reason in {"network", "timeout"}), "history_invalid": 0, "cache_basis_rejected": 0, "error": str(exc)[:240]}
                 self._last_screen_diagnostics = diagnostics
@@ -1132,8 +1561,11 @@ class Main(Star):
                 self._mark_tushare_fallback(reason, diagnostics)
                 return cached
             except (TushareBulkError, ValueError, TypeError, KeyError) as exc:
+                if isinstance(exc, SnapshotLeaseLostError):
+                    raise
                 reason = self._tushare_exception_fallback_reason(exc)
                 if reason is None:
+                    self._record_tushare_failure_diagnostics(exc, stage="daily")
                     raise
                 diagnostics = {
                     "network_failed": 0,
@@ -1149,6 +1581,8 @@ class Main(Star):
                 self._mark_tushare_fallback(reason, diagnostics)
                 return cached
 
+            if lease_guard is not None:
+                await lease_guard()
             diagnostics = self._raw_diagnostics(self._bulk_value(result, "diagnostics", {}))
             provider_diagnostics = getattr(self.quotes, "last_diagnostics", None)
             if isinstance(provider_diagnostics, dict):
@@ -1194,31 +1628,54 @@ class Main(Star):
                 self._daily_retry_after = None
                 try:
                     shadow_date = actual_date or effective_date or trade_date
-                    self.store.save_snapshot_request(
-                        request_id,
-                        trade_date,
-                        actual_trade_date=shadow_date,
-                        state="shadow",
-                        attempts=attempts,
-                        source="tushare",
-                        quality="shadow",
-                        last_error="configured shadow-only; active generation unchanged",
-                        next_retry_at=None,
-                        terminal=False,
-                    )
-                    self.store.save_snapshot_meta(
-                        shadow_date,
-                        "tushare",
-                        "shadow",
-                        False,
-                        trade_date,
-                        "raw 批次已校验但按配置保留为 shadow，未切换 active",
-                        attempts=attempts,
-                        state="shadow",
-                        terminal=False,
-                    )
-                except Exception:
-                    pass
+                    shadow_provenance = {"batch_id": batch_id, "actual_trade_date": shadow_date}
+                    if lease is not None:
+                        save_owned_result(
+                            shadow_date,
+                            [],
+                            source="tushare",
+                            quality="shadow",
+                            complete=False,
+                            note="raw 批次已校验但按配置保留为 shadow，未切换 active",
+                            state="shadow",
+                            attempts=attempts,
+                            last_error="configured shadow-only; active generation unchanged",
+                            next_retry_at=None,
+                            terminal=False,
+                            failure_kind="shadow",
+                            calendar_evidence=calendar_diagnostics,
+                            provenance=shadow_provenance,
+                        )
+                    else:
+                        save_request(
+                            actual_trade_date=shadow_date,
+                            state="shadow",
+                            attempts=attempts,
+                            source="tushare",
+                            quality="shadow",
+                            last_error="configured shadow-only; active generation unchanged",
+                            next_retry_at=None,
+                            terminal=False,
+                            failure_kind="shadow",
+                            calendar_evidence=calendar_diagnostics,
+                            provenance=shadow_provenance,
+                        )
+                        self.store.save_snapshot_meta(
+                            shadow_date,
+                            "tushare",
+                            "shadow",
+                            False,
+                            trade_date,
+                            "raw 批次已校验但按配置保留为 shadow，未切换 active",
+                            attempts=attempts,
+                            state="shadow",
+                            terminal=False,
+                        )
+                except SnapshotLeaseError:
+                    raise
+                except Exception as exc:
+                    if lease is not None:
+                        raise SnapshotLeaseError("durable shadow snapshot persistence failed") from exc
                 return [], False, shadow_date
             if not quotes or not actual_date:
                 reason = self._tushare_result_fallback_reason(result)
@@ -1232,7 +1689,12 @@ class Main(Star):
                     return cached
                 diagnostics["history_unavailable"] = True
                 self._last_screen_diagnostics = diagnostics
-                self.store.save_snapshot_request(request_id, trade_date, state="failed", attempts=attempts, source="tushare", quality="unknown", last_error="bulk result had no usable quotes", next_retry_at=None, terminal=False)
+                save_request(
+                    state="failed", attempts=attempts, source="tushare", quality="unknown",
+                    last_error="bulk result had no usable quotes", next_retry_at=None, terminal=False,
+                    failure_kind=str(diagnostics.get("failure_kind") or "history_invalid"),
+                    calendar_evidence=calendar_diagnostics, provenance={},
+                )
                 return [], False, trade_date
             if not complete:
                 reason = self._tushare_result_fallback_reason(result)
@@ -1246,9 +1708,7 @@ class Main(Star):
                     return cached
                 diagnostics["history_unavailable"] = True
                 self._last_screen_diagnostics = diagnostics
-                self.store.save_snapshot_request(
-                    request_id,
-                    trade_date,
+                save_request(
                     state="failed",
                     attempts=attempts,
                     source="tushare",
@@ -1256,6 +1716,9 @@ class Main(Star):
                     last_error="bulk result was incomplete without an explicit failure kind",
                     next_retry_at=None,
                     terminal=False,
+                    failure_kind=str(diagnostics.get("failure_kind") or "history_invalid"),
+                    calendar_evidence=calendar_diagnostics,
+                    provenance={},
                 )
                 return [], False, trade_date
             if actual_date != target_session or (effective_date and effective_date != target_session):
@@ -1269,9 +1732,7 @@ class Main(Star):
                 cached = cache_result()
                 if cached[0]:
                     return cached
-                self.store.save_snapshot_request(
-                    request_id,
-                    trade_date,
+                save_request(
                     state="failed",
                     attempts=attempts,
                     source="tushare",
@@ -1279,6 +1740,9 @@ class Main(Star):
                     last_error="completed-session target changed during raw acquisition",
                     next_retry_at=None,
                     terminal=False,
+                    failure_kind="calendar_race",
+                    calendar_evidence=calendar_diagnostics,
+                    provenance={},
                 )
                 return [], False, trade_date
             active_lookup = getattr(self.store, "active_raw_batch", None)
@@ -1307,9 +1771,7 @@ class Main(Star):
                     cached = cache_result()
                     if cached[0]:
                         return cached
-                    self.store.save_snapshot_request(
-                        request_id,
-                        trade_date,
+                    save_request(
                         state="failed",
                         attempts=attempts,
                         source="tushare",
@@ -1317,6 +1779,9 @@ class Main(Star):
                         last_error="raw active generation changed during acquisition",
                         next_retry_at=None,
                         terminal=False,
+                        failure_kind="generation_race",
+                        calendar_evidence=calendar_diagnostics,
+                        provenance={},
                     )
                     return [], False, trade_date
             generation = diagnostics.get("generation") or diagnostics.get("raw_generation")
@@ -1344,21 +1809,57 @@ class Main(Star):
                     and actual_date <= trade_date
                     and actual_date == (effective_date or actual_date)
                 )
-                self.store.save_daily_quotes(actual_date, quotes, self._int("daily_cache_keep_days", 180, 7, 730))
-                self.store.save_snapshot_meta(
-                    actual_date, "tushare", "good" if complete_for_request else "partial", complete_for_request,
-                    trade_date, "" if complete_for_request else "raw 批次未能完整发布或使用了较早交易日",
-                    attempts=attempts, state="complete" if complete_for_request else "partial", terminal=complete_for_request,
-                )
-                self.store.save_snapshot_request(
-                    request_id, trade_date, actual_trade_date=actual_date,
-                    state="complete" if complete_for_request else "partial", attempts=attempts,
-                    source="tushare", quality="good" if complete else "partial",
-                    next_retry_at=None if complete_for_request else (datetime.now(CHINA_TZ) + timedelta(minutes=5)).isoformat(),
-                    terminal=complete_for_request,
-                )
-            except Exception:
-                pass
+                if lease_guard is not None:
+                    await lease_guard()
+                retry_at = None if complete_for_request else (datetime.now(CHINA_TZ) + timedelta(minutes=5)).isoformat()
+                snapshot_state = "complete" if complete_for_request else "partial"
+                snapshot_quality = "good" if complete_for_request else "partial"
+                failure_kind = "" if complete_for_request else str(diagnostics.get("failure_kind") or "partial")
+                if lease is not None:
+                    save_owned_result(
+                        actual_date,
+                        quotes,
+                        source="tushare",
+                        quality=snapshot_quality,
+                        complete=complete_for_request,
+                        note="" if complete_for_request else "raw 批次未能完整发布或使用了较早交易日",
+                        keep_days=self._int("daily_cache_keep_days", 180, 7, 730),
+                        state=snapshot_state,
+                        attempts=attempts,
+                        next_retry_at=retry_at,
+                        terminal=complete_for_request,
+                        failure_kind=failure_kind,
+                        calendar_evidence=calendar_diagnostics,
+                        provenance=self._raw_screen_provenance,
+                        request_state=snapshot_state,
+                        request_source="tushare",
+                        request_quality="good" if complete else "partial",
+                        request_next_retry_at=retry_at,
+                        request_terminal=complete_for_request,
+                        request_failure_kind=failure_kind,
+                    )
+                else:
+                    self.store.save_daily_quotes(actual_date, quotes, self._int("daily_cache_keep_days", 180, 7, 730))
+                    self.store.save_snapshot_meta(
+                        actual_date, "tushare", snapshot_quality, complete_for_request,
+                        trade_date, "" if complete_for_request else "raw 批次未能完整发布或使用了较早交易日",
+                        attempts=attempts, state=snapshot_state, terminal=complete_for_request,
+                    )
+                    save_request(
+                        actual_trade_date=actual_date,
+                        state=snapshot_state, attempts=attempts,
+                        source="tushare", quality="good" if complete else "partial",
+                        next_retry_at=retry_at,
+                        terminal=complete_for_request,
+                        failure_kind=failure_kind,
+                        calendar_evidence=calendar_diagnostics,
+                        provenance=self._raw_screen_provenance,
+                    )
+            except SnapshotLeaseError:
+                raise
+            except Exception as exc:
+                if lease is not None:
+                    raise SnapshotLeaseError("Tushare snapshot persistence failed") from exc
             self._daily_retry_after = None if complete_for_request else datetime.now(CHINA_TZ) + timedelta(minutes=5)
             return quotes, complete_for_request, actual_date
 
@@ -2024,35 +2525,51 @@ class Main(Star):
             # A fresh unknown is a deliberate negative cache result.  Do not
             # turn a short TTL into a request on every loop iteration.
             return None
-        try:
-            online = await self.quotes.fetch_trade_calendar(trade_date)
-        except Exception:
+        helper = getattr(self.quotes, "fetch_trade_calendar", None)
+        provider_identity = self._calendar_provider_identity(helper if callable(helper) else self.quotes)
+
+        async def resolve_online():
             online = None
-        if online is not None:
-            self.store.save_calendar(
-                trade_date,
-                online,
-                "tushare",
-                self._int("calendar_ttl_seconds", 86400, 60, 604800),
-            )
-            return online
-        try:
-            latest = await self.quotes.fetch_eastmoney_latest_trade_date()
-        except Exception:
+            if callable(helper):
+                try:
+                    online = await helper(trade_date)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    online = None
+            if online is not None:
+                self.store.save_calendar(
+                    trade_date,
+                    online,
+                    "tushare",
+                    self._int("calendar_ttl_seconds", 86400, 60, 604800),
+                )
+                return online
+            latest_helper = getattr(self.quotes, "fetch_eastmoney_latest_trade_date", None)
             latest = None
-        if latest:
-            # The index's last daily bar proves that this date was open only
-            # when it exactly matches the requested date. A prior bar cannot
-            # prove that today was closed, so preserve the third state.
-            if latest == trade_date:
-                self.store.save_calendar(trade_date, True, "eastmoney_index", self._int("calendar_ttl_seconds", 86400, 60, 604800))
-                return True
-            self.store.save_calendar(trade_date, None, "eastmoney_index", self._int("calendar_unknown_ttl_seconds", 900, 60, 86400))
+            if callable(latest_helper):
+                try:
+                    latest = await latest_helper()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    latest = None
+            if latest:
+                # The index's last daily bar proves that this date was open
+                # only when it exactly matches the requested date. A prior
+                # bar cannot prove that today was closed.
+                if latest == trade_date:
+                    self.store.save_calendar(trade_date, True, "eastmoney_index", self._int("calendar_ttl_seconds", 86400, 60, 604800))
+                    return True
+                self.store.save_calendar(trade_date, None, "eastmoney_index", self._int("calendar_unknown_ttl_seconds", 900, 60, 86400))
+                return None
+            self.store.save_calendar(trade_date, None, "unknown", self._int("calendar_unknown_ttl_seconds", 900, 60, 86400))
+            # A weekday is not proof of an open A-share session. Do not start
+            # a background scan or intraday listener when the calendar is
+            # unknown.
             return None
-        self.store.save_calendar(trade_date, None, "unknown", self._int("calendar_unknown_ttl_seconds", 900, 60, 86400))
-        # A weekday is not proof of an open A-share session. Do not start a
-        # background scan or intraday listener when the calendar is unknown.
-        return None
+
+        return await self._calendar_singleflight((provider_identity, "calendar_open", trade_date), resolve_online)
 
     @staticmethod
     def _snapshot_request_gate(request: dict, *, now: datetime | None = None) -> tuple[str, datetime | None]:
@@ -2079,6 +2596,142 @@ class Main(Star):
             current = current.replace(tzinfo=timezone.utc)
         current = current.astimezone(timezone.utc)
         return ("retry", retry_at) if current < retry_at else ("allow", retry_at)
+
+    def _snapshot_lease_ttl(self) -> float:
+        return self._float("tushare_snapshot_lease_ttl_seconds", 1800, 5, 86400)
+
+    def _snapshot_lease_wait(self) -> tuple[float, float]:
+        wait = self._float("tushare_snapshot_lease_wait_seconds", 30, 0, 300)
+        poll = self._float("tushare_snapshot_lease_poll_seconds", 0.25, 0.01, 10)
+        return wait, poll
+
+    @staticmethod
+    def _lease_acquired(value) -> bool:
+        if not isinstance(value, dict) or not bool(value.get("acquired")) or not str(value.get("owner") or "").strip():
+            return False
+        try:
+            return int(value.get("fence") or 0) > 0
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    async def _wait_snapshot_lease(self, request_id: str, requested_date: str, owner: str, ttl_seconds: float, capability: dict | None = None):
+        """Claim a durable snapshot lease or wait without touching providers."""
+        capability = capability or self._snapshot_lease_capability(self.store)
+        if not capability.get("supported"):
+            if capability.get("legacy"):
+                raise SnapshotLeaseCapabilityError("durable snapshot lease is unavailable")
+            raise SnapshotLeaseCapabilityError(
+                f"durable snapshot lease capability is unsafe: {capability.get('reason', 'unsupported')}"
+            )
+        claim_method = capability["claim"]
+        state_method = capability["state"]
+        claim = claim_method(
+            request_id,
+            requested_date,
+            owner,
+            ttl_seconds=ttl_seconds,
+        )
+        if not isinstance(claim, dict):
+            raise SnapshotLeaseCapabilityError("snapshot lease claim returned an invalid result")
+        if self._lease_acquired(claim):
+            return claim
+        if str(claim.get("reason") or "").lower() == "terminal":
+            return claim
+        wait_seconds, poll_seconds = self._snapshot_lease_wait()
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        state = claim
+        def terminal(value: dict | None) -> bool:
+            if not isinstance(value, dict):
+                return False
+            return bool(value.get("terminal")) or str(value.get("state") or "").strip().lower() in {"complete", "terminal"}
+
+        while bool(state.get("lease_active")) and not terminal(state) and asyncio.get_running_loop().time() < deadline:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            await asyncio.sleep(min(poll_seconds, remaining))
+            state = state_method(request_id)
+            if not state:
+                break
+            if not isinstance(state, dict):
+                raise SnapshotLeaseCapabilityError("snapshot lease state returned an invalid result")
+            if not bool(state.get("lease_active")) or terminal(state):
+                break
+        if state and bool(state.get("lease_active")):
+            if not terminal(state):
+                state = dict(state)
+                state["reason"] = "wait_timeout"
+                return state
+        if state and terminal(state):
+            state = dict(state)
+            state["reason"] = "terminal"
+            return state
+        return claim_method(
+            request_id,
+            requested_date,
+            owner,
+            ttl_seconds=ttl_seconds,
+        )
+
+    async def _snapshot_lease_renewer(self, context: dict, lost: asyncio.Event) -> None:
+        interval = max(1.0, min(float(context["ttl_seconds"]) / 3.0, 60.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                renewed = context["renew_method"](
+                    context["request_id"],
+                    context["owner"],
+                    context["fence"],
+                    ttl_seconds=context["ttl_seconds"],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                renewed = None
+            if renewed is None or renewed is False:
+                lost.set()
+                return
+
+    async def _snapshot_lease_guard(self, context: dict, lost: asyncio.Event) -> None:
+        if lost.is_set():
+            raise SnapshotLeaseLostError("snapshot lease was lost")
+        try:
+            renewed = context["renew_method"](
+                context["request_id"],
+                context["owner"],
+                context["fence"],
+                ttl_seconds=context["ttl_seconds"],
+            )
+        except Exception as exc:
+            lost.set()
+            raise SnapshotLeaseLostError("snapshot lease renewal failed") from exc
+        if renewed is None or renewed is False:
+            lost.set()
+            raise SnapshotLeaseLostError("snapshot lease was lost")
+
+    async def _cache_only_tushare_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
+        """Read the configured raw cache without consulting any provider."""
+        quotes, actual_date, provenance, state = self._fresh_raw_snapshot(
+            trade_date,
+            cache_as_of=trade_date,
+            max_stale_trading_days=self._raw_stale_days(),
+        )
+        diagnostics = self._raw_diagnostics(self._last_screen_diagnostics)
+        if state == "cache_basis_rejected":
+            diagnostics["cache_basis_rejected"] = int(diagnostics.get("cache_basis_rejected", 0)) + 1
+        if not quotes or not actual_date:
+            diagnostics["history_unavailable"] = True
+            diagnostics["fallback_allowed"] = False
+            self._last_screen_diagnostics = diagnostics
+            return [], False, trade_date
+        diagnostics.update({
+            "raw_cache": True,
+            "raw_batch_id": provenance.get("batch_id") or provenance.get("active_batch_id"),
+            "raw_generation": provenance.get("generation"),
+            "actual_trade_date": actual_date,
+            "fallback_allowed": False,
+        })
+        self._raw_screen_provenance = provenance
+        self._last_screen_diagnostics = diagnostics
+        return quotes, False, actual_date
 
     async def _daily_snapshot(self, trade_date: str) -> tuple[list, bool, str]:
         """Return a snapshot, whether it was fetched now, and its actual trade date."""
@@ -2276,6 +2929,25 @@ class Main(Star):
         if not canonical_requested or canonical_requested > today:
             raise ValueError("Eastmoney fallback requested date is invalid or in the future")
         requested_date = canonical_requested
+        fallback_owner = str((self._last_screen_diagnostics or {}).get("fallback_owner") or "").strip()
+        authorized_owner = str(getattr(self, "_authorized_fallback_owner", None) or "").strip()
+        if fallback_owner:
+            # New Tushare failures carry a one-shot owner token.  A different
+            # Main instance, or a replay after consumption, cannot start EM.
+            if not authorized_owner or fallback_owner != authorized_owner:
+                self._last_screen_diagnostics = {
+                    **dict(self._last_screen_diagnostics or {}),
+                    "data_mode": "eastmoney_transient",
+                    "source": "eastmoney_fallback",
+                    "quality": "degraded",
+                    "complete": False,
+                    "requested_date": requested_date,
+                    "degraded_unavailable": True,
+                    "degraded_reason": "fallback_owner_lost",
+                    "fallback_allowed": False,
+                }
+                return [], None
+            self._authorized_fallback_owner = None
         fetch = getattr(self.quotes, "fetch_eastmoney_fallback_result", None)
         if not callable(fetch):
             fetch = getattr(self.quotes, "fetch_eastmoney_snapshot_result", None)
@@ -2362,6 +3034,13 @@ class Main(Star):
             "quality": "degraded",
             "complete": False,
             "provider_date_verified": bool(result_diagnostics.get("date_verified", True)),
+            "fallback_provenance": {
+                "mode": "transient",
+                "source": "eastmoney",
+                "requested_date": requested_date,
+                "actual_trade_date": actual,
+                "date_verified": bool(result_diagnostics.get("date_verified", True)),
+            },
         })
         return candidates, actual
 

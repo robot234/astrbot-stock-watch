@@ -104,6 +104,19 @@ class TushareRateLimitError(TushareBulkError):
     """A request remained rate limited after its one delayed retry."""
 
 
+class TusharePermissionError(TushareBulkError):
+    """Tushare rejected a request because the account lacks permission."""
+
+
+class TushareProviderUnknownError(TushareBulkError):
+    """Tushare returned a non-zero response whose meaning is unverified."""
+
+
+# Keep a short compatibility spelling for integrations that use the generic
+# provider terminology rather than the Tushare-specific class name.
+TushareUnknownError = TushareProviderUnknownError
+
+
 class TushareNetworkError(TushareBulkError):
     """A typed provider network failure eligible for a transient fallback."""
 
@@ -200,7 +213,11 @@ class TushareRequestGateway:
                     continue
         self.api_limits = configured
         self._local_states: dict[str, dict] = {}
-        self._local_cache: dict[tuple[str, str], dict] = {}
+        self._local_cache: dict[tuple[str, str, str], dict] = {}
+        # The key includes the API name, optional stable cache namespace and
+        # canonical request digest.  A Future is shared with shield() so a
+        # cancelled follower cannot cancel the leader's transport operation.
+        self._inflight: dict[tuple[str, str, str], dict] = {}
 
     def _now(self) -> float:
         if callable(self.clock):
@@ -340,7 +357,7 @@ class TushareRequestGateway:
             if row and isinstance(row.get("body"), dict):
                 return dict(row["body"])
             return None
-        row = self._local_cache.get((api_name, cache_key or digest))
+        row = self._local_cache.get((api_name, str(cache_key or ""), digest))
         if row and float(row.get("expires_at") or 0) > now:
             return dict(row["body"])
         return None
@@ -354,19 +371,99 @@ class TushareRequestGateway:
             except TypeError:
                 self.storage.save_provider_cache(api_name, cache_key or digest, body, ttl_seconds=ttl, payload_digest=digest, now=now)
             return
-        self._local_cache[(api_name, cache_key or digest)] = {"body": dict(body), "expires_at": now + ttl}
+        self._local_cache[(api_name, str(cache_key or ""), digest)] = {"body": dict(body), "expires_at": now + ttl}
 
     @staticmethod
-    def _rate_limited(response=None, body=None) -> bool:
+    def _response_message(body) -> str:
+        if not isinstance(body, dict):
+            return ""
+        value = body.get("msg")
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            except (TypeError, ValueError, OverflowError):
+                value = ""
+        return str(value or "").strip().casefold()[:500]
+
+    @classmethod
+    def _classify_response(cls, response=None, body=None) -> str | None:
+        """Classify only high-confidence provider outcomes.
+
+        Tushare's public docs expose generic permission code 2002, while
+        40203 is used by several account-limit/error paths.  Its message is
+        therefore required before treating it as rate limiting or permission
+        failure; an ambiguous message stays provider_unknown.
+        """
         try:
-            if int(getattr(response, "status_code", 0) or 0) == 429:
-                return True
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status == 429:
+                return "rate_limited"
+            if status in {401, 403}:
+                return "permission_denied"
         except (TypeError, ValueError, OverflowError):
             pass
         try:
-            return int((body or {}).get("code")) == 40203
+            code = int((body or {}).get("code"))
         except (TypeError, ValueError, OverflowError, AttributeError):
-            return False
+            code = 0
+        if code == 0:
+            return None
+        if code == 2002:
+            return "permission_denied"
+        message = cls._response_message(body)
+        rate_markers = (
+            "429", "too many", "rate limit", "rate-limit", "ratelimit", "throttl",
+            "频率", "频次", "每分钟", "过于频繁", "请求太频繁", "访问太频繁",
+            "超过限制", "超出限制", "超过上限", "超出上限",
+        )
+        permission_markers = (
+            "permission", "not authorized", "unauthorized", "access denied", "forbidden",
+            "no access", "points", "point", "积分", "权限", "未授权", "无权限", "没有权限",
+        )
+        if any(marker in message for marker in rate_markers):
+            return "rate_limited"
+        if any(marker in message for marker in permission_markers):
+            return "permission_denied"
+        return "provider_unknown"
+
+    @classmethod
+    def _rate_limited(cls, response=None, body=None) -> bool:
+        return cls._classify_response(response, body) == "rate_limited"
+
+    @staticmethod
+    def _inflight_key(api_name: str, digest: str, cache_key: str | None) -> tuple[str, str, str]:
+        return api_name, str(cache_key or ""), digest
+
+    @staticmethod
+    def _complete_future(future: asyncio.Future, *, result=None, error: BaseException | None = None) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+            # A request may have no followers.  Retrieve the exception after
+            # completion so asyncio does not emit an unhandled-future warning.
+            future.add_done_callback(lambda item: item.exception() if not item.cancelled() else None)
+        else:
+            future.set_result(result)
+
+    @staticmethod
+    def _provider_error(category: str, code) -> TushareBulkError:
+        try:
+            numeric = int(code)
+        except (TypeError, ValueError, OverflowError):
+            numeric = -1
+        if category == "rate_limited":
+            return TushareRateLimitError(f"Tushare provider rate limited (code {numeric})")
+        if category == "permission_denied":
+            return TusharePermissionError(f"Tushare provider permission denied (code {numeric})")
+        return TushareProviderUnknownError(f"Tushare provider returned an unknown error (code {numeric})")
+
+    @staticmethod
+    def _response_code(body) -> int:
+        try:
+            return int((body or {}).get("code") if (body or {}).get("code") is not None else 0)
+        except (TypeError, ValueError, OverflowError, AttributeError):
+            return -1
 
     @staticmethod
     def _response_error(response, status: int) -> httpx.HTTPStatusError:
@@ -400,67 +497,119 @@ class TushareRequestGateway:
         if cache_ttl and (cached := self._cache_get(name, digest, now, stable_cache_key)) is not None:
             return cached
 
-        async def send():
-            if client is not None:
-                return await self._send_once(client, payload)
-            async with self.http.slot() as shared:
-                return await self._send_once(shared, payload)
+        loop = asyncio.get_running_loop()
+        inflight_key = self._inflight_key(name, digest, stable_cache_key)
+        entry = self._inflight.get(inflight_key)
+        if entry is not None:
+            entry_loop = entry.get("loop")
+            future = entry.get("future")
+            if entry_loop is loop and isinstance(future, asyncio.Future) and not future.done():
+                entry["cache_ttl"] = max(float(entry.get("cache_ttl") or 0), float(cache_ttl or 0))
+                return await asyncio.shield(future)
+            if self._inflight.get(inflight_key) is entry:
+                self._inflight.pop(inflight_key, None)
 
-        if self.enforce_rate_limits:
-            await self._reserve(name)
-        rate_retry = False
-        attempts = 0
-        while True:
-            response = await send()
+        future = loop.create_future()
+        entry = {"future": future, "loop": loop, "cache_ttl": float(cache_ttl or 0)}
+        self._inflight[inflight_key] = entry
+
+        async def perform() -> None:
+            """Own the transport independently of every caller task."""
             try:
-                status = int(getattr(response, "status_code", 200) or 200)
-            except (TypeError, ValueError, OverflowError):
-                status = 200
-            body = None
-            if status != 429:
-                try:
-                    body = response.json()
-                except (ValueError, TypeError, AttributeError):
-                    body = None
-            if self._rate_limited(response, body):
+                # Another caller may have completed the same request between
+                # the first cache check and ownership acquisition.
                 now = self._now()
-                state = self._state(name)
-                previous = int(state.get("rate_limit_failures") or 0)
-                open_circuit = previous >= 1 or rate_retry
-                until = now + self.rate_limit_block_seconds
-                self._update_state(name, now=now, blocked_until=until, rate_limited=True, open_circuit=open_circuit, error="rate limited")
-                if rate_retry:
-                    raise TushareRateLimitError(f"Tushare {name} rate limit persisted")
-                rate_retry = True
-                await self._sleep(self.rate_limit_block_seconds)
-                # The delayed retry belongs to this request.  It is sent
-                # after the block and does not hold a reservation transaction.
-                continue
-            if status in {408, 425} or 500 <= status <= 599:
-                error = self._response_error(response, status)
-                attempts += 1
-                if attempts < self.retry_attempts:
-                    await self._sleep(min(8.0, 0.25 * (2 ** (attempts - 1))))
-                    if self.enforce_rate_limits:
-                        await self._reserve(name)
-                    continue
-                self._update_state(name, error=f"HTTP {status}")
-                raise error
-            if hasattr(response, "raise_for_status"):
-                response.raise_for_status()
-            if not isinstance(body, dict):
-                self._update_state(name, error="invalid response")
-                raise ValueError("Tushare response is not an object")
-            try:
-                code = int(body.get("code") if body.get("code") is not None else 0)
-            except (TypeError, ValueError, OverflowError):
-                code = -1
-            if code != 0:
-                self._update_state(name, error="Tushare returned an error")
-                raise TushareBulkError("Tushare returned an error")
-            self._update_state(name, now=self._now(), success=True)
-            self._cache_put(name, digest, payload, body, float(cache_ttl or 0), self._now(), stable_cache_key)
-            return body
+                effective_ttl = float(entry.get("cache_ttl") or 0)
+                if effective_ttl and (cached := self._cache_get(name, digest, now, stable_cache_key)) is not None:
+                    self._complete_future(future, result=cached)
+                    return
+
+                async def send():
+                    if client is not None:
+                        return await self._send_once(client, payload)
+                    async with self.http.slot() as shared:
+                        return await self._send_once(shared, payload)
+
+                if self.enforce_rate_limits:
+                    await self._reserve(name)
+                rate_retry = False
+                attempts = 0
+                while True:
+                    response = await send()
+                    try:
+                        status = int(getattr(response, "status_code", 200) or 200)
+                    except (TypeError, ValueError, OverflowError):
+                        status = 200
+                    body = None
+                    if status != 429:
+                        try:
+                            body = response.json()
+                        except (ValueError, TypeError, AttributeError):
+                            body = None
+                    classification = self._classify_response(response, body)
+                    if classification == "rate_limited":
+                        now = self._now()
+                        state = self._state(name)
+                        previous = int(state.get("rate_limit_failures") or 0)
+                        open_circuit = previous >= 1 or rate_retry
+                        until = now + self.rate_limit_block_seconds
+                        self._update_state(name, now=now, blocked_until=until, rate_limited=True, open_circuit=open_circuit, error="rate limited")
+                        if rate_retry:
+                            raise TushareRateLimitError(f"Tushare {name} rate limit persisted")
+                        rate_retry = True
+                        await self._sleep(self.rate_limit_block_seconds)
+                        # The delayed retry belongs to this request.  It is sent
+                        # after the block and does not hold a reservation transaction.
+                        continue
+                    if status in {408, 425} or 500 <= status <= 599:
+                        error = self._response_error(response, status)
+                        attempts += 1
+                        if attempts < self.retry_attempts:
+                            await self._sleep(min(8.0, 0.25 * (2 ** (attempts - 1))))
+                            if self.enforce_rate_limits:
+                                await self._reserve(name)
+                            continue
+                        self._update_state(name, error=f"HTTP {status}")
+                        raise error
+                    if classification in {"permission_denied", "provider_unknown"}:
+                        # Do not persist msg/body.  The numeric code and
+                        # stable category are sufficient for diagnostics and
+                        # retry policy, even when a permission response is
+                        # not valid JSON.
+                        code = self._response_code(body)
+                        self._update_state(name, error=f"provider_{classification}")
+                        raise self._provider_error(classification, code)
+                    if not isinstance(body, dict):
+                        self._update_state(name, error="invalid response")
+                        raise ValueError("Tushare response is not an object")
+                    code = self._response_code(body)
+                    if code != 0:
+                        self._update_state(name, error="provider_unknown")
+                        raise self._provider_error("provider_unknown", code)
+                    if hasattr(response, "raise_for_status"):
+                        response.raise_for_status()
+                    self._update_state(name, now=self._now(), success=True)
+                    effective_ttl = max(float(entry.get("cache_ttl") or 0), float(cache_ttl or 0))
+                    self._cache_put(name, digest, payload, body, effective_ttl, self._now(), stable_cache_key)
+                    self._complete_future(future, result=body)
+                    return
+            except BaseException as exc:
+                self._complete_future(future, error=exc)
+            finally:
+                # A stale worker from a closed loop must not remove a newer
+                # owner for the same request key.
+                if self._inflight.get(inflight_key) is entry:
+                    self._inflight.pop(inflight_key, None)
+
+        try:
+            entry["task"] = asyncio.create_task(perform(), name=f"tushare:{name}")
+        except BaseException:
+            if self._inflight.get(inflight_key) is entry:
+                self._inflight.pop(inflight_key, None)
+            raise
+        # Shield the shared future so cancellation of this caller, including
+        # the first caller that created the worker, cannot cancel the worker.
+        return await asyncio.shield(future)
 
     async def request_api(self, api_name: str, payload: dict, *, client=None, cache_ttl: float = 0, cache_key: str | None = None) -> dict:
         return await self.request_json(client, payload, api_name=api_name, cache_ttl=cache_ttl, cache_key=cache_key)
@@ -720,6 +869,65 @@ class TushareBulkDailyProvider:
     @staticmethod
     def _retryable_status(status: int) -> bool:
         return int(status) in {408, 425, 429} or 500 <= int(status) <= 599
+
+    @staticmethod
+    async def _run_lease_guard(lease_guard) -> None:
+        """Run an optional owner check without imposing a provider type."""
+        if lease_guard is None:
+            return
+        result = lease_guard()
+        if inspect.isawaitable(result):
+            await result
+
+    @staticmethod
+    def _snapshot_lease_kwargs(snapshot_lease) -> dict:
+        """Expose only the stable lease identity to storage publication."""
+        if not isinstance(snapshot_lease, dict):
+            return {}
+        request_id = str(snapshot_lease.get("request_id") or "").strip()
+        owner = str(snapshot_lease.get("owner") or "").strip()
+        try:
+            fence = int(snapshot_lease.get("fence"))
+        except (TypeError, ValueError, OverflowError):
+            fence = 0
+        if not request_id or not owner or fence < 1:
+            return {}
+        return {
+            "lease_request_id": request_id,
+            "lease_owner": owner,
+            "lease_fence": fence,
+        }
+
+    @staticmethod
+    def _resolved_calendar_dates(calendar_evidence, requested: str, target_sessions: int, completed_end: str):
+        """Validate a coordinator-produced calendar window, if supplied."""
+        if not isinstance(calendar_evidence, dict) or not calendar_evidence.get("calendar_resolved"):
+            return None
+        raw_dates = calendar_evidence.get("calendar_dates")
+        if isinstance(raw_dates, str):
+            raw_dates = [raw_dates]
+        if not isinstance(raw_dates, (list, tuple)) or not raw_dates:
+            raise TushareCalendarError("resolved calendar evidence has no dates")
+        dates: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_dates:
+            value = TushareBulkDailyProvider._date(raw)
+            if not value or value in seen or value > completed_end or value > requested:
+                raise TushareCalendarError("resolved calendar evidence contains an invalid date")
+            seen.add(value)
+            dates.append(value)
+        if dates != sorted(dates, reverse=True):
+            raise TushareCalendarError("resolved calendar evidence is not newest-first")
+        target = TushareBulkDailyProvider._date(calendar_evidence.get("calendar_target_date") or dates[0])
+        if not target or target != dates[0]:
+            raise TushareCalendarError("resolved calendar target does not match its date window")
+        if len(dates) < target_sessions:
+            raise TushareCalendarError(
+                f"resolved calendar evidence returned only {len(dates)} sessions; {target_sessions} required",
+                available_dates=dates,
+                required_sessions=target_sessions,
+            )
+        return dates[:target_sessions]
 
     async def _post_json(self, client, payload: dict) -> dict:
         operation = self._operation_for_payload(payload)
@@ -1517,12 +1725,23 @@ class TushareBulkDailyProvider:
                     fail(batch_id, str(exc)[:500])
             raise
 
-    async def fetch_bulk_daily_result(self, trade_date: str = "", *, lookback_days: int | None = None, session_count: int | None = None, max_pages: int = 1000) -> BulkDailyResult:
+    async def fetch_bulk_daily_result(
+        self,
+        trade_date: str = "",
+        *,
+        lookback_days: int | None = None,
+        session_count: int | None = None,
+        max_pages: int = 1000,
+        calendar_evidence: dict | None = None,
+        lease_guard=None,
+        snapshot_lease: dict | None = None,
+    ) -> BulkDailyResult:
         requested = self._date(trade_date or datetime.now(CHINA_TZ).date().isoformat())
         if not requested:
             raise ValueError("trade_date must be YYYY-MM-DD")
         original_requested = requested
         self._check_breaker()
+        await self._run_lease_guard(lease_guard)
         diagnostics: dict[str, object] = {
             "requested_date": requested,
             "network_failed": 0,
@@ -1545,7 +1764,25 @@ class TushareBulkDailyProvider:
                 if session_count is not None or lookback_days is None
                 else {"lookback_days": target_sessions}
             )
-            dates = await self.fetch_completed_trade_dates(requested, **calendar_kwargs)
+            dates = self._resolved_calendar_dates(calendar_evidence, requested, target_sessions, completed_end)
+            if dates is None:
+                dates = await self.fetch_completed_trade_dates(requested, **calendar_kwargs)
+            else:
+                # The coordinator already paid for this immutable window.
+                # Keep the provider's market-policy state in sync without a
+                # second trade_cal request.
+                self._allowed_bj_dates = set(dates)
+                self._bj_calendar_available = bool(calendar_evidence.get("bj_calendar_available", True))
+                self._calendar_evidence_policy = str(calendar_evidence.get("calendar_policy") or "sse_fallback")
+                self._last_completed_calendar_dates = list(dates)
+                diagnostics["calendar_reused"] = True
+                diagnostics["calendar_evidence"] = {
+                    "source": str(calendar_evidence.get("calendar_source") or "tushare")[:40],
+                    "target_date": dates[0],
+                    "session_count": len(dates),
+                    "policy": self._calendar_evidence_policy,
+                }
+            await self._run_lease_guard(lease_guard)
         except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
             diagnostics["network_failed"] = 1
             self.last_diagnostics = diagnostics
@@ -1605,7 +1842,9 @@ class TushareBulkDailyProvider:
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
         diagnostics["dates_requested"] = len(dates)
         try:
+            await self._run_lease_guard(lease_guard)
             universe_evidence = await self.fetch_universe_evidence(dates[0], max_pages=max_pages)
+            await self._run_lease_guard(lease_guard)
         except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
             diagnostics["network_failed"] = 1
             self.last_diagnostics = diagnostics
@@ -1667,6 +1906,7 @@ class TushareBulkDailyProvider:
         try:
             async with self.http.slot() as client:
                 for date in dates:
+                    await self._run_lease_guard(lease_guard)
                     stored_page_size = self.page_size
                     try:
                         stored_page_size = max(1, min(int(batch_record.get("page_size") or self.page_size), 6000))
@@ -1695,6 +1935,7 @@ class TushareBulkDailyProvider:
                         return await self.fetch_daily_page(date, offset=offset, page_size=page_size, client=client)
                     remaining_pages = max(1, int(max_pages) - start_page)
                     async for page_no, raw_page in self._iter_pages(load_page, limit=size, max_pages=remaining_pages, start_page=start_page):
+                        await self._run_lease_guard(lease_guard)
                         diagnostics["pages"] = int(diagnostics["pages"]) + 1
                         # Stop decisions happen inside _iter_pages before any
                         # market-policy filtering; a filtered short page must
@@ -1808,6 +2049,7 @@ class TushareBulkDailyProvider:
         complete = False
         if self.storage is not None:
             try:
+                await self._run_lease_guard(lease_guard)
                 published = self.storage.publish_raw_batch(
                     batch_id,
                     expected_trade_dates=dates,
@@ -1815,7 +2057,9 @@ class TushareBulkDailyProvider:
                     quality="good",
                     source="tushare",
                     shadow=not self.raw_publish_enabled,
+                    **self._snapshot_lease_kwargs(snapshot_lease),
                 )
+                await self._run_lease_guard(lease_guard)
                 complete = isinstance(published, dict) and str(published.get("status") or "") == "published"
                 if not complete:
                     raise TusharePublishError("raw batch publication did not return published status")

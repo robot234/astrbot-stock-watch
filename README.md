@@ -10,7 +10,7 @@
 - 盘中轮询自选股，触发信号后推送提醒
 - 盘中行情按会话合并抓取，信号冷却状态持久化到 SQLite
 - SQLite 使用可重复执行的 v7→v14 迁移；交易日、快照请求、候选运行、价位来源和事件均保留状态
-- v0.13.2 的 Tushare 日线采用 append-only raw 批次、活动 generation 和读取 provenance；未完成或校验失败的批次不会切换活动数据，默认切换已校验批次为 active
+- v0.13.3 的 Tushare 日线采用 append-only raw 批次、活动 generation 和读取 provenance；未完成或校验失败的批次不会切换活动数据，默认切换已校验批次为 active；跨进程快照使用带 fence 的持久租约，租约丢失时不会发布旧 owner 的批次
 - 技术指标只使用明确标记为未复权的日线；只有通过交易日、收盘价偏差和价位顺序校验的收盘计划才会用于告警和回放
 - 股票代码和名称共享本地索引；`/行情`、`/自选` 支持已同步名称，名称有歧义时会要求改用更完整名称或代码
 - 连续确认状态持久化到 SQLite，插件重启后可继续累计
@@ -65,6 +65,7 @@
 - `tushare_raw_dataset_key`：raw 日线数据集标识，默认 `tushare_daily`。
 - `tushare_raw_session_count`：每个 raw 批次保留的目标交易日数量，默认 120；日历查询会按周末和节假日扩展自然日包络。`tushare_raw_lookback_days` 已弃用，仅作为旧配置的交易日数量别名，不再表示自然日范围。`tushare_raw_max_stale_trading_days`：网络失败时允许读取活动 raw 缓存的最大交易日年龄，默认 2 天。
 - `tushare_raw_publish_enabled`：完成所有 raw 校验后是否切换为 active，默认 `true`。只有明确设为 `false` 时才发布为 `shadow`，该批次不会参与当前筛选、不会自动晋级，也不会立即触发东方财富降级。
+- `tushare_snapshot_lease_ttl_seconds` / `tushare_snapshot_lease_wait_seconds` / `tushare_snapshot_lease_poll_seconds`：跨进程 Tushare 日快照的租约有效期、等待其他 owner 完成的最长时间和轮询间隔，默认 1800/30/0.25 秒。等待超时或租约丢失只读取现有 raw 缓存，不会由 waiter 重复请求或发布。
 - `tushare_raw_chunk_size`：raw 历史指标的分块处理大小，默认 500 只。
 - `tushare_raw_min_overall_coverage` / `tushare_raw_min_market_coverage` / `tushare_raw_min_market_median_ratio`：raw 批次全市场和单市场覆盖率门槛，默认 97%/95%/95%；每日数量低于窗口中位数门槛的批次会整体拒绝，不会切换 active generation。每个 raw/evaluation 批次都必须有独立 universe 证据，不能仅凭当前 raw 分区行数自证完整。留空 `tushare_raw_universe_counts` 时，插件会独立读取 Tushare `stock_basic` 的 `L`/`D`/`P` 列表，按目标交易日计算有效 membership，并记录版本、有效日期、市场计数、状态计数、BJ 日历策略、`suspension_method=not_available_ratios_only` 和 canonical digest；这表示暂停状态未单独取得，只能按数量比率做覆盖判断。`tushare_raw_universe_version` 可限制允许的证据版本，留空时使用观测生成的版本；`tushare_raw_require_universe_evidence` 保留为兼容配置，但设为 `false` 也不会关闭 fail-closed 保护。
 - `quote_interval_seconds`：盘中自选股行情轮询间隔，默认 30 秒。

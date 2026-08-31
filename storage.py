@@ -21,6 +21,18 @@ DEFAULT_PROVIDER_BUCKETS = {
 }
 
 
+class SnapshotLeaseError(RuntimeError):
+    """A durable snapshot lease operation could not be completed safely."""
+
+
+class SnapshotLeaseCapabilityError(SnapshotLeaseError):
+    """The configured storage cannot safely provide the lease contract."""
+
+
+class SnapshotLeaseLostError(SnapshotLeaseError):
+    """A snapshot owner attempted to mutate a lease it no longer owns."""
+
+
 class RawBatchRead:
     """A point-in-time reader pinned to one published raw generation."""
 
@@ -93,6 +105,10 @@ class RawBatchRead:
 
 
 class StockStore:
+    # Main uses this marker together with method signatures to select the
+    # durable path before invoking any lease operation.
+    SNAPSHOT_LEASE_CAPABILITY = "fenced-v1"
+
     @staticmethod
     def _date_norm(value: str) -> str:
         digits = str(value or "").replace("-", "")
@@ -355,6 +371,10 @@ class StockStore:
             # Provider throttling/cache state is also draft-v14.  Keep this
             # repair additive so opening an existing v14 store is harmless.
             self._ensure_v14_provider_tables(db)
+            # Snapshot request ownership is also additive within schema 14.
+            # The lease fence is deliberately durable so an expired owner can
+            # never publish or release after a later owner takes over.
+            self._ensure_v14_snapshot_lease_columns(db)
             # Universe evidence uses durable per-status staging so a process
             # restart can resume L/D/P without activating a partial set.
             self._ensure_v14_universe_tables(db)
@@ -518,6 +538,23 @@ class StockStore:
         db.execute("CREATE INDEX IF NOT EXISTS idx_provider_api_updated ON provider_api_state(updated_at)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_provider_cache_expiry ON provider_cache(api_name,expires_at,status)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_provider_cache_digest ON provider_cache(api_name,request_digest,response_digest)")
+
+    @classmethod
+    def _ensure_v14_snapshot_lease_columns(cls, db) -> None:
+        """Add the schema-14 request lease/fence fields idempotently."""
+        if not cls._table_exists(db, "snapshot_requests"):
+            return
+        for column, definition in (
+            ("lease_owner", "TEXT NOT NULL DEFAULT ''"),
+            ("lease_fence", "INTEGER NOT NULL DEFAULT 0"),
+            ("lease_expires_at", "REAL NOT NULL DEFAULT 0"),
+            ("lease_updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ("failure_kind", "TEXT NOT NULL DEFAULT ''"),
+            ("calendar_evidence_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("provenance_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            cls._ensure_column(db, "snapshot_requests", column, definition)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_requests_lease ON snapshot_requests(lease_expires_at,state,terminal)")
 
     @classmethod
     def _ensure_v14_universe_tables(cls, db) -> None:
@@ -4015,6 +4052,9 @@ class StockStore:
         coverage: dict | None = None,
         shadow: bool = False,
         raw_publish_enabled: bool | None = None,
+        lease_request_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_fence: int | None = None,
     ) -> dict:
         """Validate a batch atomically, optionally without changing active data."""
         if raw_publish_enabled is not None:
@@ -4033,6 +4073,15 @@ class StockStore:
             ).fetchone()
             if not batch:
                 raise KeyError(f"unknown raw batch {batch_id}")
+            lease_identity = (str(lease_request_id or "").strip(), str(lease_owner or "").strip())
+            if lease_identity[0] or lease_identity[1] or lease_fence is not None:
+                try:
+                    fence_value = int(lease_fence)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise SnapshotLeaseLostError("snapshot lease fence is invalid") from exc
+                if not lease_identity[0] or not lease_identity[1] or fence_value < 1:
+                    raise SnapshotLeaseLostError("snapshot lease identity is incomplete")
+                self._assert_snapshot_lease_in_tx(db, lease_identity[0], lease_identity[1], fence_value)
             if str(batch["status"]) == "published":
                 self._validate_published_raw_batch_in_tx(db, batch)
                 result = dict(batch)
@@ -4060,6 +4109,12 @@ class StockStore:
                     raise RuntimeError("raw batch coverage metrics mismatch")
             if not detail["coverage"].get("coverage_ok"):
                 raise RuntimeError("raw batch coverage is below the configured floor")
+            # Partition, manifest, and coverage validation can take long
+            # enough for the lease to expire.  Recheck immediately before the
+            # publication mutation so an expired owner cannot commit active
+            # data merely because it claimed the lease earlier.
+            if lease_identity[0]:
+                self._assert_snapshot_lease_in_tx(db, lease_identity[0], lease_identity[1], fence_value)
             source_value = str(source or batch["source"] or batch["provider"]).strip()[:80]
             if source_value.casefold() != str(batch["source"] or batch["provider"]).strip().casefold():
                 raise ValueError("raw batch source does not match staged source")
@@ -4636,12 +4691,13 @@ class StockStore:
         with self._connect() as db:
             return [str(row[0]) for row in db.execute("SELECT origin FROM whitelist WHERE enabled=1 ORDER BY origin")]
 
-    def save_daily_quotes(self, trade_date: str, quotes, keep_days: int = 180) -> int:
+    def _daily_quote_rows(self, trade_date: str, quotes, now_text: str | None = None):
         from .core import normalize_code, normalize_stock_name
 
         normalized_trade_date = self._date_norm(trade_date)
         rows = []
         symbols = []
+        symbol_timestamp = now_text or datetime.utcnow().isoformat()
         for quote in quotes or []:
             code = normalize_code(getattr(quote, "code", ""))
             if not re.fullmatch(r"\d{6}", code):
@@ -4653,33 +4709,113 @@ class StockStore:
             name = self._stock_display_name(getattr(quote, "name", ""))
             normalized_name = normalize_stock_name(name)
             if name and normalized_name and normalized_name != code:
-                symbols.append((code, name, normalized_name, str(getattr(quote, "source", "") or "daily_quote")[:80], datetime.utcnow().isoformat()))
+                symbols.append((code, name, normalized_name, str(getattr(quote, "source", "") or "daily_quote")[:80], symbol_timestamp))
+        return normalized_trade_date, rows, symbols
+
+    def _save_daily_quotes_in_tx(self, db, trade_date: str, quotes, keep_days: int = 180, *, now_text: str | None = None) -> int:
+        normalized_trade_date, rows, symbols = self._daily_quote_rows(trade_date, quotes, now_text=now_text)
         if not rows:
             return 0
         cutoff = (datetime.strptime(normalized_trade_date, "%Y-%m-%d") - timedelta(days=keep_days)).strftime("%Y-%m-%d")
-        with self._connect() as db:
-            # A partial retry may contain fewer symbols and must not erase a
-            # usable old quote from the same trading date.
+        # A partial retry may contain fewer symbols and must not erase a
+        # usable old quote from the same trading date.
+        db.executemany(
+            "INSERT INTO daily_quotes(trade_date,code,name,price,prev_close,amount,pct_change,volume,fetched_at,source,provider_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(trade_date,code) DO UPDATE SET name=excluded.name,price=excluded.price,"
+            "prev_close=excluded.prev_close,amount=excluded.amount,pct_change=excluded.pct_change,"
+            "volume=excluded.volume,fetched_at=excluded.fetched_at,source=excluded.source,provider_ts=excluded.provider_ts",
+            rows,
+        )
+        if symbols:
             db.executemany(
-                "INSERT INTO daily_quotes(trade_date,code,name,price,prev_close,amount,pct_change,volume,fetched_at,source,provider_ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(trade_date,code) DO UPDATE SET name=excluded.name,price=excluded.price,"
-                "prev_close=excluded.prev_close,amount=excluded.amount,pct_change=excluded.pct_change,"
-                "volume=excluded.volume,fetched_at=excluded.fetched_at,source=excluded.source,provider_ts=excluded.provider_ts",
-                rows,
+                "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
+                symbols,
             )
-            if symbols:
-                db.executemany(
-                    "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
-                    "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
-                    symbols,
-                )
-            db.execute("DELETE FROM daily_quotes WHERE trade_date < ?", (cutoff,))
+        db.execute("DELETE FROM daily_quotes WHERE trade_date < ?", (cutoff,))
         return len(rows)
+
+    def save_daily_quotes(self, trade_date: str, quotes, keep_days: int = 180) -> int:
+        with self._connect() as db:
+            return self._save_daily_quotes_in_tx(db, trade_date, quotes, keep_days)
 
     @staticmethod
     def _quality_rank(value: str) -> int:
         return {"unknown": 0, "cached": 1, "degraded": 2, "partial": 3, "good": 4}.get(str(value or "").lower(), 0)
+
+    def _save_snapshot_meta_in_tx(
+        self,
+        db,
+        trade_date: str,
+        source: str,
+        quality: str,
+        complete: bool,
+        requested_date: str,
+        note: str = "",
+        *,
+        snapshot_version: int | None = None,
+        state: str | None = None,
+        attempts: int | None = None,
+        last_error: str | None = None,
+        next_retry_at: str | None = None,
+        terminal: bool | None = None,
+        now_text: str | None = None,
+    ) -> None:
+        if not trade_date:
+            return
+        source = str(source or "unknown")
+        quality = str(quality or "unknown").lower()
+        now = now_text or datetime.utcnow().isoformat()
+        current = db.execute("SELECT * FROM daily_snapshot_meta WHERE trade_date=?", (trade_date,)).fetchone()
+        # A later, smaller response is a retry state, not a replacement
+        # for a good snapshot. Keep the good payload and only advance
+        # durable retry fields.
+        downgrade = bool(current) and self._quality_rank(quality) < self._quality_rank(str(current["quality"]))
+        requested_attempts = max(0, int(attempts or 0))
+        current_attempts = max(0, int(current["attempts"] or 0)) if current else 0
+        resolved_attempts = max(current_attempts, requested_attempts)
+        if downgrade and str(current["quality"]).lower() == "good":
+            # ``attempts`` is an absolute observation from the request
+            # state machine.  Never add it again while preserving a good
+            # snapshot, even when that good row was not marked complete.
+            db.execute(
+                "UPDATE daily_snapshot_meta SET attempts=?,last_error=COALESCE(?,last_error),"
+                "next_retry_at=?,updated_at=? WHERE trade_date=?",
+                (resolved_attempts, last_error, next_retry_at, now, trade_date),
+            )
+            return
+        if current:
+            version = max(1, int(snapshot_version or current["snapshot_version"] or 1))
+            if not downgrade and snapshot_version is None:
+                version = max(version, int(current["snapshot_version"] or 1) + 1)
+        else:
+            version = max(1, int(snapshot_version or 1))
+        resolved_state = str(state or ("complete" if complete else ("partial" if quality in {"partial", "degraded"} else "unknown")))
+        db.execute(
+            "INSERT INTO daily_snapshot_meta(trade_date,source,quality,complete,requested_date,fetched_at,note,snapshot_version,state,attempts,last_error,next_retry_at,terminal,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(trade_date) DO UPDATE SET source=excluded.source,quality=excluded.quality,complete=excluded.complete,"
+            "requested_date=excluded.requested_date,fetched_at=excluded.fetched_at,note=excluded.note,snapshot_version=excluded.snapshot_version,"
+            "state=excluded.state,attempts=excluded.attempts,last_error=excluded.last_error,next_retry_at=excluded.next_retry_at,"
+            "terminal=excluded.terminal,updated_at=excluded.updated_at",
+            (
+                trade_date,
+                source,
+                quality,
+                int(bool(complete)),
+                requested_date or trade_date,
+                now,
+                note or "",
+                version,
+                resolved_state,
+                resolved_attempts,
+                last_error,
+                next_retry_at,
+                int(bool(terminal)) if terminal is not None else int(bool(current["terminal"])) if current else 0,
+                now,
+            ),
+        )
 
     def save_snapshot_meta(
         self,
@@ -4697,61 +4833,178 @@ class StockStore:
         next_retry_at: str | None = None,
         terminal: bool | None = None,
     ) -> None:
-        if not trade_date:
-            return
-        source = str(source or "unknown")
-        quality = str(quality or "unknown").lower()
-        now = datetime.utcnow().isoformat()
         with self._connect() as db:
-            current = db.execute("SELECT * FROM daily_snapshot_meta WHERE trade_date=?", (trade_date,)).fetchone()
-            # A later, smaller response is a retry state, not a replacement
-            # for a good snapshot. Keep the good payload and only advance
-            # durable retry fields.
-            downgrade = bool(current) and self._quality_rank(quality) < self._quality_rank(str(current["quality"]))
-            requested_attempts = max(0, int(attempts or 0))
-            current_attempts = max(0, int(current["attempts"] or 0)) if current else 0
-            resolved_attempts = max(current_attempts, requested_attempts)
-            if downgrade and str(current["quality"]).lower() == "good":
-                # ``attempts`` is an absolute observation from the request
-                # state machine.  Never add it again while preserving a good
-                # snapshot, even when that good row was not marked complete.
-                db.execute(
-                    "UPDATE daily_snapshot_meta SET attempts=?,last_error=COALESCE(?,last_error),"
-                    "next_retry_at=?,updated_at=? WHERE trade_date=?",
-                    (resolved_attempts, last_error, next_retry_at, now, trade_date),
+            self._save_snapshot_meta_in_tx(
+                db,
+                trade_date,
+                source,
+                quality,
+                complete,
+                requested_date,
+                note,
+                snapshot_version=snapshot_version,
+                state=state,
+                attempts=attempts,
+                last_error=last_error,
+                next_retry_at=next_retry_at,
+                terminal=terminal,
+            )
+
+    def save_tushare_snapshot_owned(
+        self,
+        request_id: str,
+        requested_date: str,
+        owner: str,
+        fence: int,
+        *,
+        quotes=None,
+        actual_trade_date: str | None = None,
+        source: str = "tushare",
+        quality: str = "unknown",
+        complete: bool = False,
+        note: str = "",
+        keep_days: int = 180,
+        snapshot_version: int | None = None,
+        state: str | None = None,
+        attempts: int | None = None,
+        last_error: str | None = None,
+        next_retry_at: str | None = None,
+        terminal: bool = False,
+        failure_kind: str = "",
+        calendar_evidence: dict | None = None,
+        provenance: dict | None = None,
+        request_state: str | None = None,
+        request_source: str | None = None,
+        request_quality: str | None = None,
+        request_last_error: str | None = None,
+        request_next_retry_at: str | None = None,
+        request_terminal: bool | None = None,
+        request_failure_kind: str | None = None,
+        persist_meta: bool = True,
+        lease_ttl_seconds: float | None = None,
+        now: float | None = None,
+    ) -> dict:
+        """Persist a Tushare snapshot and request outcome under one fence.
+
+        The lease check, quote upsert, metadata update, and request update all
+        share one ``BEGIN IMMEDIATE`` transaction.  A stale owner therefore
+        either writes nothing or receives ``SnapshotLeaseLostError``; it can
+        never leave a new quote paired with an old request outcome.
+        """
+        request_key = str(request_id or "").strip()
+        requested_value = self._date_norm(requested_date)
+        owner_value = str(owner or "").strip()
+        try:
+            fence_value = int(fence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("snapshot lease fence is invalid") from exc
+        if not request_key or not requested_value or not owner_value or fence_value < 1:
+            raise ValueError("snapshot lease identity is required")
+        if len(owner_value) > 160:
+            raise ValueError("snapshot lease owner is too long")
+        actual_value = self._date_norm(actual_trade_date) if actual_trade_date else None
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", requested_value):
+            raise ValueError("snapshot requested date is invalid")
+        if actual_value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", actual_value):
+            raise ValueError("snapshot actual trade date is invalid")
+        current = self._snapshot_lease_epoch(now)
+        now_text = datetime.utcnow().isoformat()
+        calendar_text = json.dumps(calendar_evidence or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        provenance_text = json.dumps(provenance or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        request_state_value = str(request_state if request_state is not None else state or "pending")[:32]
+        request_source_value = str(request_source if request_source is not None else source or "")[:80]
+        request_quality_value = str(request_quality if request_quality is not None else quality or "unknown")[:32]
+        request_error_value = request_last_error if request_last_error is not None else last_error
+        request_error_value = str(request_error_value)[:500] if request_error_value is not None else None
+        request_retry_value = request_next_retry_at if request_next_retry_at is not None else next_retry_at
+        request_retry_value = str(request_retry_value)[:80] if request_retry_value is not None else None
+        request_terminal_value = int(bool(request_terminal if request_terminal is not None else terminal))
+        request_failure_value = str(request_failure_kind if request_failure_kind is not None else failure_kind or "")[:64]
+        request_attempts = max(0, int(attempts or 0))
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_snapshot_lease_in_tx(db, request_key, owner_value, fence_value, now=current)
+            saved = 0
+            if persist_meta and actual_value:
+                saved = self._save_daily_quotes_in_tx(
+                    db,
+                    actual_value,
+                    quotes,
+                    keep_days,
+                    now_text=now_text,
                 )
-                return
-            if current:
-                version = max(1, int(snapshot_version or current["snapshot_version"] or 1))
-                if not downgrade and snapshot_version is None:
-                    version = max(version, int(current["snapshot_version"] or 1) + 1)
-            else:
-                version = max(1, int(snapshot_version or 1))
-            resolved_state = str(state or ("complete" if complete else ("partial" if quality in {"partial", "degraded"} else "unknown")))
-            db.execute(
-                "INSERT INTO daily_snapshot_meta(trade_date,source,quality,complete,requested_date,fetched_at,note,snapshot_version,state,attempts,last_error,next_retry_at,terminal,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(trade_date) DO UPDATE SET source=excluded.source,quality=excluded.quality,complete=excluded.complete,"
-                "requested_date=excluded.requested_date,fetched_at=excluded.fetched_at,note=excluded.note,snapshot_version=excluded.snapshot_version,"
-                "state=excluded.state,attempts=excluded.attempts,last_error=excluded.last_error,next_retry_at=excluded.next_retry_at,"
-                "terminal=excluded.terminal,updated_at=excluded.updated_at",
-                (
-                    trade_date,
+                self._save_snapshot_meta_in_tx(
+                    db,
+                    actual_value,
                     source,
                     quality,
-                    int(bool(complete)),
-                    requested_date or trade_date,
-                    now,
-                    note or "",
-                    version,
-                    resolved_state,
-                    resolved_attempts,
-                    last_error,
-                    next_retry_at,
-                    int(bool(terminal)) if terminal is not None else int(bool(current["terminal"])) if current else 0,
-                    now,
-                ),
+                    complete,
+                    requested_value,
+                    note,
+                    snapshot_version=snapshot_version,
+                    state=state,
+                    attempts=request_attempts,
+                    last_error=last_error,
+                    next_retry_at=next_retry_at,
+                    terminal=terminal,
+                    now_text=now_text,
+                )
+            elif quotes and actual_value:
+                saved = self._save_daily_quotes_in_tx(
+                    db,
+                    actual_value,
+                    quotes,
+                    keep_days,
+                    now_text=now_text,
+                )
+            self._assert_snapshot_lease_in_tx(db, request_key, owner_value, fence_value, now=current)
+            assignments = (
+                "requested_date=?,actual_trade_date=?,state=?,attempts=?,source=?,quality=?,"
+                "last_error=?,next_retry_at=?,terminal=?,failure_kind=?,calendar_evidence_json=?,"
+                "provenance_json=?,updated_at=?"
             )
+            values = [
+                requested_value,
+                actual_value,
+                request_state_value,
+                request_attempts,
+                request_source_value,
+                request_quality_value,
+                request_error_value,
+                request_retry_value,
+                request_terminal_value,
+                request_failure_value,
+                calendar_text,
+                provenance_text,
+                now_text,
+            ]
+            if lease_ttl_seconds is not None:
+                row = db.execute("SELECT lease_expires_at FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+                try:
+                    expiry = float(row["lease_expires_at"] or 0) if row else 0.0
+                except (TypeError, ValueError, OverflowError):
+                    expiry = 0.0
+                new_expiry = max(expiry, current + self._snapshot_lease_ttl(lease_ttl_seconds))
+                assignments += ",lease_expires_at=?,lease_updated_at=?"
+                values.extend((new_expiry, now_text))
+            values.extend((request_key, owner_value, fence_value, current))
+            cursor = db.execute(
+                f"UPDATE snapshot_requests SET {assignments} WHERE request_id=? AND lease_owner=? AND lease_fence=? AND lease_expires_at>? AND terminal=0",
+                values,
+            )
+            if cursor.rowcount <= 0:
+                raise SnapshotLeaseLostError("snapshot lease update lost ownership")
+            refreshed = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+            result = self._snapshot_lease_view(refreshed, current, acquired=True, owner=owner_value, fence=fence_value)
+            result["saved_quotes"] = saved
+            return result
+
+    # Compatibility spellings for integrations that describe the operation as
+    # a generic snapshot-result persistence call.
+    persist_tushare_snapshot_owned = save_tushare_snapshot_owned
+    save_snapshot_result_owned = save_tushare_snapshot_owned
+    persist_snapshot_result_owned = save_tushare_snapshot_owned
 
     def snapshot_meta(self, trade_date: str) -> dict | None:
         with self._connect() as db:
@@ -4765,6 +5018,284 @@ class StockStore:
             else:
                 row = db.execute("SELECT * FROM daily_snapshot_meta ORDER BY trade_date DESC LIMIT 1").fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    def _snapshot_lease_epoch(now: float | None = None) -> float:
+        current = float(time.time() if now is None else now)
+        if not math.isfinite(current) or current < 0:
+            raise ValueError("snapshot lease clock value is invalid")
+        return current
+
+    @staticmethod
+    def _snapshot_lease_ttl(value: float) -> float:
+        ttl = float(value)
+        if not math.isfinite(ttl) or ttl <= 0:
+            raise ValueError("snapshot lease TTL is invalid")
+        return max(5.0, min(ttl, 86400.0))
+
+    @classmethod
+    def _snapshot_lease_view(cls, row, now: float, **extra) -> dict:
+        value = dict(row) if row is not None else {}
+        try:
+            expiry = float(value.get("lease_expires_at") or 0)
+        except (TypeError, ValueError, OverflowError):
+            expiry = 0.0
+        owner = str(value.get("lease_owner") or "")
+        value.update({
+            "lease_active": bool(owner and expiry > now),
+            "lease_stale": bool(owner and expiry <= now),
+            "lease_expires_at": expiry,
+        })
+        value.update(extra)
+        return value
+
+    @classmethod
+    def _assert_snapshot_lease_in_tx(cls, db, request_id: str, owner: str, fence: int, *, now: float | None = None) -> None:
+        """Fail closed unless one transaction still owns a live lease."""
+        request_key = str(request_id or "").strip()
+        owner_value = str(owner or "").strip()
+        try:
+            fence_value = int(fence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SnapshotLeaseLostError("snapshot lease fence is invalid") from exc
+        if not request_key or not owner_value or fence_value < 1:
+            raise SnapshotLeaseLostError("snapshot lease identity is incomplete")
+        current = cls._snapshot_lease_epoch(now)
+        row = db.execute(
+            "SELECT lease_owner,lease_fence,lease_expires_at,state,terminal FROM snapshot_requests WHERE request_id=?",
+            (request_key,),
+        ).fetchone()
+        try:
+            expiry = float(row["lease_expires_at"] or 0) if row else 0.0
+        except (TypeError, ValueError, OverflowError):
+            expiry = 0.0
+        state = str(row["state"] or "").strip().lower() if row else ""
+        if (
+            not row
+            or str(row["lease_owner"] or "") != owner_value
+            or int(row["lease_fence"] or 0) != fence_value
+            or int(row["terminal"] or 0)
+            or state in {"complete", "terminal"}
+            or expiry <= current
+        ):
+            raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
+
+    def snapshot_lease_state(self, request_id: str, *, now: float | None = None) -> dict | None:
+        """Read request state and whether its durable lease is currently live."""
+        current = self._snapshot_lease_epoch(now)
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (str(request_id or ""),)).fetchone()
+            return self._snapshot_lease_view(row, current) if row else None
+
+    def claim_snapshot_lease(
+        self,
+        request_id: str,
+        requested_date: str,
+        owner: str,
+        *,
+        ttl_seconds: float = 1800.0,
+        now: float | None = None,
+    ) -> dict:
+        """Atomically claim or renew one schema-14 daily snapshot lease.
+
+        A live lease owned by another process is never replaced.  An expired
+        lease is replaced with a strictly larger fence, which makes later
+        writes from the old owner fail their owner/fence comparison.
+        """
+        request_key = str(request_id or "").strip()
+        date_value = self._date_norm(requested_date)
+        owner_value = str(owner or "").strip()
+        if not request_key or not date_value or not owner_value:
+            raise ValueError("snapshot lease identity is required")
+        if len(owner_value) > 160:
+            raise ValueError("snapshot lease owner is too long")
+        current = self._snapshot_lease_epoch(now)
+        ttl = self._snapshot_lease_ttl(ttl_seconds)
+        expiry = current + ttl
+        now_text = datetime.utcnow().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO snapshot_requests(request_id,requested_date,state,attempts,source,quality,terminal,created_at,updated_at) "
+                "VALUES(?,?, 'pending',0,'','unknown',0,?,?) ON CONFLICT(request_id) DO NOTHING",
+                (request_key, date_value, now_text, now_text),
+            )
+            row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+            if not row:
+                raise RuntimeError("snapshot lease request could not be created")
+            state = str(row["state"] or "").strip().lower()
+            terminal = bool(int(row["terminal"] or 0)) or state in {"complete", "terminal"}
+            if terminal:
+                # Preserve the persisted owner/fence in the response.  A
+                # terminal row is not claimable, and reporting the requester
+                # here would make a waiter look like the lease owner.
+                return self._snapshot_lease_view(row, current, acquired=False, reason="terminal")
+            current_owner = str(row["lease_owner"] or "")
+            try:
+                current_expiry = float(row["lease_expires_at"] or 0)
+            except (TypeError, ValueError, OverflowError):
+                current_expiry = 0.0
+            try:
+                current_fence = max(0, int(row["lease_fence"] or 0))
+            except (TypeError, ValueError, OverflowError):
+                current_fence = 0
+            if current_owner and current_expiry > current and current_owner != owner_value:
+                return self._snapshot_lease_view(
+                    row,
+                    current,
+                    acquired=False,
+                    owner=current_owner,
+                    fence=current_fence,
+                    reason="active",
+                )
+            if current_owner == owner_value and current_expiry > current:
+                renewed_expiry = max(current_expiry, expiry)
+                db.execute(
+                    "UPDATE snapshot_requests SET lease_expires_at=?,lease_updated_at=?,updated_at=? WHERE request_id=? AND lease_owner=? AND lease_fence=?",
+                    (renewed_expiry, now_text, now_text, request_key, owner_value, current_fence),
+                )
+                refreshed = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+                return self._snapshot_lease_view(refreshed, current, acquired=True, renewed=True, owner=owner_value, fence=current_fence)
+            next_fence = current_fence + 1
+            cursor = db.execute(
+                "UPDATE snapshot_requests SET state='fetching',terminal=0,next_retry_at=NULL,lease_owner=?,lease_fence=?,lease_expires_at=?,lease_updated_at=?,attempts=MAX(attempts,0)+1,updated_at=? "
+                "WHERE request_id=? AND (lease_owner='' OR lease_expires_at<=? OR (lease_owner=? AND lease_fence=?))",
+                (owner_value, next_fence, expiry, now_text, now_text, request_key, current, owner_value, current_fence),
+            )
+            if cursor.rowcount <= 0:
+                refreshed = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+                return self._snapshot_lease_view(refreshed, current, acquired=False, owner=str(refreshed["lease_owner"] or ""), fence=int(refreshed["lease_fence"] or 0), reason="contended")
+            refreshed = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+            return self._snapshot_lease_view(refreshed, current, acquired=True, renewed=False, owner=owner_value, fence=next_fence)
+
+    def renew_snapshot_lease(
+        self,
+        request_id: str,
+        owner: str,
+        fence: int,
+        *,
+        ttl_seconds: float = 1800.0,
+        now: float | None = None,
+    ) -> dict | None:
+        """Extend a lease only when owner and fence still match."""
+        request_key = str(request_id or "").strip()
+        owner_value = str(owner or "").strip()
+        try:
+            fence_value = int(fence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("snapshot lease fence is invalid") from exc
+        if not request_key or not owner_value or fence_value < 1:
+            raise ValueError("snapshot lease identity is required")
+        current = self._snapshot_lease_epoch(now)
+        expiry = current + self._snapshot_lease_ttl(ttl_seconds)
+        now_text = datetime.utcnow().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                "UPDATE snapshot_requests SET lease_expires_at=MAX(lease_expires_at,?),lease_updated_at=?,updated_at=? "
+                "WHERE request_id=? AND lease_owner=? AND lease_fence=? AND lease_expires_at>? AND terminal=0",
+                (expiry, now_text, now_text, request_key, owner_value, fence_value, current),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+            return self._snapshot_lease_view(row, current, renewed=True, owner=owner_value, fence=fence_value)
+
+    def release_snapshot_lease(self, request_id: str, owner: str, fence: int, *, now: float | None = None) -> bool:
+        """Release only the currently owned lease; stale owners are ignored."""
+        request_key = str(request_id or "").strip()
+        owner_value = str(owner or "").strip()
+        try:
+            fence_value = int(fence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("snapshot lease fence is invalid") from exc
+        if not request_key or not owner_value or fence_value < 1:
+            return False
+        self._snapshot_lease_epoch(now)
+        now_text = datetime.utcnow().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                "UPDATE snapshot_requests SET lease_owner='',lease_expires_at=0,lease_updated_at=?,updated_at=? WHERE request_id=? AND lease_owner=? AND lease_fence=?",
+                (now_text, now_text, request_key, owner_value, fence_value),
+            )
+            return cursor.rowcount > 0
+
+    def save_snapshot_request_owned(
+        self,
+        request_id: str,
+        requested_date: str,
+        owner: str,
+        fence: int,
+        *,
+        actual_trade_date: str | None = None,
+        state: str = "pending",
+        attempts: int | None = None,
+        source: str = "",
+        quality: str = "unknown",
+        last_error: str | None = None,
+        next_retry_at: str | None = None,
+        terminal: bool = False,
+        failure_kind: str = "",
+        calendar_evidence: dict | None = None,
+        provenance: dict | None = None,
+        lease_ttl_seconds: float | None = None,
+        now: float | None = None,
+    ) -> dict:
+        """Persist request state only for the live owner/fence pair."""
+        request_key = str(request_id or "").strip()
+        date_value = self._date_norm(requested_date)
+        owner_value = str(owner or "").strip()
+        try:
+            fence_value = int(fence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("snapshot lease fence is invalid") from exc
+        if not request_key or not date_value or not owner_value or fence_value < 1:
+            raise ValueError("snapshot lease identity is required")
+        current = self._snapshot_lease_epoch(now)
+        now_text = datetime.utcnow().isoformat()
+        calendar_text = json.dumps(calendar_evidence or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        provenance_text = json.dumps(provenance or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        fields = {
+            "actual_trade_date": self._date_norm(actual_trade_date) if actual_trade_date else None,
+            "state": str(state or "pending")[:32],
+            "attempts": max(0, int(attempts or 0)),
+            "source": str(source or "")[:80],
+            "quality": str(quality or "unknown")[:32],
+            "last_error": str(last_error)[:500] if last_error is not None else None,
+            "next_retry_at": str(next_retry_at)[:80] if next_retry_at is not None else None,
+            "terminal": int(bool(terminal)),
+            "failure_kind": str(failure_kind or "")[:64],
+            "calendar_evidence_json": calendar_text,
+            "provenance_json": provenance_text,
+            "updated_at": now_text,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+            if not row:
+                raise SnapshotLeaseLostError("snapshot lease request is missing")
+            try:
+                expiry = float(row["lease_expires_at"] or 0)
+            except (TypeError, ValueError, OverflowError):
+                expiry = 0.0
+            if str(row["lease_owner"] or "") != owner_value or int(row["lease_fence"] or 0) != fence_value or expiry <= current:
+                raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
+            assignments = ",".join(f"{name}=?" for name in fields)
+            values = list(fields.values())
+            if lease_ttl_seconds is not None:
+                new_expiry = max(expiry, current + self._snapshot_lease_ttl(lease_ttl_seconds))
+                assignments += ",lease_expires_at=?,lease_updated_at=?"
+                values.extend((new_expiry, now_text))
+            values.append(request_key)
+            cursor = db.execute(
+                f"UPDATE snapshot_requests SET requested_date=?,{assignments} WHERE request_id=? AND lease_owner=? AND lease_fence=? AND lease_expires_at>?",
+                [date_value, *values, owner_value, fence_value, current],
+            )
+            if cursor.rowcount <= 0:
+                raise SnapshotLeaseLostError("snapshot lease update lost ownership")
+            refreshed = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+            return self._snapshot_lease_view(refreshed, current, acquired=True, owner=owner_value, fence=fence_value)
 
     def save_snapshot_request(
         self,

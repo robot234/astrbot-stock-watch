@@ -7,8 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
-EXPECTED_VERSION = "0.13.2"
+EXPECTED_VERSION = "0.13.3"
 TEXT_SUFFIXES = (".py", ".json", ".yaml", ".yml", ".md")
+VERIFICATION_PATH_PREFIX = "tools/verification/"
 FORBIDDEN_PATH_PARTS = (
     "tests/",
     "__pycache__/",
@@ -89,7 +90,7 @@ def main() -> int:
         if any(part in lowered for part in FORBIDDEN_PATH_PARTS):
             print("FAIL prohibited release artifact", name)
             return 1
-        if lowered.startswith("test_") or "/test_" in lowered:
+        if not lowered.startswith(VERIFICATION_PATH_PREFIX) and (lowered.startswith("test_") or "/test_" in lowered):
             print("FAIL test file tracked", name)
             return 1
     for name in tracked:
