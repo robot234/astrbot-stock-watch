@@ -79,7 +79,7 @@ def _candidate(code, score=20):
 
 def test_schema_v17_review_batch_is_idempotent_and_complete(tmp_path):
     store = StockStore(tmp_path / "ai-review.sqlite3")
-    assert store.schema_version() == 23
+    assert store.schema_version() == 24
     _record(store, "r1", code="600000", version="v1")
     _record(store, "r2", code="600001", version="v1")
 

@@ -72,7 +72,7 @@ def test_freeze_is_immutable_and_does_not_publish_formal_candidates(tmp_path):
     assert store.current_research_radar("600000", first["run_id"]) is None
     assert store.active_candidate_runs() == []
     assert store.recent_screen_runs() == []
-    assert store.schema_version() == 23
+    assert store.schema_version() == 24
 
 
 def test_plugin_freezes_current_day_only_and_keeps_pools_disjoint(tmp_path):

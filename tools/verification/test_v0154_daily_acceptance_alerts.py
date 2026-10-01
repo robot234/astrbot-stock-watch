@@ -41,7 +41,7 @@ def _complete_day(store: StockStore, *, candidate_count: int = 0, run_id: str = 
 
 def test_schema_v18_deduplicates_anomaly_and_emits_recovery(tmp_path):
     store = StockStore(tmp_path / "acceptance.sqlite3")
-    assert store.schema_version() == 23
+    assert store.schema_version() == 24
 
     first = store.evaluate_daily_acceptance(TRADE_DATE, now=NOW)
     assert first["status"] == "critical" and first["event_kind"] == "anomaly"
@@ -167,7 +167,7 @@ def test_schema_v17_database_migrates_additively_to_v18(tmp_path):
         db.execute("UPDATE schema_meta SET value='17' WHERE key='schema_version'")
 
     upgraded = StockStore(database)
-    assert upgraded.schema_version() == 23
+    assert upgraded.schema_version() == 24
     with upgraded._connect() as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"daily_acceptance_runs", "daily_acceptance_events", "daily_acceptance_alerts"}.issubset(tables)

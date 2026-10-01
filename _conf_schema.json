@@ -111,6 +111,8 @@
   "screen_min_indicator_coverage": {"type": "float", "description": "完整空结果允许清理候选池所需的技术指标覆盖率", "default": 0.8},
   "min_score": {"type": "int", "description": "技术评分最低分（建议先用10，分数只用于排序）", "default": 10},
   "fallback_limit": {"type": "int", "description": "无达标项时最多保留的观察候选数", "default": 5},
+  "degraded_watch_enabled": {"type": "bool", "description": "自动收盘校验失败时保存降级观察名单（数据不完整、未验证，不进入跟踪和胜率统计），重试用尽时推送一次", "default": true},
+  "degraded_watch_limit": {"type": "int", "description": "降级观察名单最多列出的股票数（1-50）", "default": 10},
   "price_min": {"type": "float", "description": "最低股价", "default": 2},
   "price_max": {"type": "float", "description": "最高股价", "default": 80},
   "news_rss_url": {"type": "string", "description": "可选 RSS 地址，留空关闭故事监听", "default": ""},

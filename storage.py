@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .data_evidence import factor_capture, stamp as evidence_stamp
 
-LATEST_SCHEMA_VERSION = 23
+LATEST_SCHEMA_VERSION = 24
 DEFAULT_RAW_MIN_ROW_COUNT = 4000
 DEFAULT_RAW_REQUIRE_UNIVERSE_EVIDENCE = True
 DEFAULT_PROVIDER_BUCKETS = {
@@ -328,6 +328,7 @@ class StockStore:
                 (21, self._migrate_v21_risk_qualification),
                 (22, self._migrate_v22_paper_bridge),
                 (23, self._migrate_v23_paper_forward),
+                (24, self._migrate_v24_degraded_watch),
             )
             pending = [(version, migration) for version, migration in migrations if current < version]
             if pending:
@@ -5670,7 +5671,10 @@ class StockStore:
         keys = ("input", "risk_tuple_complete", "tradable", "indicator_targets", "indicator_raw_batch",
                 "indicator_network", "indicator_memory_cache", "indicator_persistent_cache",
                 "indicator_failed", "enriched", "indicator_coverage", "screen_min_indicator_coverage",
-                "candidate_count", "valid_empty", "raw_batch_id")
+                "candidate_count", "valid_empty", "raw_batch_id", "risk_confirmed", "history_missing",
+                "observation_universe_targets", "observation_universe_enriched", "observation_universe_coverage",
+                "indicator_targets_risk_unknown", "indicator_source_counts", "indicator_price_basis_counts",
+                "observation_count", "market_stats_confirmed", "degraded_reason", "degraded_missing")
         summary = {key: diagnostics.get(key) for key in keys if key in diagnostics}
         with self._connect() as db:
             row = db.execute("SELECT automatic_attempts FROM job_runs WHERE job_key=?", (job_key,)).fetchone()
@@ -9615,3 +9619,58 @@ class StockStore:
                 (str(origin), max(1, min(int(limit), 50))),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    @staticmethod
+    def _migrate_v24_degraded_watch(db) -> None:
+        """Unverified watch lists live apart from screen_candidates and recommendations."""
+        db.execute("""CREATE TABLE IF NOT EXISTS degraded_watch_lists(
+            job_key TEXT NOT NULL, attempt INTEGER NOT NULL, trade_date TEXT NOT NULL,
+            reason TEXT NOT NULL, missing_json TEXT NOT NULL, diagnostics_json TEXT NOT NULL,
+            items_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(job_key, attempt)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_degraded_watch_trade_date ON degraded_watch_lists(trade_date, created_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS degraded_watch_pushes(
+            trade_date TEXT PRIMARY KEY, claimed_at TEXT NOT NULL
+        )""")
+
+    def save_degraded_watch_list(self, job_key: str, trade_date: str, reason: str, missing: list,
+                                 diagnostics: dict, items: list) -> int:
+        """Store one unverified watch list per automatic attempt; never touches formal tables."""
+        def dump(value) -> str:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, default=str)
+
+        with self._connect() as db:
+            row = db.execute("SELECT automatic_attempts FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
+            attempt = int(row[0] or 0) if row else 0
+            db.execute(
+                "INSERT OR IGNORE INTO degraded_watch_lists(job_key,attempt,trade_date,reason,missing_json,"
+                "diagnostics_json,items_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (str(job_key), attempt, str(trade_date), str(reason)[:500], dump(list(missing or [])),
+                 dump(dict(diagnostics or {})), dump(list(items or [])[:50]), _utcnow_naive().isoformat()),
+            )
+        return attempt
+
+    def claim_degraded_watch_push(self, trade_date: str) -> bool:
+        """At most one degraded-watch push per trade date, claimed before sending."""
+        with self._connect() as db:
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO degraded_watch_pushes(trade_date,claimed_at) VALUES(?,?)",
+                (str(trade_date), _utcnow_naive().isoformat()),
+            )
+            return cursor.rowcount == 1
+
+    def latest_degraded_watch_list(self) -> dict | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM degraded_watch_lists ORDER BY trade_date DESC,attempt DESC,created_at DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        for key in ("missing_json", "diagnostics_json", "items_json"):
+            try:
+                value[key[:-5]] = json.loads(value.pop(key) or "null")
+            except (TypeError, ValueError):
+                value[key[:-5]] = None
+        return value

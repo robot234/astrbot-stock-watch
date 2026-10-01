@@ -76,10 +76,13 @@ class ScreenScoreResult:
 
     candidates: tuple[Candidate, ...]
     diagnostics: Mapping[str, object]
+    # Unverified technical observations kept apart from formal candidates.
+    # They never feed recommendation tracking or performance statistics.
+    observations: tuple[Candidate, ...] = ()
 
     @classmethod
-    def build(cls, candidates, diagnostics: Mapping[str, object] | None = None) -> "ScreenScoreResult":
-        return cls(tuple(candidates or ()), MappingProxyType(dict(diagnostics or {})))
+    def build(cls, candidates, diagnostics: Mapping[str, object] | None = None, observations=()) -> "ScreenScoreResult":
+        return cls(tuple(candidates or ()), MappingProxyType(dict(diagnostics or {})), tuple(observations or ()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -4022,19 +4025,30 @@ class Main(Star):
             )
         if include_factors:
             await self._fill_quote_names(quotes, as_of)
-        tradable = [quote for quote in quotes if is_screenable(
-            quote,
-            self._float("price_min", 2, 0.01, 100000),
-            self._float("price_max", 80, 0.01, 100000),
-        )]
+        price_min = self._float("price_min", 2, 0.01, 100000)
+        price_max = self._float("price_max", 80, 0.01, 100000)
+        tradable = [quote for quote in quotes if is_screenable(quote, price_min, price_max)]
         tradable.sort(key=lambda quote: (float(quote.amount or 0), str(quote.code)), reverse=True)
         deep_limit = self._int("deep_screen_limit", 300, 1, 1000)
         enrich_targets = tradable[:deep_limit]
+        raw_mode = self._tushare_mode()
+        # Observation universe: price-eligible names without an explicit
+        # suspension/limit/ST block, ranked by amount.  Names whose risk
+        # fields are merely unverified stay here so the diagnostics can show
+        # the real top-N indicator coverage, but they are scored only for the
+        # degraded watch list and never enter the formal candidate path.
+        observation_universe = sorted(
+            (quote for quote in quotes if is_tradable(quote, price_min, price_max)),
+            key=lambda quote: (float(quote.amount or 0), str(quote.code)),
+            reverse=True,
+        )[:deep_limit] if raw_mode else []
+        formal_codes = {quote.code for quote in enrich_targets}
+        observation_only = [quote for quote in observation_universe if quote.code not in formal_codes]
         before = as_of or datetime.now(CHINA_TZ).date().isoformat()
         indicator_status: dict[str, str] = {}
+        observation_status: dict[str, str] = {}
         persistent: dict[str, list[dict]] = {}
         history_reason = ""
-        raw_mode = self._tushare_mode()
         initial_diagnostics = dict(base_diagnostics or {})
         raw_diagnostics = self._raw_diagnostics(initial_diagnostics) if raw_mode else {}
         prior_history_unavailable = bool(initial_diagnostics.get("history_unavailable")) if raw_mode else False
@@ -4045,7 +4059,7 @@ class Main(Star):
             # market snapshot does not create one task or one temporary list
             # per symbol, and never invoke the legacy per-symbol loader.
             persistent, provenance, history_reason = await self._read_fresh_raw_history_async(
-                [q.code for q in enrich_targets], before,
+                [q.code for q in enrich_targets] + [q.code for q in observation_only], before,
             )
             raw_provenance = dict(provenance or {})
             chunk_size = self._raw_chunk()
@@ -4061,6 +4075,11 @@ class Main(Star):
                         indicator_status[quote.code] = "raw_batch"
                     else:
                         indicator_status[quote.code] = "history_failed"
+            for quote in observation_only:
+                bars, rejection = self._raw_indicator_rows(persistent.get(quote.code, []), expected_code=quote.code)
+                observation_status[quote.code] = (
+                    "raw_batch" if not rejection and apply_daily_indicators(quote, bars) else "history_failed"
+                )
         else:
             load_daily_bars = getattr(self.store, "latest_daily_bars", None)
             persistent = (
@@ -4139,6 +4158,31 @@ class Main(Star):
             "diagnostics_requested_date": str(requested_date or as_of or ""),
             "diagnostics_actual_date": str(as_of or ""),
         }
+        # Source/basis accounting over every quote that received usable
+        # indicators, plus the observation universe that also includes names
+        # whose suspension/limit/ST evidence is not yet verified.
+        observation_enriched = sum(1 for value in observation_status.values() if value == "raw_batch")
+        usable_quotes = [quote for quote in enrich_targets if indicator_status.get(quote.code) in {
+            "network", "memory_cache", "persistent_cache", "raw_batch"}]
+        usable_quotes += [quote for quote in observation_only if observation_status.get(quote.code) == "raw_batch"]
+        source_counts: dict[str, int] = {}
+        basis_counts: dict[str, int] = {}
+        for quote in usable_quotes:
+            source_key = str(getattr(quote, "indicator_source", "") or "unknown").strip().lower() or "unknown"
+            basis_key = str(getattr(quote, "indicator_price_basis", "") or "unknown").strip().lower() or "unknown"
+            source_counts[source_key] = source_counts.get(source_key, 0) + 1
+            basis_counts[basis_key] = basis_counts.get(basis_key, 0) + 1
+        universe_targets = len(enrich_targets) + len(observation_only)
+        universe_enriched = enriched + observation_enriched
+        diagnostics.update({
+            "risk_confirmed": len(tradable),
+            "observation_universe_targets": universe_targets,
+            "observation_universe_enriched": universe_enriched,
+            "observation_universe_coverage": round(universe_enriched / universe_targets, 4) if universe_targets else 0.0,
+            "indicator_targets_risk_unknown": len(observation_only),
+            "indicator_source_counts": dict(sorted(source_counts.items())),
+            "indicator_price_basis_counts": dict(sorted(basis_counts.items())),
+        })
         if raw_mode:
             diagnostics.update({
                 "raw_dataset_key": self._raw_dataset(),
@@ -4397,7 +4441,44 @@ class Main(Star):
                         else:
                             item.factor_overlay.current_industry_name = current
         diagnostics["candidate_count"] = len(final_candidates)
-        return ScreenScoreResult.build(final_candidates, diagnostics)
+        observations = self._degraded_observations(
+            scored,
+            [quote for quote in observation_only if observation_status.get(quote.code) == "raw_batch"],
+            context=context,
+            price_min=price_min,
+            price_max=price_max,
+        )
+        diagnostics["observation_count"] = len(observations)
+        return ScreenScoreResult.build(final_candidates, diagnostics, observations)
+
+    def _degraded_observations(self, scored, extra_quotes, *, context: str, price_min: float, price_max: float) -> list[Candidate]:
+        """Rank unverified technical observations for the degraded watch list.
+
+        Only names with usable unadjusted history are kept; an explicit
+        suspension/limit/ST/fundamental block always excludes a name.  Every
+        name whose risk tuple is not fully verified is labelled ``unknown`` so
+        nothing here can be mistaken for a formal candidate.
+        """
+        limit = self._int("degraded_watch_limit", 10, 1, 50)
+        pool: list[Candidate] = []
+        for item in scored:
+            if item.risk_level == "blocked" or int(item.quote.history_days or 0) < 20:
+                continue
+            pool.append(item)
+        for quote in extra_quotes:
+            candidate = score_quote(quote)
+            if context == "daily_close":
+                review = review_risk(quote, candidate)
+                candidate.risk_level = review.verdict
+                candidate.risk_flags = list(review.flags)
+            if candidate.risk_level == "blocked" or int(quote.history_days or 0) < 20:
+                continue
+            pool.append(candidate)
+        for item in pool:
+            if not is_screenable(item.quote, price_min, price_max) and item.risk_level != "blocked":
+                item.risk_level = "unknown"
+        pool.sort(key=candidate_rank_key)
+        return pool[:limit]
 
     @staticmethod
     def _factor_evidence_cutoff(as_of: str) -> str:
@@ -6064,6 +6145,97 @@ class Main(Star):
             failures.append("indicator_coverage")
         return failures
 
+    @staticmethod
+    def _degraded_watch_details(diagnostics: Mapping[str, object], snapshot: Mapping[str, object],
+                                failures: list[str]) -> tuple[str, list[str]]:
+        """Explain, in plain words, which formal gate inputs are missing."""
+        def number(key: str, default=0):
+            try:
+                return type(default)(diagnostics.get(key, default) or default)
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        missing: list[str] = []
+        if "snapshot_incomplete" in failures:
+            missing.append(f"全市场收盘快照不完整（质量 {snapshot.get('quality') or 'unknown'}）")
+        if "market_stats_unconfirmed" in failures:
+            reasons = ",".join(str(item) for item in (diagnostics.get("market_stats_unconfirmed_reasons") or ()))
+            missing.append("市场统计未确认" + (f"（{reasons}）" if reasons else ""))
+        if "risk_evidence_missing" in failures:
+            missing.append(
+                f"停牌/涨跌停/ST 风险字段已核验 {number('risk_tuple_complete')}/{number('input')} 只，"
+                f"低于门槛 {number('screen_min_indicator_coverage', 0.8):.0%}"
+            )
+        if "indicator_coverage" in failures:
+            missing.append(
+                f"正式目标指标覆盖 {number('enriched')}/{number('indicator_targets')}"
+                f"（{number('indicator_coverage', 0.0):.1%}），低于门槛 {number('screen_min_indicator_coverage', 0.8):.0%}"
+            )
+        universe = number("observation_universe_targets")
+        if universe:
+            missing.append(
+                f"成交额前 {universe} 只（含风险未核验）指标可用 {number('observation_universe_enriched')}/{universe}"
+                f"（{number('observation_universe_coverage', 0.0):.1%}）"
+            )
+        return ",".join(failures), missing
+
+    @staticmethod
+    def _degraded_watch_text(trade_date: str, missing: list[str], items: list[Mapping[str, object]]) -> str:
+        """Push text for the degraded watch list; it must never read as advice."""
+        lines = [
+            f"降级观察名单 {trade_date}（数据不完整，未验证）",
+            "说明：今日正式名单未通过数据校验，以下只是技术面观察，不是买入信号，不进入跟踪和胜率统计。",
+            "缺失项：",
+        ]
+        lines += [f"· {text}" for text in (missing or ["未知"])]
+        if not items:
+            lines.append("可用历史不足，暂无可列出的观察对象。")
+        for index, item in enumerate(items, start=1):
+            name = re.sub(r"[\x00-\x1f\x7f]", "", str(item.get("name") or item.get("code") or ""))[:20]
+            risk = "风险字段未核验" if str(item.get("risk_level") or "") != "eligible" else "风险字段已核验"
+            close = item.get("close")
+            close_text = f"{float(close):.2f}" if isinstance(close, (int, float)) and math.isfinite(close) else "-"
+            lines.append(
+                f"{index}. {item.get('code')} {name}｜收盘 {close_text}｜技术分 {item.get('score')}"
+                f"｜历史 {item.get('history_days')} 日｜{risk}"
+            )
+        lines.append("仅供研究和模拟盘，不自动下单。")
+        return "\n".join(lines)
+
+    async def _save_and_push_degraded_watch(self, job_key: str, trade_date: str, reason: str, missing: list[str],
+                                            diagnostics: Mapping[str, object], observations: list[Candidate],
+                                            *, terminal: bool) -> dict:
+        if not self._bool("degraded_watch_enabled", True):
+            return {"state": "disabled"}
+        saver = getattr(self.store, "save_degraded_watch_list", None)
+        if not callable(saver):
+            return {"state": "unavailable"}
+        items = [{
+            "code": item.quote.code, "name": item.quote.name, "close": item.quote.price,
+            "pct_change": item.quote.pct_change, "amount": item.quote.amount,
+            "score": item.score, "base_score": item.base_score,
+            "history_days": int(item.quote.history_days or 0),
+            "indicator_source": str(getattr(item.quote, "indicator_source", "") or ""),
+            "indicator_price_basis": str(getattr(item.quote, "indicator_price_basis", "") or ""),
+            "risk_level": item.risk_level,
+        } for item in observations]
+        try:
+            saved = await self._store_call(saver, job_key, trade_date, reason, missing, dict(diagnostics), items)
+        except (sqlite3.Error, TypeError, ValueError, RuntimeError):
+            logger.warning("[%s] 降级观察名单持久化失败：%s", PLUGIN_NAME, job_key)
+            return {"state": "save_failed"}
+        if not terminal:
+            return {"state": "saved", "pushed": 0}
+        claimer = getattr(self.store, "claim_degraded_watch_push", None)
+        if not callable(claimer) or not await self._store_call(claimer, trade_date):
+            return {"state": "saved", "pushed": 0}
+        text = self._degraded_watch_text(trade_date, missing, items)
+        pushed = 0
+        for origin in await self._store_call(self.store.subscriptions):
+            if self._push_allowed(origin) and await self._push(origin, text):
+                pushed += 1
+        return {"state": "pushed", "pushed": pushed, "saved": saved}
+
     async def _recommendation_outcome_checkpoint_tick(self, now: datetime | None = None) -> dict:
         current = (now or datetime.now(CHINA_TZ)).astimezone(CHINA_TZ)
         if current < getattr(self, "_outcome_retry_after", current):
@@ -6314,10 +6486,23 @@ class Main(Star):
         )
         failures = self._automatic_report_failures(report_diagnostics, snapshot)
         if failures:
-            await record_gate("fail_closed:" + ",".join(failures), report_diagnostics)
+            degraded_reason, missing = self._degraded_watch_details(report_diagnostics, snapshot, failures)
+            gate_diagnostics = {**dict(report_diagnostics), "degraded_reason": degraded_reason,
+                                "degraded_missing": missing}
+            await record_gate("fail_closed:" + ",".join(failures), gate_diagnostics)
             self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
             reason = "自动收盘报告校验失败：" + ",".join(failures)
-            await self._finish_automatic_close_job(job_key, "failed", reason)
+            finished = await self._finish_automatic_close_job(job_key, "failed", reason)
+            try:
+                await self._save_and_push_degraded_watch(
+                    job_key, requested_date, degraded_reason, missing, gate_diagnostics,
+                    list(score_result.observations), terminal=str(dict(finished or {}).get("status") or "") == "missed",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The job outcome is already recorded; a watch-list problem must not rewrite it.
+                logger.exception("[%s] 降级观察名单处理失败：invocation=%s", PLUGIN_NAME, job_key)
             logger.warning(
                 "[%s] 自动收盘 fail-closed：invocation=%s requested=%s actual=%s reasons=%s",
                 PLUGIN_NAME,
@@ -6998,6 +7183,7 @@ class Main(Star):
             "/监听 开启|关闭|状态：控制盘中和故事提醒\n"
             "/白名单 状态：查看当前会话是否在推送白名单\n"
             "/研究状态 或 /数据质量：查看运行、来源和质量\n"
+            "/降级观察：查看最近一次校验失败时的观察名单（数据不完整、未验证）\n"
             "/验证 [天数]：回放最近候选；/结果：查看已保存回放结果\n"
             "/故事 [关键词]：查看新闻故事\n"
             "所有结果仅供研究和模拟盘，不自动下单。"
@@ -7629,6 +7815,19 @@ class Main(Star):
             else:
                 lines.append(f"{name}（{row['code']}）｜{row['recommended_date']}｜{status}：{row.get('reason') or '观察期或数据尚不足'}")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("降级观察")
+    async def degraded_watch(self, event: AstrMessageEvent):
+        reader = getattr(self.store, "latest_degraded_watch_list", None)
+        if not callable(reader):
+            yield event.plain_result("降级观察名单暂不可用：当前存储尚未完成升级。")
+            return
+        row = await self._store_call(reader)
+        if not row:
+            yield event.plain_result("暂无降级观察名单：最近的自动收盘没有出现数据校验失败。")
+            return
+        yield event.plain_result(self._degraded_watch_text(
+            str(row.get("trade_date") or ""), list(row.get("missing") or []), list(row.get("items") or [])))
 
     @filter.command("策略表现")
     async def strategy_performance(self, event: AstrMessageEvent, horizon: int = 5):
