@@ -1,0 +1,22 @@
+[Unit]
+Description=Collect frozen Stock Watch risk evidence from BaoStock and AKShare
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+SupplementaryGroups=docker
+WorkingDirectory=/home/pi/apps/stock-watch-data-probe
+ExecStart=/home/pi/apps/stock-watch-data-probe/.venv/bin/python /home/pi/apps/stock-watch-data-probe/capture_research_risk.py --db /AstrBot/data/plugin_data/astrbot_stock_watch/stock_watch.sqlite3 --out-dir /home/pi/apps/stock-watch-data-probe/evidence-staging --container astrbot --publish-dir /AstrBot/data/plugin_data/astrbot_stock_watch/research_risk_evidence
+TimeoutStartSec=600
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pi/apps/stock-watch-data-probe/evidence-staging
+InaccessiblePaths=-/home/pi/.ssh -/home/pi/astrbot/data/config -/home/pi/astrbot/data/cmd_config.json
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=

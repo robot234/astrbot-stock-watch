@@ -1,0 +1,21 @@
+[Unit]
+Description=Stock Watch LAN read-only dashboard
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/apps/stock-watch-web/current
+ExecStart=/usr/bin/python3 -B -m webapp.server --host 192.168.124.6 --database /var/lib/stock-watch-web-snapshot/stock_watch.sqlite3 --artifact /var/lib/stock-watch-web-snapshot/intraday_quotes.json --port 8767
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONNOUSERSITE=1
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

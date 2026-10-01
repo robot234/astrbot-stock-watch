@@ -1,0 +1,235 @@
+{
+  "as_of": "2026-09-12",
+  "audited_at_utc": "2026-09-12T01:17:32.299271+00:00",
+  "delivery_source_capabilities": {
+    "astrbot/core/platform/platform.py": {
+      "methods": {
+        "send_by_session": [
+          "self",
+          "session",
+          "message_chain"
+        ]
+      },
+      "sha256": "d7cdf4cf01b6a1a6f6194bac44fdf000fc9fea09f7bf7dab0aaffeb39ffe1537"
+    },
+    "astrbot/core/star/context.py": {
+      "methods": {
+        "send_message": [
+          "self",
+          "session",
+          "message_chain"
+        ]
+      },
+      "sha256": "a9a2772080b463583af2c3082b4c13e3612ebd9fda0d234147be462394a1ba2e"
+    }
+  },
+  "health": "ok",
+  "intraday": {
+    "correlated_fsm_payload_count": 32,
+    "evidence": [
+      {
+        "code": "__market__",
+        "created_at": "2026-09-10T01:30:16.004581",
+        "event_key": "intraday:cbc32e6a3d03b4e2fe790a84adc3faaa33b85a27782f4a11c89f5c568472fe21",
+        "fsm_payload_linked": true,
+        "invocation_id": "intraday:2026-09-10:900a088523c44e59aac2e6e2a1ad3bab",
+        "market_snapshot_at": "",
+        "origin_sha256": "12503b7353cb6d89799ec778a9b9c886e5dc7963ef94c23f78c08c38757389c4",
+        "plan_version": "live-market-v1",
+        "quote_fetched_at": "",
+        "risk_event": true,
+        "run_id": "watch:2026-09-10",
+        "sent_at": "2026-09-10T01:33:44.422384",
+        "signal": "market_regime_invalidated",
+        "state": "sent"
+      },
+      {
+        "code": "600031",
+        "created_at": "2026-09-10T01:30:16.004581",
+        "event_key": "intraday:4486ee5f6404c8e86eaa4c831b2e283ea4c6650929cbcd1c8326f8b7ebf5b80d",
+        "fsm_payload_linked": true,
+        "invocation_id": "intraday:2026-09-10:900a088523c44e59aac2e6e2a1ad3bab",
+        "market_snapshot_at": "",
+        "origin_sha256": "12503b7353cb6d89799ec778a9b9c886e5dc7963ef94c23f78c08c38757389c4",
+        "plan_version": "33bdfce4c2b14b068bd6f8e7a43710e8:ce0a238e31c4a475",
+        "quote_fetched_at": "",
+        "risk_event": true,
+        "run_id": "33bdfce4c2b14b068bd6f8e7a43710e8",
+        "sent_at": "2026-09-10T01:33:45.053490",
+        "signal": "plan_expired",
+        "state": "sent"
+      },
+      {
+        "code": "600313",
+        "created_at": "2026-09-10T01:30:16.004581",
+        "event_key": "intraday:a569563cd4b663c9cf56059dde22f27f96d66e71c1bfe325d3929c655c169b9f",
+        "fsm_payload_linked": true,
+        "invocation_id": "intraday:2026-09-10:900a088523c44e59aac2e6e2a1ad3bab",
+        "market_snapshot_at": "",
+        "origin_sha256": "12503b7353cb6d89799ec778a9b9c886e5dc7963ef94c23f78c08c38757389c4",
+        "plan_version": "33bdfce4c2b14b068bd6f8e7a43710e8:0601f226febbc196",
+        "quote_fetched_at": "",
+        "risk_event": true,
+        "run_id": "33bdfce4c2b14b068bd6f8e7a43710e8",
+        "sent_at": "2026-09-10T01:33:45.783391",
+        "signal": "plan_expired",
+        "state": "sent"
+      }
+    ],
+    "freshness_acceptance": "not_established",
+    "opportunity_count": 0,
+    "outbox_count": 32,
+    "reason": "risk_only_events",
+    "signal_counts": {
+      "data_invalidated": 1,
+      "market_regime_invalidated": 1,
+      "plan_expired": 30
+    },
+    "state_counts": {
+      "sent": 32
+    },
+    "status": "pending"
+  },
+  "market_inputs": {
+    "index_divergence": {
+      "reason": "no_persisted_exact_index_baseline_contract",
+      "status": "unknown"
+    },
+    "persisted_index_tables": [],
+    "production_scoring_changed": false,
+    "turnover_change": {
+      "reason": "no_audited_same_universe_amount_unit_series",
+      "status": "unknown"
+    }
+  },
+  "ranking": {
+    "legacy_bars": [
+      {
+        "dates": 8130,
+        "first_date": "1993-04-07",
+        "last_date": "2026-08-28",
+        "rows": 161373
+      }
+    ],
+    "raw_batches": [
+      {
+        "actual_trade_date": "2026-09-11",
+        "basis": "unadjusted",
+        "created_at": "2026-09-11T07:10:23.176826",
+        "expected_days": 120,
+        "published_at": "2026-09-11T07:55:41.281546",
+        "quality": "good",
+        "row_count": 661611,
+        "status": "published"
+      },
+      {
+        "actual_trade_date": "2026-09-10",
+        "basis": "unadjusted",
+        "created_at": "2026-09-10T07:10:04.374729",
+        "expected_days": 120,
+        "published_at": "2026-09-10T07:58:00.939581",
+        "quality": "good",
+        "row_count": 661542,
+        "status": "published"
+      },
+      {
+        "actual_trade_date": "2026-09-09",
+        "basis": "unadjusted",
+        "created_at": "2026-09-09T07:10:23.846902",
+        "expected_days": 120,
+        "published_at": "2026-09-09T07:57:25.949742",
+        "quality": "good",
+        "row_count": 661472,
+        "status": "published"
+      },
+      {
+        "actual_trade_date": "2026-09-08",
+        "basis": "unadjusted",
+        "created_at": "2026-09-08T07:10:12.386664",
+        "expected_days": 120,
+        "published_at": "2026-09-08T07:59:21.747376",
+        "quality": "good",
+        "row_count": 661401,
+        "status": "published"
+      },
+      {
+        "actual_trade_date": "2026-09-07",
+        "basis": "unadjusted",
+        "created_at": "2026-09-07T07:10:21.720230",
+        "expected_days": 120,
+        "published_at": "2026-09-07T07:53:33.088532",
+        "quality": "good",
+        "row_count": 661330,
+        "status": "published"
+      }
+    ],
+    "screen_history": [
+      {
+        "decision_dates": 5,
+        "first_date": "2026-08-28",
+        "last_date": "2026-09-11",
+        "runs": 32
+      }
+    ],
+    "status": "insufficient_data",
+    "strategy_quality_established": false
+  },
+  "read_only": true,
+  "recommendations": {
+    "factor_table_present": false,
+    "groups": [
+      {
+        "base_factor_column_present": false,
+        "comparability_counts": {
+          "unknown": 30
+        },
+        "horizons": {
+          "1": {
+            "due_date": null,
+            "known_forward_sessions": 0,
+            "maturity": "pending",
+            "maturity_reason": "calendar_unverified",
+            "stored_status_counts": {
+              "unknown": 30
+            }
+          },
+          "10": {
+            "due_date": null,
+            "known_forward_sessions": 0,
+            "maturity": "pending",
+            "maturity_reason": "calendar_unverified",
+            "stored_status_counts": {
+              "unknown": 30
+            }
+          },
+          "3": {
+            "due_date": null,
+            "known_forward_sessions": 0,
+            "maturity": "pending",
+            "maturity_reason": "calendar_unverified",
+            "stored_status_counts": {
+              "unknown": 30
+            }
+          },
+          "5": {
+            "due_date": null,
+            "known_forward_sessions": 0,
+            "maturity": "pending",
+            "maturity_reason": "calendar_unverified",
+            "stored_status_counts": {
+              "unknown": 30
+            }
+          }
+        },
+        "recommended_date": "2026-09-11",
+        "samples": 30
+      }
+    ],
+    "production_rows_modified": false,
+    "returns_recomputed": false,
+    "samples": 30,
+    "status": "pending"
+  },
+  "schema_version": 1,
+  "sqlite_user_version": 0
+}

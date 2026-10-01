@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry frozen Stock Watch risk evidence collection after close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 18..23:30:00 Asia/Shanghai
+AccuracySec=1min
+Persistent=true
+Unit=stock-watch-research-risk.service
+
+[Install]
+WantedBy=timers.target

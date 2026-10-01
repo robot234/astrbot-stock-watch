@@ -6,6 +6,8 @@ import importlib
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -82,6 +84,323 @@ def _main_harness(store):
     main._daily_retry_after = None
     main._daily_snapshot_lock = asyncio.Lock()
     return main
+
+
+def test_cache_only_raw_read_keeps_the_event_loop_moving():
+    """A slow raw-cache read must not pause unrelated AstrBot coroutines."""
+
+    class SlowStore:
+        def snapshot_request(self, request_id):
+            return {}
+
+    main = _main_harness(SlowStore())
+
+    def slow_snapshot(*args, **kwargs):
+        time.sleep(0.18)
+        return {}, None, {}, "unavailable"
+
+    main._fresh_raw_snapshot = slow_snapshot
+
+    async def verify():
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.02)
+        baseline = ticks
+        result_task = asyncio.create_task(main._cache_only_tushare_snapshot("2026-08-28"))
+        await asyncio.sleep(0.07)
+        assert ticks - baseline >= 4
+        assert await result_task == ([], False, "2026-08-28")
+        stop.set()
+        await task
+
+    asyncio.run(verify())
+
+
+def test_screen_bundle_write_keeps_the_event_loop_moving():
+    """A slow transactional report write must not block other bot coroutines."""
+
+    class SlowStore:
+        def save_screen_bundle_atomic(self, *args, **kwargs):
+            time.sleep(0.18)
+            return {"report_claimed": True}
+
+    main = _main_harness(SlowStore())
+
+    async def verify():
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.02)
+        baseline = ticks
+        record_task = asyncio.create_task(
+            main._record_screen(
+                "2020-08-28",
+                "2020-08-28",
+                "tushare",
+                [],
+                [],
+            )
+        )
+        await asyncio.sleep(0.07)
+        assert ticks - baseline >= 4
+        assert await record_task
+        stop.set()
+        await task
+
+    asyncio.run(verify())
+
+
+def test_symbol_upsert_keeps_the_event_loop_moving():
+    """The real Sina parser must batch slow symbol writes off the bot loop."""
+    from astrbot_stock_watch.providers import SinaQuoteProvider
+
+    started = threading.Event()
+    calls = []
+    fields = [""] * 32
+    fields[0] = "浦发银行"
+    fields[2] = "9.80"
+    fields[3] = "10.00"
+    fields[8] = "12345"
+    fields[9] = "67890"
+    fields[30] = "2026-09-08"
+    fields[31] = "10:30:00"
+    payload = f'var hq_str_sh600000="{",".join(fields)}";'
+
+    class SlowSymbolStore:
+        def upsert_stock_symbol(self, code, name, source):
+            calls.append((code, name, source))
+            started.set()
+            time.sleep(0.18)
+
+    class SinaResponse:
+        text = payload
+
+        def raise_for_status(self):
+            return None
+
+    class RiskResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": {"diff": [{
+                "f12": "600000", "f43": 1000, "f51": 1000, "f52": 900,
+                "suspended": "0",
+            }]}}
+
+    class SinaClient:
+        async def get(self, url, **kwargs):
+            if url.endswith("list=sh600000"):
+                return SinaResponse()
+            assert url == "https://push2.eastmoney.com/api/qt/ulist.np/get"
+            assert kwargs["params"]["secids"] == "1.600000"
+            return RiskResponse()
+
+    class SinaSlot:
+        async def __aenter__(self):
+            return SinaClient()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class SinaHttp:
+        def slot(self):
+            return SinaSlot()
+
+    provider = SinaQuoteProvider.__new__(SinaQuoteProvider)
+    provider.symbol_store = SlowSymbolStore()
+    provider.http = SinaHttp()
+
+    async def verify():
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        fetch_task = asyncio.create_task(provider.fetch_quotes(["600000"]))
+        while not started.is_set():
+            if fetch_task.done():
+                await fetch_task
+            await asyncio.sleep(0.005)
+        baseline = ticks
+        await asyncio.sleep(0.07)
+        assert ticks - baseline >= 4
+        quotes = await fetch_task
+        assert len(quotes) == 1
+        assert quotes[0].code == "600000"
+        assert quotes[0].name == "浦发银行"
+        assert quotes[0].price == 10.0
+        stop.set()
+        await heartbeat_task
+
+    asyncio.run(verify())
+    assert calls == [("600000", "浦发银行", "sina")]
+
+
+def test_intraday_market_snapshot_fetches_batches_with_bounded_concurrency_without_symbol_rewrites():
+    from astrbot_stock_watch.providers import SinaQuoteProvider
+
+    provider = SinaQuoteProvider.__new__(SinaQuoteProvider)
+    provider.http = types.SimpleNamespace(max_concurrency=2)
+    active = 0
+    maximum_active = 0
+    calls = []
+
+    async def fetch_quotes(codes, *, remember_symbols=True):
+        nonlocal active, maximum_active
+        calls.append((tuple(codes), remember_symbols))
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return list(codes)
+
+    provider.fetch_quotes = fetch_quotes
+    codes = [f"{600000 + index:06d}" for index in range(1200)]
+    result = asyncio.run(provider.fetch_intraday_market_snapshot(codes))
+
+    assert result.expected_codes == tuple(codes)
+    assert result.batch_count == 3
+    assert result.failed_batches == 0
+    assert result.quotes == codes
+    assert maximum_active == 2
+    assert [len(batch) for batch, _remember in calls] == [500, 500, 200]
+    assert all(remember is False for _batch, remember in calls)
+
+
+class _AsyncSlot:
+    async def __aenter__(self):
+        return object()
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _EvaluationHttp:
+    def slot(self):
+        return _AsyncSlot()
+
+
+@pytest.mark.parametrize("slow_operation", ["stage", "publish"])
+def test_evaluation_raw_writes_keep_the_event_loop_moving(slow_operation):
+    """Slow partition staging and publication must run outside the bot loop."""
+    from astrbot_stock_watch.providers import TushareBulkDailyProvider
+
+    started = threading.Event()
+    calls = []
+
+    class SlowRawStore:
+        def stage_raw_partition(self, *args, **kwargs):
+            calls.append("stage")
+            if slow_operation == "stage":
+                started.set()
+                time.sleep(0.18)
+            return "partition-1"
+
+        def publish_raw_batch(self, *args, **kwargs):
+            calls.append("publish")
+            if slow_operation == "publish":
+                started.set()
+                time.sleep(0.18)
+            return {
+                "status": "published",
+                "dataset_id": "dataset-1",
+                "generation": 1,
+                "shadow": False,
+            }
+
+        def fail_raw_batch(self, *args, **kwargs):
+            calls.append("fail")
+
+    provider = TushareBulkDailyProvider.__new__(TushareBulkDailyProvider)
+    provider.storage = SlowRawStore()
+    provider.http = _EvaluationHttp()
+    provider.dataset_key = "tushare_daily_evaluation"
+    provider.page_size = 6000
+    provider.bj_calendar_policy = "require_bse"
+    provider.raw_publish_enabled = True
+    provider._begin_raw_batch = lambda *args, **kwargs: ("batch-1", {"page_size": 6000})
+    provider._staged_pages = lambda *args, **kwargs: ([], 0, False)
+    provider._page_filter_policy = lambda *args, **kwargs: "none"
+    provider._record_success = lambda *args, **kwargs: None
+    provider.fetch_completed_trade_dates_range = lambda *args, **kwargs: _async_value(["2026-09-02"])
+    provider.fetch_universe_evidence = lambda *args, **kwargs: _async_value({
+        "universe_version": "fixture-v1",
+        "digest": "fixture-digest",
+        "effective_date": "2026-09-02",
+        "eligible_markets": ["SH"],
+        "method": "fixture",
+        "source": "fixture",
+        "suspension_method": "fixture",
+        "bj_calendar_policy": "require_bse",
+    })
+    provider._coverage_metrics = lambda *args, **kwargs: {
+        "coverage_ok": True,
+        "errors": [],
+        "eligible_markets": ["SH"],
+    }
+
+    async def pages(*args, **kwargs):
+        yield 0, [{
+            "code": "600000",
+            "ts_code": "600000.SH",
+            "trade_date": "2026-09-02",
+            "close": 10.0,
+        }]
+
+    provider._iter_pages = pages
+
+    async def verify():
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        fetch_task = asyncio.create_task(
+            provider.fetch_evaluation_daily_result("2026-09-01", horizon=1)
+        )
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        baseline = ticks
+        await asyncio.sleep(0.07)
+        assert ticks - baseline >= 4
+        result = await fetch_task
+        assert result.complete is True
+        assert result.batch_id == "batch-1"
+        stop.set()
+        await heartbeat_task
+
+    asyncio.run(verify())
+    assert calls == ["stage", "publish"]
+
+
+async def _async_value(value):
+    return value
 
 
 class _LeaseLostStore(StockStore):

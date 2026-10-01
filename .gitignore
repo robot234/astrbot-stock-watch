@@ -8,3 +8,5 @@ logs/
 data/
 .local_records/
 /tests/
+/dist/
+/intraday_quotes.json

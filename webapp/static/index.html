@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Stock Watch · 研究工作台</title>
+  <link rel="icon" href="/icons/chart-no-axes-combined.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="side">
+      <a class="brand" href="#overview"><span class="brand-mark" data-icon="chart-no-axes-combined"></span><span><b>STOCK WATCH</b><small>证券研究工作台</small></span></a>
+      <nav class="side-nav" aria-label="主导航">
+        <div class="nav-group">监控</div>
+        <a class="nav" href="#overview" data-view="overview"><span data-icon="layout-dashboard"></span>今日总览</a>
+        <a class="nav" href="#watch/signals" data-view="signals" data-watch><span data-icon="activity"></span>盯盘</a>
+        <a class="nav" href="#candidates" data-view="candidates"><span data-icon="list-filter"></span>候选池</a>
+        <a class="nav" href="#stock" data-view="stock"><span data-icon="chart-candlestick"></span>个股详情</a>
+        <div class="nav-group">研究</div>
+        <a class="nav" href="#research" data-view="research"><span data-icon="flask-conical"></span>研究观察池<span class="tag">未验证</span></a>
+        <a class="nav" href="#performance" data-view="performance"><span data-icon="chart-no-axes-combined"></span>历史表现</a>
+        <div class="nav-group">系统</div>
+        <a class="nav" href="#health" data-view="health"><span data-icon="heart-pulse"></span>系统健康</a>
+        <a class="nav" href="#settings" data-view="settings"><span data-icon="settings-2"></span>策略设置</a>
+      </nav>
+      <div class="side-foot">
+        <div class="row"><span data-icon="lock"></span><span>只读 SQLite 快照</span></div>
+        <div class="row"><span data-icon="database"></span><span id="database-name">本地 SQLite</span></div>
+        <div class="row warnline" id="access-hint"><span data-icon="shield-alert"></span><span>访问地址读取中</span></div>
+        <div class="row"><span class="conn-dot"></span><span id="connection-state">只读</span></div>
+      </div>
+    </aside>
+    <div class="work">
+      <header class="strip">
+        <span class="strip-title" id="breadcrumb">今日总览</span>
+        <div class="chips">
+          <a class="chip unk" id="chip-data" href="#health"><span data-icon="circle-help"></span><span class="k">数据</span><b>未知</b></a>
+          <a class="chip unk" id="chip-chain" href="#health"><span data-icon="circle-help"></span><span class="k">链路</span><b>未知</b></a>
+          <a class="chip lab" id="chip-strategy" href="#research" title="unverified"><span data-icon="flask-conical"></span><span class="k">策略</span><b>未验证</b></a>
+        </div>
+        <div class="strip-right">
+          <span class="when" id="market-hint">行情状态读取中</span>
+          <span class="when-time" id="updated">等待快照</span>
+          <button id="refresh" class="icon-btn" type="button" aria-label="刷新快照" data-tip="刷新快照"><span data-icon="refresh-cw"></span></button>
+        </div>
+      </header>
+      <div id="source-banner" class="source-banner" role="status">连接本地只读数据源</div>
+      <details class="source-details"><summary>数据来源与采集时间</summary><div id="source-details-content"></div></details>
+      <main id="content" aria-live="polite"><div class="loading">正在读取快照…</div></main>
+      <footer class="foot">只读研究工作台 · 不构成任何买卖建议 · 页面时间均为北京时间 (UTC+8)</footer>
+    </div>
+  </div>
+  <nav class="tabbar" aria-label="底部导航">
+    <a href="#overview" data-view="overview"><span data-icon="layout-dashboard"></span>总览</a>
+    <a href="#watch/signals" data-view="signals" data-watch><span data-icon="activity"></span>盯盘</a>
+    <a href="#candidates" data-view="candidates"><span data-icon="list-filter"></span>候选</a>
+    <a href="#research" data-view="research"><span data-icon="flask-conical"></span>研究</a>
+    <a href="#more" data-view="more" id="tab-more" aria-haspopup="dialog"><span data-icon="ellipsis"></span>更多</a>
+  </nav>
+  <div class="sheet-mask" id="sheet-mask"></div>
+  <div class="sheet" id="sheet" role="dialog" aria-label="更多页面">
+    <div class="sheet-head"><b>更多页面</b><button type="button" class="icon-btn" id="sheet-close" aria-label="关闭" data-tip="关闭"><span data-icon="x"></span></button></div>
+    <a href="#stock"><span data-icon="chart-candlestick"></span>个股详情</a>
+    <a href="#performance"><span data-icon="chart-no-axes-combined"></span>历史表现</a>
+    <a href="#health"><span data-icon="heart-pulse"></span>系统健康</a>
+    <a href="#settings"><span data-icon="settings-2"></span>策略设置</a>
+  </div>
+</body>
+</html>

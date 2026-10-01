@@ -1,0 +1,49 @@
+"""Build an allowlisted runtime archive and SHA-256 manifest, not a plugin release."""
+import hashlib
+import io
+import json
+from pathlib import Path
+import sys
+import tarfile
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def main():
+    release = sys.argv[1]
+    if not release.replace("-", "").isalnum():
+        raise ValueError("invalid_release_id")
+    revision = sys.argv[2] if len(sys.argv) > 2 else ""
+    if revision and not revision.replace("-", "").isalnum():
+        raise ValueError("invalid_revision")
+    output = ROOT / ".local_records" / "pi-web-deployment" / (release + revision)
+    output.mkdir(parents=True, exist_ok=False)
+    paths = [ROOT / name for name in (
+        "webapp/__init__.py", "webapp/server.py", "webapp/data.py",
+        "data_evidence.py", "paper_forward.py", "paper_review.py", "_conf_schema.json",
+        "webapp/deploy/snapshot.py", "webapp/deploy/stock-watch-web.service",
+        "webapp/deploy/stock-watch-web-snapshot.service",
+        "webapp/deploy/stock-watch-web-snapshot.timer",
+    )]
+    paths += sorted(p for p in (ROOT / "webapp/static").rglob("*") if p.is_file())
+    payload = {p.relative_to(ROOT).as_posix(): p.read_bytes() for p in paths}
+    manifest = {"release": release, "files": {
+        name: hashlib.sha256(data).hexdigest() for name, data in payload.items()}}
+    encoded = json.dumps(manifest, indent=2, sort_keys=True).encode()
+    (output / "manifest.json").write_bytes(encoded)
+    payload["manifest.json"] = encoded
+    archive = output / "runtime.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        for name, data in payload.items():
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o644
+            tar.addfile(info, io.BytesIO(data))
+    result = {"archive": str(archive), "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+              "release": release, "files": len(manifest["files"])}
+    (output / "package.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

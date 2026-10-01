@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -8,17 +9,34 @@ import math
 import re
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 14
+from .data_evidence import factor_capture, stamp as evidence_stamp
+
+LATEST_SCHEMA_VERSION = 23
 DEFAULT_RAW_MIN_ROW_COUNT = 4000
 DEFAULT_RAW_REQUIRE_UNIVERSE_EVIDENCE = True
 DEFAULT_PROVIDER_BUCKETS = {
     "trade_cal": (1, 60),
     "stock_basic": (1, 60),
     "daily": (30, 60),
+    "adj_factor": (50, 60),
+    "daily_basic": (50, 60),
+    "fina_indicator": (1, 60),
+    "rt_k": (1, 60),
 }
+
+
+def _utcnow_naive() -> datetime:
+    """Return UTC at the legacy offset-free SQLite timestamp boundary.
+
+    Persisted timestamps intentionally remain UTC-naive ISO text.  Making them
+    aware would mix ``+00:00`` values with existing rows and break the naive
+    arithmetic used by leases, expiry, and ordering checks.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class SnapshotLeaseError(RuntimeError):
@@ -115,6 +133,7 @@ class StockStore:
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}" if len(digits) == 8 else str(value or "")
     def __init__(self, path: Path):
         self.path = path
+        self._raw_batch_validation_cache: dict[str, dict] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(5):
             try:
@@ -281,6 +300,14 @@ class StockStore:
             self._ensure_column(db, "watchlist", "name", "TEXT NULL")
             self._ensure_column(db, "daily_quotes", "source", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(db, "daily_quotes", "provider_ts", "TEXT NULL")
+            # Nullable tri-state fields preserve the distinction between a
+            # provider-validated False and unavailable/conflicted evidence.
+            self._ensure_column(db, "daily_quotes", "suspended", "INTEGER NULL")
+            self._ensure_column(db, "daily_quotes", "limit_up", "INTEGER NULL")
+            self._ensure_column(db, "daily_quotes", "limit_down", "INTEGER NULL")
+            self._ensure_column(db, "daily_quotes", "st", "INTEGER NULL")
+            self._ensure_column(db, "daily_quotes", "risk_source", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(db, "daily_quotes", "risk_scenario_version", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(db, "screen_candidates", "factor_payload", "TEXT NOT NULL DEFAULT '{}'")
             self._set_schema_version(db, max(current, 7))
 
@@ -292,6 +319,15 @@ class StockStore:
                 (12, self._migrate_v12_minute_bars),
                 (13, self._migrate_v13_provenance_and_symbols),
                 (14, self._migrate_v14_raw_dataset_generations),
+                (15, self._migrate_v15_bounded_retention_indexes),
+                (16, self._migrate_v16_intraday_outbox_retention_indexes),
+                (17, self._migrate_v17_recommendation_ai_reviews),
+                (18, self._migrate_v18_daily_acceptance),
+                (19, self._migrate_v19_factor_capture),
+                (20, self._migrate_v20_research_pools),
+                (21, self._migrate_v21_risk_qualification),
+                (22, self._migrate_v22_paper_bridge),
+                (23, self._migrate_v23_paper_forward),
             )
             pending = [(version, migration) for version, migration in migrations if current < version]
             if pending:
@@ -378,6 +414,58 @@ class StockStore:
             # Universe evidence uses durable per-status staging so a process
             # restart can resume L/D/P without activating a partial set.
             self._ensure_v14_universe_tables(db)
+            # Automatic close publication and delivery state are additive v14
+            # durability records. Existing v14 databases receive them without
+            # rewriting raw-market tables or changing the schema marker.
+            self._ensure_v14_automatic_close_tables(db)
+            # Intraday signal state and delivery records are additive as well.
+            # They intentionally share the v14 marker so existing production
+            # stores can adopt durable cooldown/outbox behavior in place.
+            self._ensure_v14_intraday_tables(db)
+            # Recommendation snapshots and their strictly point-in-time
+            # outcome records are additive. They never alter an historical
+            # candidate or infer a missing calendar/price observation.
+            self._ensure_v14_recommendation_tables(db)
+            self._ensure_v17_recommendation_ai_review_tables(db)
+            self._ensure_v18_daily_acceptance_tables(db)
+            self._ensure_v19_factor_capture(db)
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS market_comparison_observations(
+                    observation_id TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    benchmark_code TEXT NOT NULL,
+                    universe_ref TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )"""
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS idx_market_comparison_lookup ON market_comparison_observations(trade_date,benchmark_code,universe_ref,recorded_at)")
+
+    def save_market_comparison(self, packet: dict) -> str:
+        from . import market_comparison as comparison
+
+        payload = json.dumps(packet, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        payload_hash = hashlib.sha256(payload.encode()).hexdigest()
+        available_at = comparison.timestamp(packet["available_at"]).isoformat()
+        recorded_at = comparison.timestamp(comparison.utc_now()).isoformat()
+        if available_at > recorded_at:
+            raise ValueError("future market evidence availability")
+        observation_id = "market:" + payload_hash
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO market_comparison_observations VALUES(?,?,?,?,?,?,?,?)",
+                (observation_id, str(packet.get("trade_date") or ""), str(packet.get("benchmark_code") or ""),
+                 str(packet.get("universe_ref") or ""), available_at, recorded_at, payload_hash, payload),
+            )
+        return observation_id
+
+    def market_comparison_report(self, trade_date: str, benchmark_code: str, universe_ref: str, *, as_of: str) -> dict:
+        from . import market_comparison as comparison
+
+        with self._connect() as db:
+            return comparison.read_report(db, trade_date, benchmark_code, universe_ref, as_of=as_of)
 
     @staticmethod
     def _table_exists(db, table: str) -> bool:
@@ -387,6 +475,333 @@ class StockStore:
     @staticmethod
     def _columns(db, table: str) -> set[str]:
         return {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")}
+
+    @staticmethod
+    def _ensure_v14_automatic_close_tables(db) -> None:
+        job_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(job_runs)")}
+        for column, definition in (
+            ("automatic_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("automatic_first_started_at", "TEXT"),
+            ("automatic_next_retry_at", "REAL NOT NULL DEFAULT 0"),
+            ("automatic_terminal_reason", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in job_columns:
+                db.execute(f"ALTER TABLE job_runs ADD COLUMN {column} {definition}")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS automatic_close_publications(
+                publication_key TEXT PRIMARY KEY,
+                actual_trade_date TEXT NOT NULL UNIQUE,
+                requested_date TEXT NOT NULL,
+                run_id TEXT NOT NULL UNIQUE,
+                invocation_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                origins_json TEXT NOT NULL DEFAULT '[]',
+                outbox_prepared INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        publication_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(automatic_close_publications)")}
+        if "outbox_prepared" not in publication_columns:
+            db.execute("ALTER TABLE automatic_close_publications ADD COLUMN outbox_prepared INTEGER NOT NULL DEFAULT 0")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS automatic_close_deliveries(
+                delivery_id TEXT PRIMARY KEY,
+                publication_key TEXT NOT NULL REFERENCES automatic_close_publications(publication_key) ON DELETE CASCADE,
+                actual_trade_date TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','sending','sent','failed','unknown_delivery','cancelled')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_fence INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at REAL NOT NULL DEFAULT 0,
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sent_at TEXT,
+                UNIQUE(publication_key,origin)
+            )"""
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_automatic_close_delivery_recovery ON automatic_close_deliveries(state,next_retry_at,lease_expires_at)")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS delivery_capability_evidence(
+                delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('automatic_close','intraday')),
+                delivery_key TEXT NOT NULL,
+                lease_fence INTEGER NOT NULL,
+                evidence_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY(delivery_kind,delivery_key,lease_fence)
+            )"""
+        )
+
+    def record_delivery_capabilities(self, kind: str, key: str, owner: str, fence: int, evidence: dict) -> bool:
+        targets = {
+            "automatic_close": ("automatic_close_deliveries", "delivery_id"),
+            "intraday": ("intraday_event_outbox", "event_key"),
+            "daily_acceptance": ("daily_acceptance_alerts", "alert_id"),
+        }
+        if kind not in targets:
+            raise ValueError("invalid delivery kind")
+        table, column = targets[kind]
+        payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                f"SELECT 1 FROM {table} WHERE {column}=? AND state='sending' "
+                "AND lease_owner=? AND lease_fence=? AND lease_expires_at>?",
+                (key, owner, int(fence), time.time()),
+            ).fetchone()
+            if not row:
+                return False
+            recorded_at = datetime.now(timezone.utc).isoformat()
+            if kind == "daily_acceptance":
+                db.execute(
+                    "INSERT OR IGNORE INTO daily_acceptance_delivery_capability_evidence VALUES(?,?,?,?)",
+                    (key, int(fence), payload, recorded_at),
+                )
+            else:
+                db.execute(
+                    "INSERT OR IGNORE INTO delivery_capability_evidence VALUES(?,?,?,?,?)",
+                    (kind, key, int(fence), payload, recorded_at),
+                )
+            return True
+
+    @classmethod
+    def _ensure_v14_intraday_tables(cls, db) -> None:
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS intraday_origin_preferences(
+                origin TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS intraday_signal_states(
+                origin TEXT NOT NULL,
+                code TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                plan_version TEXT NOT NULL,
+                armed INTEGER NOT NULL DEFAULT 1,
+                consecutive_count INTEGER NOT NULL DEFAULT 0,
+                last_condition INTEGER NOT NULL DEFAULT 0,
+                last_observed_at REAL NOT NULL DEFAULT 0,
+                last_triggered_at REAL NOT NULL DEFAULT 0,
+                trigger_count INTEGER NOT NULL DEFAULT 0,
+                last_reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(origin,code,signal,plan_version)
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS intraday_event_outbox(
+                event_key TEXT PRIMARY KEY,
+                origin TEXT NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                signal TEXT NOT NULL,
+                plan_version TEXT NOT NULL,
+                event_sequence INTEGER NOT NULL,
+                run_id TEXT NOT NULL DEFAULT '',
+                invocation_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                quote_fetched_at TEXT NOT NULL DEFAULT '',
+                candidate_valid_until TEXT NOT NULL DEFAULT '',
+                market_regime TEXT NOT NULL DEFAULT '',
+                market_snapshot_at TEXT NOT NULL DEFAULT '',
+                risk_event INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','sending','sent','failed','unknown_delivery','cancelled')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_fence INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at REAL NOT NULL DEFAULT 0,
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sent_at TEXT,
+                UNIQUE(origin,code,signal,plan_version,event_sequence)
+            )"""
+        )
+        for column, definition in (
+            ("quote_fetched_at", "TEXT NOT NULL DEFAULT ''"),
+            ("candidate_valid_until", "TEXT NOT NULL DEFAULT ''"),
+            ("market_regime", "TEXT NOT NULL DEFAULT ''"),
+            ("market_snapshot_at", "TEXT NOT NULL DEFAULT ''"),
+            ("risk_event", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            cls._ensure_column(db, "intraday_event_outbox", column, definition)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_intraday_outbox_recovery ON intraday_event_outbox(state,next_retry_at,lease_expires_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_intraday_outbox_origin ON intraday_event_outbox(origin,created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_intraday_outbox_terminal_cleanup ON intraday_event_outbox(state,updated_at,event_key)")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS intraday_market_regime_state(
+                scope TEXT PRIMARY KEY,
+                regime TEXT NOT NULL DEFAULT 'unknown',
+                pending_regime TEXT NOT NULL DEFAULT 'unknown',
+                pending_count INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                source_timestamp TEXT NOT NULL DEFAULT '',
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                expected_size INTEGER NOT NULL DEFAULT 0,
+                coverage REAL NOT NULL DEFAULT 0,
+                breadth REAL,
+                advancing INTEGER NOT NULL DEFAULT 0,
+                declining INTEGER NOT NULL DEFAULT 0,
+                flat INTEGER NOT NULL DEFAULT 0,
+                median_return REAL,
+                quote_timestamp_min TEXT NOT NULL DEFAULT '',
+                quote_timestamp_max TEXT NOT NULL DEFAULT '',
+                quality TEXT NOT NULL DEFAULT 'unknown',
+                reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )"""
+        )
+
+    @staticmethod
+    def _ensure_v14_recommendation_tables(db) -> None:
+        db.execute("""CREATE TABLE IF NOT EXISTS recommendation_records(
+            recommendation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, recommended_date TEXT NOT NULL,
+            code TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', candidate_price REAL, confirmation_price REAL,
+            attention_low REAL, attention_high REAL, invalidation_price REAL, confirmation_level REAL,
+            target_low REAL, target_high REAL, plan_version TEXT NOT NULL, market_regime TEXT NOT NULL DEFAULT 'unknown',
+            data_timestamp TEXT NOT NULL DEFAULT '', freshness TEXT NOT NULL DEFAULT 'unknown', source TEXT NOT NULL DEFAULT '',
+            caller_identity TEXT NOT NULL DEFAULT '', price_basis TEXT NOT NULL DEFAULT 'unknown', prediction_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL, UNIQUE(run_id,code))""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_recommendation_records_date ON recommendation_records(recommended_date,code)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_recommendation_records_version ON recommendation_records(plan_version,market_regime)")
+        db.execute("""CREATE TABLE IF NOT EXISTS recommendation_outcomes(
+            recommendation_id TEXT NOT NULL REFERENCES recommendation_records(recommendation_id) ON DELETE CASCADE,
+            horizon INTEGER NOT NULL CHECK(horizon IN (1,3,5,10)), evaluated_through TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL CHECK(status IN ('pending','complete','unknown','unknown_order')), close_price REAL, return_pct REAL,
+            max_gain_pct REAL, max_drawdown_pct REAL, confirmation_order TEXT NOT NULL DEFAULT 'not_touched',
+            target_order TEXT NOT NULL DEFAULT 'not_touched', invalidation_order TEXT NOT NULL DEFAULT 'not_touched',
+            first_touch TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', sample_complete INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL, PRIMARY KEY(recommendation_id,horizon))""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_status ON recommendation_outcomes(horizon,status,updated_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS corporate_action_factors(
+            code TEXT NOT NULL, trade_date TEXT NOT NULL, adj_factor REAL NOT NULL CHECK(adj_factor > 0),
+            source TEXT NOT NULL, evidence TEXT NOT NULL, fetched_at TEXT NOT NULL,
+            PRIMARY KEY(code,trade_date))""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_corporate_action_factors_date ON corporate_action_factors(trade_date,code)")
+        for table, column, definition in (
+            ("recommendation_records", "origin", "TEXT NOT NULL DEFAULT 'global'"),
+            ("recommendation_records", "visibility", "TEXT NOT NULL DEFAULT 'public'"),
+            ("recommendation_records", "strategy_version", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("recommendation_records", "plan_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("recommendation_records", "plan_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("recommendation_records", "comparability_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("recommendation_records", "corporate_action_factor", "REAL"),
+            ("recommendation_outcomes", "session_complete", "INTEGER NOT NULL DEFAULT 0"),
+            ("recommendation_outcomes", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("recommendation_outcomes", "event_order", "TEXT NOT NULL DEFAULT 'not_touched'"),
+            ("daily_bars", "corporate_action_factor", "REAL"),
+            ("daily_bars", "corporate_action_evidence", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            StockStore._ensure_column(db, table, column, definition)
+        # Pre-factor M3 only marked a record comparable when its explicit
+        # fixture/upstream factor was exactly 1. Preserve that evidence during
+        # the additive migration without granting comparability to unknown rows.
+        db.execute(
+            "UPDATE recommendation_records SET corporate_action_factor=1 "
+            "WHERE comparability_status='comparable' AND corporate_action_factor IS NULL"
+        )
+
+    @staticmethod
+    def _ensure_v17_recommendation_ai_review_tables(db) -> None:
+        db.execute("""CREATE TABLE IF NOT EXISTS recommendation_ai_review_batches(
+            review_batch_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            recommended_date TEXT NOT NULL,
+            model_requested TEXT NOT NULL,
+            model_returned TEXT NOT NULL DEFAULT '',
+            prompt_version TEXT NOT NULL,
+            input_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending','complete','unknown','failed','skipped')),
+            error TEXT NOT NULL DEFAULT '',
+            usage_json TEXT NOT NULL DEFAULT '{}',
+            requested_at TEXT NOT NULL,
+            completed_at TEXT,
+            UNIQUE(run_id,prompt_version,model_requested)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_ai_review_batches_date ON recommendation_ai_review_batches(recommended_date,status,requested_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS recommendation_ai_reviews(
+            review_batch_id TEXT NOT NULL REFERENCES recommendation_ai_review_batches(review_batch_id) ON DELETE CASCADE,
+            recommendation_id TEXT NOT NULL REFERENCES recommendation_records(recommendation_id) ON DELETE CASCADE,
+            code TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK(decision IN ('keep','watch','veto','unknown')),
+            score_adjustment INTEGER NOT NULL DEFAULT 0 CHECK(score_adjustment BETWEEN -5 AND 0),
+            risk_tags_json TEXT NOT NULL DEFAULT '[]',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(review_batch_id,recommendation_id)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_ai_reviews_recommendation ON recommendation_ai_reviews(recommendation_id,decision)")
+
+    @staticmethod
+    def _ensure_v18_daily_acceptance_tables(db) -> None:
+        db.execute("""CREATE TABLE IF NOT EXISTS daily_acceptance_runs(
+            trade_date TEXT PRIMARY KEY,
+            checked_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('healthy','warning','critical','unknown')),
+            fingerprint TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            findings_json TEXT NOT NULL DEFAULT '[]',
+            event_id TEXT NOT NULL DEFAULT '',
+            changed_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS daily_acceptance_state(
+            scope TEXT PRIMARY KEY,
+            trade_date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            event_id TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS daily_acceptance_events(
+            event_id TEXT PRIMARY KEY,
+            trade_date TEXT NOT NULL,
+            event_kind TEXT NOT NULL CHECK(event_kind IN ('anomaly','recovery')),
+            previous_fingerprint TEXT NOT NULL DEFAULT '',
+            fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            findings_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_daily_acceptance_events_date ON daily_acceptance_events(trade_date,created_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS daily_acceptance_alerts(
+            alert_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL REFERENCES daily_acceptance_events(event_id) ON DELETE CASCADE,
+            trade_date TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','sending','sent','failed','unknown_delivery','cancelled')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            lease_owner TEXT NOT NULL DEFAULT '',
+            lease_fence INTEGER NOT NULL DEFAULT 0,
+            lease_expires_at REAL NOT NULL DEFAULT 0,
+            next_retry_at REAL NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT,
+            UNIQUE(event_id,origin)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_daily_acceptance_alert_recovery ON daily_acceptance_alerts(state,next_retry_at,lease_expires_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS daily_acceptance_delivery_capability_evidence(
+            alert_id TEXT NOT NULL,
+            lease_fence INTEGER NOT NULL,
+            evidence_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY(alert_id,lease_fence)
+        )""")
 
     @classmethod
     def _ensure_column(cls, db, table: str, column: str, definition: str) -> None:
@@ -783,6 +1198,21 @@ class StockStore:
         if not state_rebuild and not cache_rebuild:
             return
 
+        # The repair can be invoked while opening an already-versioned draft
+        # database.  Keep every drop/copy/create operation in a savepoint so
+        # an interrupted or malformed legacy row leaves the original tables
+        # intact rather than half-rebuilt.
+        db.execute("SAVEPOINT provider_constraint_repair")
+        try:
+            cls._repair_v14_provider_constraints_in_tx(db, state_exists, cache_exists, state_rebuild, cache_rebuild)
+        except Exception:
+            db.execute("ROLLBACK TO provider_constraint_repair")
+            db.execute("RELEASE provider_constraint_repair")
+            raise
+        db.execute("RELEASE provider_constraint_repair")
+
+    @classmethod
+    def _repair_v14_provider_constraints_in_tx(cls, db, state_exists, cache_exists, state_rebuild, cache_rebuild) -> None:
         state_rows = []
         cache_rows = []
         if state_exists:
@@ -926,7 +1356,7 @@ class StockStore:
 
     @staticmethod
     def _provider_now_text() -> str:
-        return datetime.utcnow().isoformat()
+        return _utcnow_naive().isoformat()
 
     @classmethod
     def _provider_state_digest(cls, state: dict) -> str:
@@ -959,6 +1389,20 @@ class StockStore:
         row = db.execute("SELECT * FROM provider_api_state WHERE api_name=?", (name,)).fetchone()
         if not row:
             raise RuntimeError("provider api state could not be created")
+        try:
+            current_limit = int(row["bucket_limit"] or 0)
+            current_window = int(row["window_seconds"] or 0)
+        except (TypeError, ValueError, OverflowError):
+            current_limit, current_window = 0, 0
+        if current_limit != limit or current_window != window:
+            state = dict(row)
+            state.update({"bucket_limit": limit, "window_seconds": window})
+            state["state_digest"] = cls._provider_state_digest(state)
+            db.execute(
+                "UPDATE provider_api_state SET bucket_limit=?,window_seconds=?,state_digest=?,updated_at=? WHERE api_name=?",
+                (limit, window, state["state_digest"], now_text, name),
+            )
+            row = db.execute("SELECT * FROM provider_api_state WHERE api_name=?", (name,)).fetchone()
         return row
 
     def provider_api_state(self, api_name: str, *, bucket_limit: int = 1, window_seconds: int = 60) -> dict:
@@ -1155,6 +1599,14 @@ class StockStore:
                 "ON CONFLICT(cache_key) DO UPDATE SET api_name=excluded.api_name,request_digest=excluded.request_digest,payload_digest=excluded.payload_digest,response_digest=excluded.response_digest,body_json=excluded.body_json,cache_version=excluded.cache_version,created_at=excluded.created_at,expires_at=excluded.expires_at,status='valid'",
                 (key, api_value, digest, payload_value, response_digest, text, 1, self._provider_now_text(), current + max(0.0, float(ttl_seconds))),
             )
+            # Incremental maintenance avoids turning one request into an
+            # unbounded delete when a cache backlog has accumulated.
+            db.execute(
+                "DELETE FROM provider_cache WHERE cache_key IN ("
+                "SELECT cache_key FROM provider_cache WHERE expires_at<=? OR status<>'valid' "
+                "ORDER BY expires_at,cache_key LIMIT 500)",
+                (current,),
+            )
         return key
 
     put_provider_cache = save_provider_cache
@@ -1165,6 +1617,21 @@ class StockStore:
                 cursor = db.execute("DELETE FROM provider_cache WHERE api_name=?", (str(api_name).strip().lower(),))
             else:
                 cursor = db.execute("DELETE FROM provider_cache")
+            return int(cursor.rowcount or 0)
+
+    def cleanup_provider_cache(self, *, now: float | None = None, limit: int = 500) -> int:
+        """Remove only a bounded oldest set of expired/invalid cache rows."""
+        current = float(time.time() if now is None else now)
+        if not math.isfinite(current) or current < 0:
+            raise ValueError("provider clock value is invalid")
+        bounded = max(1, min(int(limit), 5000))
+        with self._connect() as db:
+            cursor = db.execute(
+                "DELETE FROM provider_cache WHERE cache_key IN ("
+                "SELECT cache_key FROM provider_cache WHERE expires_at<=? OR status<>'valid' "
+                "ORDER BY expires_at, cache_key LIMIT ?)\n",
+                (current, bounded),
+            )
             return int(cursor.rowcount or 0)
 
     @staticmethod
@@ -1214,6 +1681,7 @@ class StockStore:
         provider: str = "tushare",
         bj_calendar_policy: str = "sse_fallback",
         universe_version: str = "",
+        universe_statuses: str = "L,D,P",
         batch_id: str | None = None,
     ) -> dict:
         """Return a durable evidence cycle, creating a repair cycle if needed."""
@@ -1223,6 +1691,10 @@ class StockStore:
         provider_value = str(provider or "tushare").strip().lower()[:80]
         policy_value = str(bj_calendar_policy or "sse_fallback").strip().lower()[:32]
         version_value = str(universe_version or "").strip()[:160]
+        status_parts = [part.strip().upper() for part in str(universe_statuses or "L,D,P").replace(";", ",").replace(" ", ",").split(",") if part.strip()]
+        expected_statuses = [status for status in ("L", "D", "P") if status in status_parts]
+        if "L" not in expected_statuses:
+            expected_statuses.insert(0, "L")
         if not provider_value or policy_value not in {"require_bse", "sse_fallback", "exclude"}:
             raise ValueError("invalid universe evidence batch identity")
         evidence_key = self._universe_evidence_key(provider_value, effective, policy_value, version_value)
@@ -1260,7 +1732,12 @@ class StockStore:
                     records = self._universe_evidence_status_records_in_tx(db, str(candidate["evidence_batch_id"]))
                 except (TypeError, ValueError, KeyError, OverflowError):
                     return False
-                if set(records) != {"L", "D", "P"} or not self._universe_status_records_match_evidence(records, evidence):
+                try:
+                    expected = json.loads(str(candidate["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses or not self._universe_status_records_match_evidence(records, evidence):
                     return False
                 pointer = db.execute(
                     "SELECT evidence_key,evidence_batch_id,evidence_digest FROM active_universe_evidence WHERE evidence_key=?",
@@ -1278,12 +1755,10 @@ class StockStore:
             # cycle is created below.
             for row in rows:
                 status = str(row["status"] or "")
-                if status == "staging":
-                    return dict(row)
-                if status == "failed":
+                if status in {"staging", "failed"}:
                     db.execute(
-                        "UPDATE universe_evidence_batches SET status='staging',error=NULL,updated_at=? WHERE evidence_batch_id=?",
-                        (now, row["evidence_batch_id"]),
+                        "UPDATE universe_evidence_batches SET status='staging',error=NULL,expected_statuses_json=?,updated_at=? WHERE evidence_batch_id=?",
+                        (json.dumps(expected_statuses), now, row["evidence_batch_id"]),
                     )
                     refreshed = db.execute("SELECT * FROM universe_evidence_batches WHERE evidence_batch_id=?", (row["evidence_batch_id"],)).fetchone()
                     return dict(refreshed)
@@ -1300,7 +1775,7 @@ class StockStore:
             cycle_digest = self._universe_evidence_cycle_digest(cycle_key, identifier)
             db.execute(
                 "INSERT INTO universe_evidence_batches(evidence_batch_id,evidence_key,cycle_digest,provider,effective_date,bj_calendar_policy,universe_version,status,expected_statuses_json,evidence_json,evidence_digest,recovery_of,created_at,updated_at,error) VALUES(?,?,?,?,?,?,?, 'staging',?,?,?,?,?,?,NULL)",
-                (identifier, cycle_key, cycle_digest, provider_value, effective, policy_value, version_value, '["D","L","P"]', "{}", "", str(source["evidence_batch_id"]) if source else None, now, now),
+                (identifier, cycle_key, cycle_digest, provider_value, effective, policy_value, version_value, json.dumps(expected_statuses), "{}", "", str(source["evidence_batch_id"]) if source else None, now, now),
             )
             if source:
                 # Preserve individually valid L/D/P responses in a new cycle;
@@ -1631,7 +2106,12 @@ class StockStore:
 
             def validated_status_records() -> dict[str, dict]:
                 records = self._universe_evidence_status_records_in_tx(db, str(batch_id))
-                if set(records) != {"L", "D", "P"}:
+                try:
+                    expected = json.loads(str(batch["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses:
                     raise RuntimeError("universe evidence batch is incomplete")
                 if not self._universe_status_records_match_evidence(records, normalized):
                     raise ValueError("universe evidence statuses do not match manifest")
@@ -1695,12 +2175,12 @@ class StockStore:
                     # Recovery cycles intentionally use a suffixed evidence
                     # key, so a configured version must be looked up by its
                     # natural identity rather than only by the original key.
-                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND a.universe_version=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
+                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key,b.expected_statuses_json FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND a.universe_version=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
                     (provider_value, effective, policy_value, version_value),
                 ).fetchone()
             else:
                 row = db.execute(
-                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
+                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key,b.expected_statuses_json FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
                     (provider_value, effective, policy_value),
                 ).fetchone()
             if not row:
@@ -1726,13 +2206,94 @@ class StockStore:
                 ):
                     return None
                 records = self.universe_evidence_status_records(str(row["evidence_batch_id"]))
-                if set(records) != {"L", "D", "P"} or not self._universe_status_records_match_evidence(records, evidence):
+                try:
+                    expected = json.loads(str(row["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses or not self._universe_status_records_match_evidence(records, evidence):
                     return None
             except (TypeError, ValueError, KeyError, OverflowError):
                 return None
             return {**dict(row), "evidence": evidence, "status_records": records, "statuses": {key: value["rows"] for key, value in records.items()}}
 
     get_active_universe_evidence = active_universe_evidence
+
+    def recent_universe_evidence(
+        self,
+        effective_date: str,
+        *,
+        provider: str = "tushare",
+        bj_calendar_policy: str = "sse_fallback",
+        universe_version: str = "",
+        max_age_days: int = 30,
+    ) -> dict | None:
+        """Return the most recent still-valid universe evidence for reuse.
+
+        The eligible-universe stock list changes slowly, so a daily snapshot
+        does not need a fresh ``stock_basic`` fetch every trading day.  When
+        the exact-date evidence is missing (e.g. ``stock_basic`` is rate
+        limited), reuse the latest published evidence whose validity window
+        covers the requested date and which is no older than ``max_age_days``.
+        """
+        effective = self._canonical_raw_date(effective_date)
+        if not effective:
+            return None
+        provider_value = str(provider or "tushare").strip().lower()
+        policy_value = str(bj_calendar_policy or "sse_fallback").strip().lower()
+        try:
+            cutoff = (datetime.strptime(effective, "%Y-%m-%d").date() - timedelta(days=max(0, int(max_age_days)))).isoformat()
+        except (TypeError, ValueError, OverflowError):
+            cutoff = ""
+        with self._connect() as db:
+            sql = (
+                "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key,b.expected_statuses_json "
+                "FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id "
+                "WHERE a.provider=? AND a.effective_date<=? AND a.bj_calendar_policy=? AND b.status='published'"
+            )
+            args: list[object] = [provider_value, effective, policy_value]
+            if cutoff:
+                sql += " AND a.effective_date>=?"
+                args.append(cutoff)
+            sql += " ORDER BY a.effective_date DESC LIMIT 1"
+            row = db.execute(sql, args).fetchone()
+            if not row:
+                return None
+            try:
+                expected_cycle = self._universe_evidence_cycle_digest(str(row["batch_evidence_key"] or ""), str(row["evidence_batch_id"] or ""))
+                batch = db.execute("SELECT cycle_digest FROM universe_evidence_batches WHERE evidence_batch_id=?", (str(row["evidence_batch_id"]),)).fetchone()
+                if not batch or str(batch["cycle_digest"] or "").strip().lower() != expected_cycle:
+                    return None
+                evidence = self._normalize_universe_counts(json.loads(str(row["evidence_json"] or "{}")))
+                # Reuse deliberately relaxes the version and exact-date checks
+                # (a date-stamped universe_version differs per day), but still
+                # enforces digest integrity, status-record completeness and the
+                # valid_from/valid_to window against the requested date.
+                if self._validate_universe_evidence(
+                    evidence,
+                    requested_date=effective,
+                    actual_trade_date="",
+                    bj_calendar_policy=policy_value,
+                    universe_version="",
+                ):
+                    return None
+                if (
+                    str(evidence.get("digest") or "") != str(row["evidence_digest"] or "")
+                    or str(row["batch_evidence_digest"] or "") != str(row["evidence_digest"] or "")
+                    or self._universe_evidence_digest(evidence) != str(row["evidence_digest"] or "")
+                ):
+                    return None
+                records = self.universe_evidence_status_records(str(row["evidence_batch_id"]))
+                try:
+                    expected = json.loads(str(row["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses or not self._universe_status_records_match_evidence(records, evidence):
+                    return None
+            except (TypeError, ValueError, KeyError, OverflowError):
+                return None
+            return {**dict(row), "evidence": evidence, "status_records": records, "statuses": {key: value["rows"] for key, value in records.items()}}
 
     @staticmethod
     def _set_schema_version(db, version: int) -> None:
@@ -1909,6 +2470,152 @@ class StockStore:
         )
 
     @staticmethod
+    def _migrate_v15_bounded_retention_indexes(db) -> None:
+        """Indexes match bounded intraday read/retention predicates."""
+        db.execute("CREATE INDEX IF NOT EXISTS idx_minute_bars_trade_date_start ON minute_bars(trade_date,start_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_minute_bars_trade_date_code_start ON minute_bars(trade_date,code,start_at)")
+
+    @staticmethod
+    def _migrate_v16_intraday_outbox_retention_indexes(db) -> None:
+        """Keep terminal-retention queries bounded and recovery-indexed."""
+        # Intraday tables are optional/additive v14 records.  Versioned
+        # migrations may run before that optional table has ever been
+        # created; the normal v14 ensure path below creates both indexes once
+        # the feature is present.
+        if not StockStore._table_exists(db, "intraday_event_outbox"):
+            return
+        db.execute("CREATE INDEX IF NOT EXISTS idx_intraday_outbox_recovery ON intraday_event_outbox(state,next_retry_at,lease_expires_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_intraday_outbox_terminal_cleanup ON intraday_event_outbox(state,updated_at,event_key)")
+
+    @staticmethod
+    def _migrate_v17_recommendation_ai_reviews(db) -> None:
+        StockStore._ensure_v17_recommendation_ai_review_tables(db)
+
+    @staticmethod
+    def _migrate_v18_daily_acceptance(db) -> None:
+        StockStore._ensure_v18_daily_acceptance_tables(db)
+
+    @staticmethod
+    def _ensure_v19_factor_capture(db) -> None:
+        for table, column, definition in (
+            ("corporate_action_factors", "observed_at", "TEXT NOT NULL DEFAULT ''"),
+            ("corporate_action_factors", "response_sha256", "TEXT NOT NULL DEFAULT ''"),
+            ("corporate_action_factors", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
+            ("recommendation_records", "corporate_action_observed_at", "TEXT NOT NULL DEFAULT ''"),
+            ("recommendation_records", "corporate_action_response_sha256", "TEXT NOT NULL DEFAULT ''"),
+            ("recommendation_records", "corporate_action_evidence", "TEXT NOT NULL DEFAULT ''"),
+            ("daily_bars", "corporate_action_observed_at", "TEXT NOT NULL DEFAULT ''"),
+            ("daily_bars", "corporate_action_response_sha256", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            StockStore._ensure_column(db, table, column, definition)
+
+    @staticmethod
+    def _migrate_v19_factor_capture(db) -> None:
+        StockStore._ensure_v14_recommendation_tables(db)
+        StockStore._ensure_v19_factor_capture(db)
+
+    @staticmethod
+    def _migrate_v20_research_pools(db) -> None:
+        db.execute("""CREATE TABLE IF NOT EXISTS research_pool_runs(
+            run_id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, batch_id TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL, basis TEXT NOT NULL CHECK(basis='unadjusted'),
+            published_at TEXT NOT NULL, frozen_at TEXT NOT NULL,
+            diagnostics TEXT NOT NULL, status TEXT NOT NULL CHECK(status='research_only')
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS research_pool_picks(
+            run_id TEXT NOT NULL REFERENCES research_pool_runs(run_id),
+            pool TEXT NOT NULL CHECK(pool IN ('primary','radar')),
+            code TEXT NOT NULL, name TEXT NOT NULL, rank INTEGER NOT NULL,
+            score INTEGER NOT NULL, close REAL NOT NULL, amount REAL NOT NULL,
+            risk_level TEXT NOT NULL, risk_flags TEXT NOT NULL, reasons TEXT NOT NULL,
+            PRIMARY KEY(run_id,code), UNIQUE(run_id,pool,rank)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_research_pool_runs_date ON research_pool_runs(trade_date DESC,frozen_at DESC)")
+
+    @staticmethod
+    def _migrate_v21_risk_qualification(db) -> None:
+        db.execute("""CREATE TABLE IF NOT EXISTS daily_risk_observations(
+            observation_id TEXT PRIMARY KEY,
+            trade_date TEXT NOT NULL,
+            batch_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            field TEXT NOT NULL CHECK(field IN ('suspended','limit_up','limit_down','st')),
+            value INTEGER NOT NULL CHECK(value IN (0,1)),
+            source TEXT NOT NULL,
+            first_observed_at TEXT NOT NULL,
+            source_timestamp TEXT NOT NULL DEFAULT '',
+            reference_close REAL NOT NULL,
+            evidence_hash TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_daily_risk_lookup ON daily_risk_observations(trade_date,batch_id,code,first_observed_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS screen_gate_diagnostics(
+            job_key TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            trade_date TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            diagnostics_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY(job_key,attempt)
+        )""")
+
+    @staticmethod
+    def _migrate_v22_paper_bridge(db) -> None:
+        db.execute("""CREATE TABLE IF NOT EXISTS paper_qualification_events(
+            record_id TEXT NOT NULL, version TEXT NOT NULL, run_id TEXT NOT NULL,
+            code TEXT NOT NULL, trade_date TEXT NOT NULL, batch_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('eligible','blocked','unknown')),
+            reason TEXT NOT NULL, risk_json TEXT NOT NULL, first_decided_at TEXT NOT NULL,
+            PRIMARY KEY(record_id,version)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_paper_qualification_latest ON paper_qualification_events(record_id,first_decided_at DESC)")
+        db.execute("""CREATE TABLE IF NOT EXISTS paper_simulated_entries(
+            record_id TEXT PRIMARY KEY, qualification_version TEXT NOT NULL,
+            first_bar_at TEXT NOT NULL, second_bar_at TEXT NOT NULL,
+            confirmed_at TEXT NOT NULL, fill_status TEXT NOT NULL CHECK(fill_status IN ('simulated_fill','unfilled')),
+            entry_date TEXT, entry_price REAL, round_trip_fee_pct REAL NOT NULL,
+            entry_slippage_pct REAL NOT NULL, exit_slippage_pct REAL NOT NULL, reason TEXT NOT NULL,
+            source_quality TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
+
+    @staticmethod
+    def _migrate_v23_paper_forward(db) -> None:
+        """Keep legacy percent-fee entries untouched; version new terms separately."""
+        StockStore._ensure_column(db, "paper_simulated_entries", "accounting_version",
+                                  "TEXT NOT NULL DEFAULT 'legacy-percent-fee-v1'")
+        db.execute("""CREATE TABLE IF NOT EXISTS paper_freeze_contracts(
+            run_id TEXT PRIMARY KEY REFERENCES research_pool_runs(run_id),
+            protocol_version TEXT NOT NULL, fee_model_id TEXT NOT NULL,
+            rules_sha256 TEXT NOT NULL, frozen_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS paper_entry_terms(
+            record_id TEXT PRIMARY KEY REFERENCES paper_simulated_entries(record_id),
+            arm TEXT NOT NULL CHECK(arm IN ('A','B')),
+            accounting_version TEXT NOT NULL, protocol_version TEXT NOT NULL,
+            fee_model_id TEXT NOT NULL, freeze_rules_sha256 TEXT NOT NULL,
+            quantity INTEGER NOT NULL, entry_notional_cny TEXT NOT NULL,
+            commission_cny TEXT NOT NULL, transfer_fee_cny TEXT NOT NULL,
+            entry_fees_cny TEXT NOT NULL, total_cost_cny TEXT NOT NULL,
+            quote_at TEXT NOT NULL, execution_evidence_hash TEXT NOT NULL,
+            execution_evidence_json TEXT NOT NULL,
+            first_bar_evidence_hash TEXT NOT NULL, second_bar_evidence_hash TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS paper_bar_observations(
+            record_id TEXT NOT NULL, qualification_version TEXT NOT NULL,
+            bar_start TEXT NOT NULL, bar_close REAL NOT NULL,
+            received_at TEXT NOT NULL, evidence_sha256 TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            PRIMARY KEY(record_id,qualification_version,bar_start)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS paper_no_action_evidence(
+            code TEXT NOT NULL, trade_date TEXT NOT NULL,
+            source TEXT NOT NULL, observed_at TEXT NOT NULL, received_at TEXT NOT NULL,
+            response_sha256 TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('none','action','conflict')),
+            PRIMARY KEY(code,trade_date,source,response_sha256)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_paper_action_date ON paper_no_action_evidence(code,trade_date)")
+
+    @staticmethod
     def _migrate_v13_provenance_and_symbols(db) -> None:
         """Add price provenance and build a durable code/name lookup index."""
         StockStore._ensure_column(db, "daily_bars", "price_basis", "TEXT NOT NULL DEFAULT 'unknown'")
@@ -1975,7 +2682,7 @@ class StockStore:
                 if not re.fullmatch(r"\d{6}", code) or not name or normalize_stock_name(name) in {"", code}:
                     continue
                 rows[code] = (name, source)
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         db.executemany(
             "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
             "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
@@ -2991,7 +3698,7 @@ class StockStore:
         dataset_id = self._raw_dataset_id(dataset_key, provider, frequency, basis, universe)
         db.execute(
             "INSERT INTO datasets(dataset_id,dataset_key,provider,frequency,basis,universe,created_at) VALUES(?,?,?,?,?,?,?)",
-            (dataset_id, dataset_key, provider, frequency, basis, universe, datetime.utcnow().isoformat()),
+            (dataset_id, dataset_key, provider, frequency, basis, universe, _utcnow_naive().isoformat()),
         )
         return dataset_id
 
@@ -3022,7 +3729,7 @@ class StockStore:
         if not requested:
             raise ValueError("raw batch requested_date must be YYYY-MM-DD")
         batch_id = str(batch_id or ("batch-" + uuid.uuid4().hex))
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         try:
             min_row_count = max(1, int(min_row_count))
             min_overall_coverage = float(min_overall_coverage)
@@ -3387,7 +4094,7 @@ class StockStore:
             return
         db.execute(
             "INSERT INTO raw_page_metadata(batch_id,trade_date,partition_no,server_row_count,server_terminal,server_page_digest,filter_policy,server_rows_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (str(batch["batch_id"]), values["trade_date"], int(values["partition_no"]), int(values["server_row_count"]), int(values["server_terminal"]), values["server_page_digest"], values["filter_policy"], values["server_rows_json"], datetime.utcnow().isoformat()),
+            (str(batch["batch_id"]), values["trade_date"], int(values["partition_no"]), int(values["server_row_count"]), int(values["server_terminal"]), values["server_page_digest"], values["filter_policy"], values["server_rows_json"], _utcnow_naive().isoformat()),
         )
 
     def stage_raw_page_metadata(
@@ -3515,14 +4222,30 @@ class StockStore:
                     "SELECT trade_date,code,ts_code,name,open,high,low,close,pre_close,pct_change,volume,amount,source,basis FROM partition_bars WHERE partition_id=? ORDER BY code,ts_code",
                     (partition_id,),
                 )] if partition_id else []
-                normalized_rows = [self._normalize_raw_bar(row, str(key[0]), source=str(batch["provider"]), basis="unadjusted") for row in rows]
+                # Staging reuse must not re-normalise/re-hash every stored bar on
+                # every resume attempt (the same ~660k-bar cost that previously
+                # blocked the read path).  Bars were already canonicalised and
+                # digested when staged, so trust the append-only partition
+                # metadata and only verify it is well-formed.
                 if mapping:
-                    digest, count, market_counts = self._raw_partition_db_digest(db, partition_id)
-                    if digest != str(mapping["content_hash"] or "") or count != int(mapping["row_count"] or 0) or count != int(mapping["batch_row_count"] or 0) or not self._strict_market_counts_json(mapping["market_counts_json"], market_counts):
+                    count = self._strict_db_int(mapping["row_count"], minimum=0)
+                    content_hash = str(mapping["content_hash"] or "")
+                    if count is None or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
                         raise RuntimeError("staged raw partition integrity check failed")
+                    try:
+                        market_counts = json.loads(str(mapping["market_counts_json"] or "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError("staged raw partition market counts are invalid") from exc
+                    if not isinstance(market_counts, dict) or any(
+                        key not in {"SH", "SZ", "BJ"} or isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                        for key, value in market_counts.items()
+                    ):
+                        raise RuntimeError("staged raw partition market counts mismatch")
                 else:
-                    digest, count, market_counts = self._raw_digest_for_rows(normalized_rows), len(normalized_rows), {}
-                    for row in normalized_rows:
+                    count = len(rows)
+                    content_hash = self._raw_digest_for_rows(rows) if rows else ""
+                    market_counts = {}
+                    for row in rows:
                         market = self._raw_market(row.get("ts_code") or row.get("code"))
                         market_counts[market] = market_counts.get(market, 0) + 1
                 if metadata is None:
@@ -3534,31 +4257,125 @@ class StockStore:
                         batch,
                         str(key[0]),
                         int(key[1]),
-                        normalized_rows,
+                        rows,
                         source=str(batch["provider"]),
                     )
                     metadata = dict(metadata)
-                page = self._validate_raw_page_metadata_in_tx(db, batch, metadata, normalized_rows)
+                server_row_count = self._strict_db_int(metadata["server_row_count"], minimum=0)
+                server_terminal = self._strict_db_int(metadata["server_terminal"], minimum=0, maximum=1)
+                if server_row_count is None or server_terminal is None:
+                    raise RuntimeError("staged raw page metadata is invalid")
+                page = {
+                    "server_row_count": server_row_count,
+                    "server_terminal": bool(server_terminal),
+                    "server_page_digest": str(metadata["server_page_digest"] or "").strip().lower(),
+                    "filter_policy": str(metadata["filter_policy"] or ""),
+                }
                 item = {
                     "trade_date": str(key[0]),
                     "partition_no": int(key[1]),
                     "partition_id": partition_id or None,
                     "row_count": count,
-                    "content_hash": digest if mapping else (self._raw_digest_for_rows(normalized_rows) if normalized_rows else ""),
+                    "content_hash": content_hash,
                     "market_counts": market_counts,
-                    "server_row_count": page["server_row_count"],
-                    "server_terminal": page["server_terminal"],
-                    "server_page_digest": page["server_page_digest"],
-                    "filter_policy": page["filter_policy"],
+                    "server_row_count": int(page["server_row_count"]),
+                    "server_terminal": bool(page["server_terminal"]),
+                    "server_page_digest": str(page["server_page_digest"]),
+                    "filter_policy": str(page["filter_policy"]),
                 }
                 if include_rows:
-                    item["rows"] = normalized_rows
+                    item["rows"] = rows
                 result.append(item)
             return result
 
     staged_raw_partitions = raw_batch_partitions
     raw_staging_partitions = raw_batch_partitions
     list_raw_partitions = raw_batch_partitions
+
+    def reuse_partition_for_batch(self, batch_id: str, trade_date: str, *, partition_no: int = 0) -> dict | None:
+        """Reuse an already-staged partition from a prior generation.
+
+        The true-incremental path: a new daily window reuses the overlapping
+        sessions already on disk and only fetches the one new session.  Returns
+        the same item shape as ``raw_batch_partitions`` entries, or ``None`` when
+        no reusable partition exists for this dataset + trade date.
+        """
+        normalized_date = self._canonical_raw_date(trade_date)
+        if not normalized_date:
+            raise ValueError("raw partition trade_date must be canonical")
+        partition_no = self._strict_db_int(partition_no, minimum=0)
+        if partition_no is None:
+            raise ValueError("raw partition_no must be a non-negative integer")
+        with self._connect() as db:
+            batch = db.execute(
+                "SELECT b.*,d.dataset_key,d.provider,d.frequency,d.universe FROM batches b JOIN datasets d ON d.dataset_id=b.dataset_id WHERE b.batch_id=?",
+                (str(batch_id),),
+            ).fetchone()
+            if not batch:
+                raise KeyError(f"unknown raw batch {batch_id}")
+            if str(batch["status"]) != "staging":
+                raise RuntimeError("raw batch is no longer staging")
+            existing = db.execute(
+                "SELECT dp.partition_id,dp.content_hash,dp.row_count,dp.market_counts_json,dp.basis,dp.source "
+                "FROM day_partitions dp "
+                "WHERE dp.dataset_id=? AND dp.trade_date=? AND dp.partition_no=? AND dp.validation_status='validated' "
+                "  AND NOT EXISTS (SELECT 1 FROM batch_days bd WHERE bd.batch_id=? AND bd.partition_id=dp.partition_id) "
+                "ORDER BY dp.created_at DESC LIMIT 1",
+                (batch["dataset_id"], normalized_date, partition_no, str(batch_id)),
+            ).fetchone()
+            if not existing:
+                return None
+            if str(existing["basis"] or "").lower() != "unadjusted" or str(existing["source"] or "").strip().casefold() != str(batch["provider"] or "").strip().casefold():
+                return None
+            partition_id = str(existing["partition_id"])
+            source_meta = db.execute(
+                "SELECT rpm.server_row_count,rpm.server_terminal,rpm.server_page_digest,rpm.filter_policy,rpm.server_rows_json "
+                "FROM raw_page_metadata rpm JOIN batch_days bd ON bd.batch_id=rpm.batch_id AND bd.partition_id=? "
+                "WHERE rpm.trade_date=? AND rpm.partition_no=? ORDER BY rpm.created_at DESC LIMIT 1",
+                (partition_id, normalized_date, partition_no),
+            ).fetchone()
+            if not source_meta:
+                return None
+            rows = [dict(row) for row in db.execute(
+                "SELECT trade_date,code,ts_code,name,open,high,low,close,pre_close,pct_change,volume,amount,source,basis FROM partition_bars WHERE partition_id=? ORDER BY code,ts_code",
+                (partition_id,),
+            )]
+            if not rows:
+                return None
+            try:
+                market_counts = json.loads(str(existing["market_counts_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(market_counts, dict):
+                return None
+            db.execute(
+                "INSERT OR IGNORE INTO batch_days(batch_id,trade_date,partition_id,row_count) VALUES(?,?,?,?)",
+                (str(batch_id), normalized_date, partition_id, int(existing["row_count"] or len(rows))),
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO raw_page_metadata(batch_id,trade_date,partition_no,server_row_count,server_terminal,server_page_digest,filter_policy,server_rows_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    str(batch_id), normalized_date, partition_no,
+                    int(source_meta["server_row_count"] or 0), int(source_meta["server_terminal"] or 0),
+                    str(source_meta["server_page_digest"] or ""), str(source_meta["filter_policy"] or "include_all"),
+                    str(source_meta["server_rows_json"] or "[]"), _utcnow_naive().isoformat(),
+                ),
+            )
+            totals = db.execute("SELECT COALESCE(SUM(row_count),0) FROM batch_days WHERE batch_id=?", (str(batch_id),)).fetchone()
+            db.execute("UPDATE batches SET row_count=? WHERE batch_id=?", (int(totals[0]), str(batch_id)))
+            return {
+                "trade_date": normalized_date,
+                "partition_no": partition_no,
+                "partition_id": partition_id,
+                "row_count": int(existing["row_count"] or len(rows)),
+                "content_hash": str(existing["content_hash"] or ""),
+                "market_counts": market_counts,
+                "server_row_count": int(source_meta["server_row_count"] or 0),
+                "server_terminal": bool(int(source_meta["server_terminal"] or 0)),
+                "server_page_digest": str(source_meta["server_page_digest"] or ""),
+                "filter_policy": str(source_meta["filter_policy"] or "include_all"),
+                "rows": rows,
+            }
 
     def raw_batch_staged_rows(self, batch_id: str, trade_date: str | None = None) -> dict[str, list[dict]]:
         result: dict[str, list[dict]] = {}
@@ -3684,7 +4501,7 @@ class StockStore:
                         partition_id, batch["dataset_id"], normalized_date, partition_no, content_hash,
                         source_value, "unadjusted", len(normalized),
                         json.dumps(market_counts, sort_keys=True, separators=(",", ":")), 1,
-                        "validated", datetime.utcnow().isoformat(),
+                        "validated", _utcnow_naive().isoformat(),
                     ),
                 )
                 db.executemany(
@@ -3713,8 +4530,15 @@ class StockStore:
     stage_or_reuse_partition = stage_raw_partition
     stage_partition = stage_raw_partition
 
-    def _validate_raw_partitions_in_tx(self, db, batch) -> dict:
-        """Re-read every staged row and build the only trusted batch summary."""
+    def _validate_raw_partitions_in_tx(self, db, batch, fast: bool = False) -> dict:
+        """Re-read every staged row and build the only trusted batch summary.
+
+        ``fast=True`` skips the per-bar re-normalisation and page-metadata
+        recomputation, trusting the publish-time validation of an immutable
+        batch and verifying only the append-only partition digest/row-count/
+        market-count contract.  This turns a multi-minute event-loop block
+        (hundreds of thousands of float conversions) into a short digest pass.
+        """
         mappings = db.execute(
             "SELECT bd.trade_date AS batch_trade_date,bd.partition_id AS batch_partition_id,bd.row_count AS batch_row_count,"
             "dp.partition_id,dp.dataset_id,dp.trade_date,dp.partition_no,dp.content_hash,dp.source,dp.basis,dp.row_count,"
@@ -3765,43 +4589,96 @@ class StockStore:
             partition_source = str(mapping["source"] or "").strip().casefold()
             if not batch_source or partition_source != batch_source:
                 raise RuntimeError("raw batch contains a mixed source")
-            rows = [
-                dict(row) for row in db.execute(
-                    "SELECT trade_date,code,ts_code,name,open,high,low,close,pre_close,pct_change,volume,amount,source,basis "
-                    "FROM partition_bars WHERE partition_id=? ORDER BY code,ts_code",
-                    (str(mapping["partition_id"]),),
-                )
-            ]
-            if not rows:
-                raise RuntimeError("raw batch contains an empty partition")
-            normalized_rows: list[dict] = []
-            for row in rows:
+            if fast:
+                # A published batch is immutable and was already re-hashed and
+                # re-normalised bar-by-bar at publish time.  Re-hashing ~665k
+                # bars on every process start (the read path runs before the
+                # in-memory cache is warm) blocks the event loop for ~90s, so
+                # trust the append-only partition metadata instead and only
+                # verify that it is well-formed and self-consistent.
+                content_hash = str(mapping["content_hash"] or "")
+                if not re.fullmatch(r"[0-9a-f]{64}", content_hash):
+                    raise RuntimeError("raw partition content hash is invalid")
+                if partition_row_count != batch_row_count:
+                    raise RuntimeError("raw partition row count mismatch")
                 try:
-                    normalized = self._normalize_raw_bar(row, partition_date, source=str(mapping["source"]), basis="unadjusted")
-                    if self._raw_bar_payload(normalized) != self._raw_bar_payload(row):
-                        raise ValueError("raw partition row is not canonical")
-                except (TypeError, ValueError, OverflowError, KeyError) as exc:
-                    raise RuntimeError("raw batch contains an invalid partition row") from exc
-                key = (partition_date, str(normalized["code"]))
-                if key in seen_codes:
-                    raise RuntimeError("raw batch contains duplicate codes for a date")
-                seen_codes.add(key)
-                normalized_rows.append(normalized)
-            metadata = page_metadata.get(partition_key)
-            if metadata is None:
-                metadata = dict(self._raw_page_metadata_values(
-                    batch,
-                    partition_date,
-                    partition_no,
-                    normalized_rows,
-                    source=str(batch["provider"]),
-                ))
-            page = self._validate_raw_page_metadata_in_tx(db, batch, metadata, normalized_rows)
+                    market_counts = json.loads(str(mapping["market_counts_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("raw partition market counts are invalid") from exc
+                if (
+                    not isinstance(market_counts, dict)
+                    or any(key not in {"SH", "SZ", "BJ"} for key in market_counts)
+                    or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in market_counts.values())
+                ):
+                    raise RuntimeError("raw partition market counts mismatch")
+                page_meta = page_metadata.get(partition_key)
+                if page_meta is None:
+                    raise RuntimeError("raw page metadata is missing")
+                server_row_count = self._strict_db_int(page_meta["server_row_count"], minimum=0)
+                server_terminal = self._strict_db_int(page_meta["server_terminal"], minimum=0, maximum=1)
+                if server_row_count is None or server_terminal is None:
+                    raise RuntimeError("raw server page metadata is invalid")
+                server_page_digest = str(page_meta["server_page_digest"] or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", server_page_digest):
+                    raise RuntimeError("raw server page digest is invalid")
+                page = {
+                    "trade_date": partition_date,
+                    "partition_no": partition_no,
+                    "server_row_count": server_row_count,
+                    "server_terminal": bool(server_terminal),
+                    "server_page_digest": server_page_digest,
+                    "filter_policy": self._raw_page_filter_policy(str(page_meta["filter_policy"] or "")),
+                }
+                date_counts = daily_counts.setdefault(partition_date, {"total": 0})
+                date_counts["total"] += partition_row_count
+                for market, value in market_counts.items():
+                    date_counts[market] = date_counts.get(market, 0) + value
+                trusted.append({
+                    "trade_date": partition_date,
+                    "partition_no": partition_no,
+                    "partition_id": str(mapping["partition_id"]),
+                    "content_hash": content_hash,
+                    "row_count": partition_row_count,
+                    "market_counts": market_counts,
+                })
+                trusted_pages.append({
+                    "trade_date": partition_date,
+                    "partition_no": partition_no,
+                    "server_row_count": int(page["server_row_count"]),
+                    "server_terminal": bool(page["server_terminal"]),
+                    "server_page_digest": str(page["server_page_digest"]),
+                    "filter_policy": str(page["filter_policy"]),
+                })
+                total_rows += partition_row_count
+                continue
+            # Publication re-validation verifies the append-only digest (tamper
+            # detection) without re-normalising every bar or re-parsing the
+            # server-page metadata.  Both were already validated when the
+            # partition was staged, so re-doing them here only re-serialises
+            # ~665k bars and blocks the event loop for minutes.
             digest, count, market_counts = self._raw_partition_db_digest(db, str(mapping["partition_id"]))
             if digest != str(mapping["content_hash"] or "") or count != partition_row_count or count != batch_row_count:
                 raise RuntimeError("raw partition digest or row count mismatch")
             if not self._strict_market_counts_json(mapping["market_counts_json"], market_counts):
                 raise RuntimeError("raw partition market counts mismatch")
+            metadata = page_metadata.get(partition_key)
+            if metadata is None:
+                raise RuntimeError("raw page metadata is missing")
+            server_row_count = self._strict_db_int(metadata["server_row_count"], minimum=0)
+            server_terminal = self._strict_db_int(metadata["server_terminal"], minimum=0, maximum=1)
+            if server_row_count is None or server_terminal is None:
+                raise RuntimeError("raw server page metadata is invalid")
+            server_page_digest = str(metadata["server_page_digest"] or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", server_page_digest):
+                raise RuntimeError("raw server page digest is invalid")
+            page = {
+                "trade_date": partition_date,
+                "partition_no": partition_no,
+                "server_row_count": server_row_count,
+                "server_terminal": bool(server_terminal),
+                "server_page_digest": server_page_digest,
+                "filter_policy": self._raw_page_filter_policy(str(metadata["filter_policy"] or "")),
+            }
             date_counts = daily_counts.setdefault(partition_date, {"total": 0})
             date_counts["total"] += count
             for market, value in market_counts.items():
@@ -3955,7 +4832,24 @@ class StockStore:
         if batch["end_date"] is not None and str(batch["end_date"]) != end_date:
             raise RuntimeError("raw batch end date mismatch")
 
-    def _validate_published_raw_batch_in_tx(self, db, batch) -> dict:
+    def _validate_published_raw_batch_cached(self, db, batch) -> dict:
+        """Validate a published raw batch once per process, then reuse.
+
+        The first read re-hashes the stored bars so out-of-band SQLite changes
+        remain detectable.  Callers keep this work off the event loop, and the
+        result is cached by (batch_id, generation) for subsequent reads.
+        """
+        batch_id = str(batch["batch_id"] or "")
+        generation = str(batch["generation"] or "")
+        key = batch_id + ":" + generation
+        cached = self._raw_batch_validation_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._validate_published_raw_batch_in_tx(db, batch)
+        self._raw_batch_validation_cache[key] = result
+        return result
+
+    def _validate_published_raw_batch_in_tx(self, db, batch, fast: bool = False) -> dict:
         if str(batch["status"] or "") != "published":
             raise RuntimeError("raw batch is not published")
         if str(batch["basis"] or "").lower() != "unadjusted" or str(batch["dataset_basis"] or "").lower() != "unadjusted":
@@ -3963,7 +4857,7 @@ class StockStore:
         if str(batch["source"] or "").strip().casefold() != str(batch["provider"] or "").strip().casefold():
             raise RuntimeError("raw batch source does not match provider")
         try:
-            detail = self._validate_raw_partitions_in_tx(db, batch)
+            detail = self._validate_raw_partitions_in_tx(db, batch, fast=fast)
             actual_text = str(batch["actual_trade_date"] or "")
             actual = self._canonical_raw_date(actual_text)
             if not actual or actual != actual_text:
@@ -3999,7 +4893,7 @@ class StockStore:
             return dict(row) if row else None
 
     def _cleanup_raw_batches_in_tx(self, db, dataset_id: str) -> list[str]:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         # Closed readers no longer protect their batch.  Remove those
         # provenance rows before deleting old batches so the RESTRICT foreign
         # key does not turn routine retention into a failed publication.
@@ -4143,7 +5037,7 @@ class StockStore:
                     actual, start_date, end_date, 1 if shadow else 0, "shadow" if shadow else "active", quality_value, source_value, generation, detail["row_count"],
                     manifest_hash, expected_dates_value,
                     json.dumps(coverage_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False),
-                    datetime.utcnow().isoformat(), batch_id,
+                    _utcnow_naive().isoformat(), batch_id,
                 ),
             )
             if shadow:
@@ -4152,7 +5046,7 @@ class StockStore:
                 db.execute(
                     "INSERT INTO active_generations(dataset_id,active_batch_id,previous_batch_id,generation,updated_at) VALUES(?,?,?,?,?) "
                     "ON CONFLICT(dataset_id) DO UPDATE SET previous_batch_id=active_generations.active_batch_id,active_batch_id=excluded.active_batch_id,generation=excluded.generation,updated_at=excluded.updated_at",
-                    (batch["dataset_id"], batch_id, str(previous["active_batch_id"]) if previous else None, generation, datetime.utcnow().isoformat()),
+                    (batch["dataset_id"], batch_id, str(previous["active_batch_id"]) if previous else None, generation, _utcnow_naive().isoformat()),
                 )
                 deleted = self._cleanup_raw_batches_in_tx(db, str(batch["dataset_id"]))
             published = db.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
@@ -4172,6 +5066,9 @@ class StockStore:
                 raise KeyError(f"unknown raw batch {batch_id}")
             if str(batch["status"] or "") != "published" or int(batch["shadow"] or 0) != 1 or str(batch["publication_mode"] or "") != "shadow":
                 raise RuntimeError("raw batch is not a shadow publication")
+            # Promotion is a security-sensitive transition: re-validate the
+            # full batch (per-bar digest) rather than the fast cached read
+            # path, so tampered bars cannot be promoted into the active set.
             detail = self._validate_published_raw_batch_in_tx(db, batch)
             source_value = str(source or batch["source"] or batch["provider"]).strip()[:80]
             if source_value.casefold() != str(batch["source"] or batch["provider"]).strip().casefold():
@@ -4184,12 +5081,12 @@ class StockStore:
             generation = max(int(previous["generation"] or 0) + 1 if previous else 1, int(latest[0] or 0) + 1, 1)
             db.execute(
                 "UPDATE batches SET shadow=0,publication_mode='active',generation=?,published_at=?,error=NULL WHERE batch_id=?",
-                (generation, datetime.utcnow().isoformat(), str(batch_id)),
+                (generation, _utcnow_naive().isoformat(), str(batch_id)),
             )
             db.execute(
                 "INSERT INTO active_generations(dataset_id,active_batch_id,previous_batch_id,generation,updated_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(dataset_id) DO UPDATE SET previous_batch_id=active_generations.active_batch_id,active_batch_id=excluded.active_batch_id,generation=excluded.generation,updated_at=excluded.updated_at",
-                (batch["dataset_id"], str(batch_id), str(previous["active_batch_id"]) if previous else None, generation, datetime.utcnow().isoformat()),
+                (batch["dataset_id"], str(batch_id), str(previous["active_batch_id"]) if previous else None, generation, _utcnow_naive().isoformat()),
             )
             deleted = self._cleanup_raw_batches_in_tx(db, str(batch["dataset_id"]))
             published = db.execute("SELECT * FROM batches WHERE batch_id=?", (str(batch_id),)).fetchone()
@@ -4250,7 +5147,7 @@ class StockStore:
             if not row:
                 return None
             try:
-                self._validate_published_raw_batch_in_tx(db, row)
+                self._validate_published_raw_batch_cached(db, row)
                 if str(row["active_dataset_id"]) != str(row["batch_dataset_id"]) or int(row["active_generation"]) != int(row["batch_generation"]):
                     raise RuntimeError("active raw generation pointer mismatch")
             except (RuntimeError, ValueError, TypeError, KeyError, OverflowError):
@@ -4264,6 +5161,62 @@ class StockStore:
     def active_raw_generation(self, dataset_key: str = "tushare_daily", *, as_of: str = "", max_stale_trading_days: int = 2) -> dict | None:
         return self.active_raw_batch(dataset_key, as_of=as_of, max_stale_trading_days=max_stale_trading_days)
 
+    def active_raw_universe_codes(
+        self,
+        dataset_key: str = "tushare_daily",
+        *,
+        as_of: str = "",
+        max_stale_trading_days: int = 2,
+        limit: int = 8000,
+    ) -> tuple[list[str], dict]:
+        """Return the active raw generation's code universe without reading bars.
+
+        The raw generation establishes expected membership only.  It is not
+        treated as intraday price evidence and its previous close is never
+        mixed into the live cross-section.
+        """
+        active = self.active_raw_batch(dataset_key, as_of=as_of, max_stale_trading_days=max_stale_trading_days)
+        if not active or not active.get("fresh"):
+            return [], dict(active or {})
+        requested = str(active.get("actual_trade_date") or "")
+        batch_id = str(active.get("batch_id") or active.get("active_batch_id") or "")
+        if not batch_id or not requested:
+            return [], dict(active)
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT pb.code FROM batch_days bd "
+                "JOIN partition_bars pb ON pb.partition_id=bd.partition_id "
+                "WHERE bd.batch_id=? AND bd.trade_date=? ORDER BY pb.code LIMIT ?",
+                (batch_id, requested, max(1, min(int(limit), 10000))),
+            ).fetchall()
+        return [str(row[0]) for row in rows if str(row[0] or "").strip()], dict(active)
+
+    def save_intraday_market_regime_state(self, state: dict, *, scope: str = "whole_market") -> dict:
+        """Persist only compact immutable cross-section diagnostics/state."""
+        value = dict(state or {})
+        now = str(value.get("updated_at") or _utcnow_naive().isoformat())
+        fields = (
+            "regime", "pending_regime", "pending_count", "source", "source_timestamp",
+            "sample_size", "expected_size", "coverage", "breadth", "advancing", "declining",
+            "flat", "median_return", "quote_timestamp_min", "quote_timestamp_max", "quality", "reason",
+        )
+
+        row = {key: value.get(key) for key in fields}
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO intraday_market_regime_state(scope,regime,pending_regime,pending_count,source,source_timestamp,sample_size,expected_size,coverage,breadth,advancing,declining,flat,median_return,quote_timestamp_min,quote_timestamp_max,quality,reason,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(scope) DO UPDATE SET regime=excluded.regime,pending_regime=excluded.pending_regime,pending_count=excluded.pending_count,source=excluded.source,source_timestamp=excluded.source_timestamp,sample_size=excluded.sample_size,expected_size=excluded.expected_size,coverage=excluded.coverage,breadth=excluded.breadth,advancing=excluded.advancing,declining=excluded.declining,flat=excluded.flat,median_return=excluded.median_return,quote_timestamp_min=excluded.quote_timestamp_min,quote_timestamp_max=excluded.quote_timestamp_max,quality=excluded.quality,reason=excluded.reason,updated_at=excluded.updated_at",
+                (str(scope), str(row["regime"] or "unknown"), str(row["pending_regime"] or "unknown"), int(row["pending_count"] or 0), str(row["source"] or ""), str(row["source_timestamp"] or ""), int(row["sample_size"] or 0), int(row["expected_size"] or 0), float(row["coverage"] or 0), row["breadth"], int(row["advancing"] or 0), int(row["declining"] or 0), int(row["flat"] or 0), row["median_return"], str(row["quote_timestamp_min"] or ""), str(row["quote_timestamp_max"] or ""), str(row["quality"] or "unknown"), str(row["reason"] or "")[:500], now),
+            )
+            saved = db.execute("SELECT * FROM intraday_market_regime_state WHERE scope=?", (str(scope),)).fetchone()
+        return dict(saved)
+
+    def intraday_market_regime_state(self, scope: str = "whole_market") -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM intraday_market_regime_state WHERE scope=?", (str(scope),)).fetchone()
+        return dict(row) if row else None
+
     def raw_batch_bars(self, batch_id: str, codes=None, *, before_or_equal: str = "", after: str = "") -> dict[str, list[dict]]:
         with self._connect() as db:
             row = db.execute(
@@ -4273,17 +5226,17 @@ class StockStore:
             if not row:
                 return {}
             try:
-                self._validate_published_raw_batch_in_tx(db, row)
+                self._validate_published_raw_batch_cached(db, row)
             except (RuntimeError, ValueError, TypeError, KeyError, OverflowError):
                 return {}
             reader = RawBatchRead(db, "direct", str(row["batch_id"]), str(row["dataset_id"]), 0, str(row["basis"]), str(row["source"]))
             return reader.bars(codes, before_or_equal, after)
 
-    def raw_history(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2) -> tuple[dict[str, list[dict]], dict]:
+    def raw_history(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2, after: str = "") -> tuple[dict[str, list[dict]], dict]:
         with self.pin_active_raw_batch(dataset_key, as_of=as_of, max_stale_trading_days=max_stale_trading_days, reader="history") as reader:
             if reader is None:
                 return {}, {}
-            return reader.bars(codes, before_or_equal=as_of), {
+            return reader.bars(codes, before_or_equal=as_of, after=after), {
                 "batch_id": reader.batch_id,
                 "dataset_id": reader.dataset_id,
                 "generation": reader.generation,
@@ -4291,10 +5244,452 @@ class StockStore:
                 "source": reader.source,
             }
 
-    def read_active_raw_bars(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2) -> dict[str, list[dict]]:
-        return self.raw_history(codes, as_of=as_of, dataset_key=dataset_key, max_stale_trading_days=max_stale_trading_days)[0]
+    def read_active_raw_bars(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2, after: str = "") -> dict[str, list[dict]]:
+        return self.raw_history(codes, as_of=as_of, dataset_key=dataset_key, max_stale_trading_days=max_stale_trading_days, after=after)[0]
 
     load_raw_bars = read_active_raw_bars
+
+    def research_input(self, *, as_of: str, deep_limit: int = 300) -> dict | None:
+        """Read a complete published close and its history from one pinned generation."""
+        active = self.active_raw_batch(as_of=as_of, max_stale_trading_days=1)
+        if not active or not active.get("fresh") or str(active.get("quality") or "") != "good":
+            return None
+        trade_date = str(active.get("actual_trade_date") or "")
+        batch_id = str(active.get("batch_id") or active.get("active_batch_id") or "")
+        if not trade_date or not batch_id or trade_date > as_of:
+            return None
+        from .research_selector import supported_board
+        previous = (datetime.fromisoformat(trade_date).date() - timedelta(days=1)).isoformat()
+        with self.pin_active_raw_batch(as_of=as_of, max_stale_trading_days=1, reader="research-pools") as reader:
+            if reader is None or reader.batch_id != batch_id or reader.basis != "unadjusted":
+                return None
+            day_rows = [row for row in reader.rows(before_or_equal=trade_date, after=previous)
+                        if supported_board(str(row.get("code") or ""))]
+            if len(day_rows) < 3000:
+                return None
+            day_rows.sort(key=lambda row: (-float(row.get("amount") or 0), str(row["code"])))
+            histories = reader.bars([row["code"] for row in day_rows[:deep_limit]], before_or_equal=trade_date)
+        names = self.latest_quote_names([row["code"] for row in day_rows[:deep_limit]])
+        for row in day_rows[:deep_limit]:
+            row["name"] = str(row.get("name") or names.get(row["code"]) or "")
+        return {"trade_date": trade_date, "batch_id": batch_id, "source": reader.source,
+                "published_at": str(active.get("published_at") or ""),
+                "basis": reader.basis, "day_rows": day_rows, "histories": histories}
+
+    def save_research_pools(self, snapshot: dict, primary: list[dict], radar: list[dict], diagnostics: dict) -> dict:
+        """Immutable per-batch freeze, isolated from screen runs and recommendations."""
+        batch_id = str(snapshot["batch_id"])
+        run_id = "research:" + batch_id
+        now = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            found = db.execute("SELECT run_id FROM research_pool_runs WHERE batch_id=?", (batch_id,)).fetchone()
+            if found:
+                return self._research_pool_in_tx(db, str(found[0]))
+            db.execute(
+                "INSERT INTO research_pool_runs(run_id,trade_date,batch_id,source,basis,published_at,frozen_at,diagnostics,status) VALUES(?,?,?,?,?,?,?,?,?)",
+                (run_id, snapshot["trade_date"], batch_id, snapshot["source"], snapshot["basis"],
+                 snapshot["published_at"], now, json.dumps(diagnostics, ensure_ascii=False), "research_only"),
+            )
+            from . import paper_forward as forward
+            db.execute(
+                "INSERT INTO paper_freeze_contracts(run_id,protocol_version,fee_model_id,rules_sha256,frozen_at) VALUES(?,?,?,?,?)",
+                (run_id, forward.PROTOCOL_VERSION, forward.FEE_MODEL_ID,
+                 forward.frozen_rule_digest(), now),
+            )
+            for pool, picks in (("primary", primary), ("radar", radar)):
+                for rank, item in enumerate(picks, 1):
+                    db.execute(
+                        "INSERT INTO research_pool_picks(run_id,pool,code,name,rank,score,close,amount,risk_level,risk_flags,reasons) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (run_id, pool, item["code"], item["name"], rank, item["score"], item["close"],
+                         item["amount"], item["risk_level"], json.dumps(item["risk_flags"], ensure_ascii=False),
+                         json.dumps(item["reasons"], ensure_ascii=False)),
+                    )
+            return self._research_pool_in_tx(db, run_id)
+
+    @staticmethod
+    def _research_pool_in_tx(db, run_id: str) -> dict:
+        row = db.execute("SELECT * FROM research_pool_runs WHERE run_id=?", (run_id,)).fetchone()
+        if not row:
+            return {}
+        result = dict(row)
+        result["picks"] = {pool: [dict(item) for item in db.execute(
+            "SELECT * FROM research_pool_picks WHERE run_id=? AND pool=? ORDER BY rank", (run_id, pool)
+        )] for pool in ("primary", "radar")}
+        return result
+
+    def latest_research_pools(self) -> dict:
+        with self._connect() as db:
+            row = db.execute("SELECT run_id FROM research_pool_runs ORDER BY trade_date DESC,frozen_at DESC LIMIT 1").fetchone()
+            return self._research_pool_in_tx(db, str(row[0])) if row else {}
+
+    def record_daily_risk_observations(self, bundle: dict) -> int:
+        """Append dated, batch-bound source facts; never turn pool absence into False."""
+        from . import risk_qualification as risk
+
+        trade_date = str(bundle.get("trade_date") or "")
+        batch_id = str(bundle.get("batch_id") or "")
+        entries = bundle.get("observations")
+        if not isinstance(entries, list) or len(entries) > 10000:
+            raise ValueError("risk_observation_count_invalid")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            batch = db.execute(
+                "SELECT b.actual_trade_date,b.status,d.dataset_key,d.provider,d.basis "
+                "FROM batches b JOIN datasets d ON d.dataset_id=b.dataset_id WHERE b.batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if (not batch or batch["actual_trade_date"] != trade_date or batch["status"] != "published"
+                    or batch["dataset_key"] != "tushare_daily" or batch["provider"] != "tushare"
+                    or batch["basis"] != "unadjusted"):
+                raise ValueError("risk_raw_batch_unverified")
+            codes = {str(item.get("code") or "") for item in entries if isinstance(item, dict)}
+            closes = {}
+            for chunk_start in range(0, len(codes), 900):
+                chunk = sorted(codes)[chunk_start:chunk_start + 900]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _ in chunk)
+                for row in db.execute(
+                    f"SELECT code,price FROM daily_quotes WHERE trade_date=? AND code IN ({placeholders})",
+                    (trade_date, *chunk),
+                ):
+                    closes[str(row["code"])] = float(row["price"])
+            normalized = []
+            now = datetime.now(timezone.utc)
+            for item in entries:
+                code = str(item.get("code") or "") if isinstance(item, dict) else ""
+                if code not in closes:
+                    raise ValueError("risk_reference_quote_missing")
+                records = risk.normalize_observation(item, trade_date=trade_date, batch_id=batch_id, close=closes[code])
+                if any(risk.aware_instant(row["first_observed_at"]) > now for row in records):
+                    raise ValueError("risk_observation_in_future")
+                normalized.extend(records)
+            timestamp = now.isoformat()
+            before = db.total_changes
+            db.executemany(
+                "INSERT OR IGNORE INTO daily_risk_observations(observation_id,trade_date,batch_id,code,field,value,source,first_observed_at,source_timestamp,reference_close,evidence_hash,recorded_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(row["observation_id"], row["trade_date"], row["batch_id"], row["code"], row["field"],
+                  row["value"], row["source"], row["first_observed_at"], row["source_timestamp"], row["reference_close"],
+                  row["evidence_hash"], timestamp) for row in normalized],
+            )
+            return db.total_changes - before
+
+    def daily_risk_evidence_for_quotes(self, trade_date: str, batch_id: str, quotes, decision_at) -> dict[str, dict]:
+        """Read only exact batch/date/price facts known by this decision time."""
+        from . import risk_qualification as risk
+
+        closes = {str(q.code): float(q.price) for q in quotes or [] if risk.supported_code(getattr(q, "code", ""))}
+        if not trade_date or not batch_id or not closes:
+            return {}
+        rows = []
+        with self._connect() as db:
+            codes = sorted(closes)
+            for start in range(0, len(codes), 900):
+                chunk = codes[start:start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(dict(row) for row in db.execute(
+                    "SELECT trade_date,batch_id,code,field,value,source,first_observed_at,source_timestamp,reference_close,recorded_at "
+                    f"FROM daily_risk_observations WHERE trade_date=? AND batch_id=? AND code IN ({placeholders})",
+                    (trade_date, batch_id, *chunk),
+                ))
+        return risk.resolve_as_of(rows, trade_date=trade_date, batch_id=batch_id,
+                                  closes=closes, decision_at=decision_at)
+
+    def qualify_research_pick(self, run_id: str, code: str, decision_at) -> dict:
+        """Version a later trading-risk decision without altering the freeze."""
+        from . import risk_qualification as risk
+
+        cutoff = risk.aware_instant(decision_at)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            pick = db.execute(
+                "SELECT p.close,r.trade_date,r.batch_id,r.frozen_at,r.status "
+                "FROM research_pool_picks p JOIN research_pool_runs r ON r.run_id=p.run_id "
+                "WHERE p.run_id=? AND p.code=? AND p.pool='primary'",
+                (str(run_id), str(code)),
+            ).fetchone()
+            if not pick or pick["status"] != "research_only" or not risk.supported_code(code):
+                raise ValueError("paper_research_identity_unverified")
+            frozen = datetime.fromisoformat(str(pick["frozen_at"]).replace("Z", "+00:00"))
+            if frozen.tzinfo is None:
+                frozen = frozen.replace(tzinfo=timezone.utc)
+            if cutoff <= frozen.astimezone(timezone.utc):
+                raise ValueError("paper_decision_before_freeze")
+            trade_date, batch_id = str(pick["trade_date"]), str(pick["batch_id"])
+            evidence = [dict(row) for row in db.execute(
+                "SELECT * FROM daily_risk_observations WHERE trade_date=? AND batch_id=? AND code=?",
+                (trade_date, batch_id, str(code)),
+            )]
+            facts = risk.resolve_as_of(evidence, trade_date=trade_date, batch_id=batch_id,
+                                       closes={str(code): float(pick["close"])}, decision_at=cutoff)
+            flags = facts.get(str(code), {})
+            required = ("suspended", "limit_up", "limit_down", "st")
+            state = ("blocked" if any(flags.get(field) is True for field in required)
+                     else "eligible" if all(flags.get(field) is False for field in required)
+                     else "unknown")
+            reason = ("explicit_trading_risk" if state == "blocked" else
+                      "trading_flags_clear_only" if state == "eligible" else "trading_risk_evidence_incomplete")
+            seen = sorted(row["observation_id"] for row in risk.usable_as_of_rows(
+                evidence, trade_date=trade_date, batch_id=batch_id,
+                closes={str(code): float(pick["close"])}, decision_at=cutoff))
+            version = "risk:" + hashlib.sha256(json.dumps(seen, separators=(",", ":")).encode()).hexdigest()
+            record_id = f"{run_id}:{code}"
+            db.execute(
+                "INSERT OR IGNORE INTO paper_qualification_events(record_id,version,run_id,code,trade_date,batch_id,state,reason,risk_json,first_decided_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (record_id, version, str(run_id), str(code), trade_date, batch_id,
+                 state, reason, json.dumps(flags, sort_keys=True), cutoff.isoformat()),
+            )
+            return dict(db.execute("SELECT * FROM paper_qualification_events WHERE record_id=? AND version=?",
+                                   (record_id, version)).fetchone())
+
+    def latest_paper_qualification(self, record_id: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM paper_qualification_events WHERE record_id=? "
+                "ORDER BY first_decided_at DESC,version DESC LIMIT 1", (str(record_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def observe_paper_completed_bar(self, record_id: str, version: str, *, bar_start,
+                                    bar_close: float, quote_at, quote_price: float,
+                                    suspended, limit_up, limit_down, st, source_quality: str,
+                                    now, bar_evidence=None, execution_evidence=None) -> dict:
+        """Use the durable two-distinct-bar FSM and record one simulated outcome."""
+        from . import risk_qualification as risk
+        from . import paper_forward as forward
+
+        try:
+            current = risk.aware_instant(now)
+            start = risk.aware_instant(bar_start)
+            quote_time = risk.aware_instant(quote_at)
+        except (TypeError, ValueError, OverflowError):
+            return {"state": "unknown", "reason": "minute_or_quote_time_unverified"}
+        china = timezone(timedelta(hours=8))
+        bar_end = start + timedelta(minutes=1)
+        local_start, local_quote, local_now = (instant.astimezone(china) for instant in (start, quote_time, current))
+        def session(value):
+            wall = value.time()
+            if datetime_time(9, 30) <= wall < datetime_time(11, 30):
+                return "morning"
+            if datetime_time(13) <= wall < datetime_time(15):
+                return "afternoon"
+            return None
+        if (source_quality != "validated_minute" or bar_end > quote_time
+                or quote_time > current or (current - quote_time).total_seconds() > 120
+                or (current - bar_end).total_seconds() > 120
+                or local_start.date() != local_now.date()
+                or not session(local_start) or session(local_start) != session(local_quote)
+                or session(local_start) != session(local_now)):
+            return {"state": "unknown", "reason": "minute_or_quote_time_unverified"}
+        if not forward.in_entry_window(current, "B") or not forward.in_entry_window(quote_time, "B"):
+            return {"state": "unknown", "reason": "paper_entry_window_closed"}
+        try:
+            bar_digest = forward.verify_fixture_evidence(
+                bar_evidence, kind="bar", reference_at=start, received_by=quote_time, bar_close=bar_close)
+            execution_digest = forward.verify_fixture_evidence(
+                execution_evidence, kind="execution", reference_at=quote_time,
+                received_by=current, record_id=record_id, price=quote_price)
+        except (TypeError, ValueError, OverflowError, ArithmeticError):
+            bar_digest = execution_digest = None
+        if not bar_digest or not execution_digest:
+            return {"state": "unknown", "reason": "paper_source_evidence_unverified"}
+        if (current <= quote_time or quote_time <= start + timedelta(minutes=1)
+                or quote_time <= forward.aware(bar_evidence["received_at"])):
+            return {"state": "unknown", "reason": "confirmation_execution_order_unverified"}
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            qualification = db.execute(
+                "SELECT q.*,p.close FROM paper_qualification_events q "
+                "JOIN research_pool_picks p ON p.run_id=q.run_id AND p.code=q.code AND p.pool='primary' "
+                "WHERE q.record_id=? AND q.version=?", (str(record_id), str(version)),
+            ).fetchone()
+            if not qualification or qualification["state"] != "eligible":
+                return {"state": "unknown", "reason": "qualification_not_eligible"}
+            # Re-resolve the frozen batch under the *current* source policy.
+            # An older eligible event must not unlock a new simulated entry
+            # after a source license is removed or after restart/cache replay.
+            prior_observations = [dict(row) for row in db.execute(
+                "SELECT * FROM daily_risk_observations WHERE trade_date=? AND batch_id=? AND code=?",
+                (qualification["trade_date"], qualification["batch_id"], qualification["code"]),
+            )]
+            current_flags = risk.resolve_as_of(
+                prior_observations, trade_date=qualification["trade_date"],
+                batch_id=qualification["batch_id"],
+                closes={str(qualification["code"]): float(qualification["close"])},
+                decision_at=current,
+            ).get(str(qualification["code"]), {})
+            if any(current_flags.get(field) is not False for field in risk.RISK_FIELDS):
+                return {"state": "unknown", "reason": "formal_risk_source_unlicensed"}
+            if (local_start.date().isoformat() <= qualification["trade_date"]
+                    or start <= risk.aware_instant(qualification["first_decided_at"])):
+                return {"state": "unknown", "reason": "bar_before_qualification_or_same_day"}
+            entry_day = local_start.date().isoformat()
+            calendar = db.execute("SELECT is_open,status FROM trading_calendar WHERE trade_date=?", (entry_day,)).fetchone()
+            if (not calendar or calendar["is_open"] != 1 or calendar["status"] != "open"
+                    or self._raw_age_days(db, qualification["trade_date"], entry_day) != 1):
+                return {"state": "unknown", "reason": "paper_plan_or_session_unverified"}
+            latest = db.execute(
+                "SELECT version,state FROM paper_qualification_events WHERE record_id=? AND first_decided_at<=? "
+                "ORDER BY first_decided_at DESC,version DESC LIMIT 1", (str(record_id), current.isoformat()),
+            ).fetchone()
+            if not latest or latest["version"] != version or latest["state"] != "eligible":
+                return {"state": "unknown", "reason": "qualification_version_superseded"}
+            frozen_rules = db.execute(
+                "SELECT * FROM paper_freeze_contracts WHERE run_id=?", (qualification["run_id"],)
+            ).fetchone()
+            if (not frozen_rules or frozen_rules["protocol_version"] != forward.PROTOCOL_VERSION
+                    or frozen_rules["rules_sha256"] != forward.frozen_rule_digest()):
+                return {"state": "unknown", "reason": "paper_freeze_contract_unverified"}
+            freeze_at = datetime.fromisoformat(str(frozen_rules["frozen_at"]).replace("Z", "+00:00"))
+            if freeze_at.tzinfo is None:
+                freeze_at = freeze_at.replace(tzinfo=timezone.utc)
+            freeze_local = freeze_at.astimezone(china)
+            run = db.execute("SELECT trade_date,batch_id,basis,status,published_at,frozen_at FROM research_pool_runs WHERE run_id=?",
+                             (qualification["run_id"],)).fetchone()
+            try:
+                published_at = forward.aware(run["published_at"]) if run else None
+            except (TypeError, ValueError):
+                published_at = None
+            if (not run or run["basis"] != "unadjusted" or run["status"] != "research_only"
+                    or run["trade_date"] != qualification["trade_date"]
+                    or run["batch_id"] != qualification["batch_id"]
+                    or run["frozen_at"] != frozen_rules["frozen_at"]
+                    or not published_at or published_at > freeze_at
+                    or freeze_local.date().isoformat() != qualification["trade_date"]
+                    or freeze_local.time() < datetime_time(17, 30)):
+                return {"state": "unknown", "reason": "paper_freeze_window_unverified"}
+            existing = db.execute("SELECT * FROM paper_simulated_entries WHERE record_id=?", (str(record_id),)).fetchone()
+            if existing:
+                return dict(existing)
+            try:
+                close, price, frozen_close = float(bar_close), float(quote_price), float(qualification["close"])
+                prices_valid = all(math.isfinite(value) and value > 0 for value in (close, price, frozen_close))
+            except (TypeError, ValueError, OverflowError):
+                prices_valid = False
+            risk_clear = (suspended is False and limit_up is False
+                          and limit_down is False and st is False)
+            qualifies = bool(prices_valid and risk_clear and frozen_close * 1.005 <= close <= frozen_close * 1.03)
+            keys = ("paper", str(qualification["code"]), "paper_entry", str(version))
+            saved_bar = db.execute(
+                "SELECT evidence_sha256 FROM paper_bar_observations WHERE record_id=? AND qualification_version=? AND bar_start=?",
+                (str(record_id), str(version), start.isoformat()),
+            ).fetchone()
+            if saved_bar and saved_bar["evidence_sha256"] != bar_digest:
+                return {"state": "unknown", "reason": "paper_bar_evidence_conflict"}
+            db.execute(
+                "INSERT OR IGNORE INTO paper_bar_observations(record_id,qualification_version,bar_start,bar_close,received_at,evidence_sha256,evidence_json) VALUES(?,?,?,?,?,?,?)",
+                (str(record_id), str(version), start.isoformat(), close, bar_evidence["received_at"],
+                 bar_digest, json.dumps(bar_evidence, sort_keys=True, separators=(",", ":"))),
+            )
+            previous = db.execute(
+                "SELECT consecutive_count,last_condition,last_observed_at FROM intraday_signal_states WHERE origin=? AND code=? AND signal=? AND plan_version=?",
+                keys,
+            ).fetchone()
+            first_start = (datetime.fromtimestamp(float(previous["last_observed_at"]), timezone.utc).isoformat()
+                           if qualifies and previous and previous["consecutive_count"] == 1
+                           and previous["last_condition"] and previous["last_observed_at"] else start.isoformat())
+            decision = self._advance_intraday_signal_in_tx(
+                db, keys, qualifies=qualifies, rearm_ready=False, required=2,
+                max_gap_seconds=90, cooldown_seconds=86400,
+                reason="paper_price_or_risk_unverified" if not qualifies else "paper_bar_confirmed",
+                current=current.timestamp(), now_text=current.replace(tzinfo=None).isoformat(),
+                observation_time=start.timestamp(),
+            )
+            if not decision["triggered"]:
+                return {"state": "pending" if qualifies else "unknown", "reason": decision["reason"],
+                        "consecutive_count": decision["consecutive_count"]}
+            # B has a frozen confirmation threshold and a stricter limit price.
+            b_limit = forward.b_limit_price(frozen_close)
+            executable = bool(prices_valid and risk_clear and
+                              Decimal(str(frozen_close)) * Decimal("0.995") <= Decimal(str(price)) <= b_limit)
+            terms = None
+            if executable:
+                try:
+                    terms = forward.entry_terms(price)
+                    if terms["filled_price"] > b_limit:
+                        executable = False
+                        terms = None
+                except (ValueError, ArithmeticError):
+                    executable = False
+            status = "simulated_fill" if executable else "unfilled"
+            entry_price = float(terms["filled_price"]) if terms else None
+            db.execute(
+                "INSERT OR IGNORE INTO paper_simulated_entries(record_id,qualification_version,first_bar_at,second_bar_at,confirmed_at,fill_status,entry_date,entry_price,round_trip_fee_pct,entry_slippage_pct,exit_slippage_pct,reason,source_quality,created_at,accounting_version) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (record_id, version, first_start, start.isoformat(), current.isoformat(), status,
+                 current.astimezone(china).date().isoformat() if executable else None,
+                 entry_price, 0.30, 0.10, 0.10, "synthetic_fixture_inside_B_limit" if executable else "synthetic_fixture_unfilled_B_limit",
+                 source_quality, current.isoformat(), forward.ACCOUNTING_VERSION),
+            )
+            if terms:
+                first_row = db.execute(
+                    "SELECT evidence_sha256 FROM paper_bar_observations WHERE record_id=? AND qualification_version=? AND bar_start=?",
+                    (str(record_id), str(version), first_start),
+                ).fetchone()
+                if not first_row:
+                    raise ValueError("paper_first_bar_evidence_missing")
+                db.execute(
+                    "INSERT OR IGNORE INTO paper_entry_terms(record_id,arm,accounting_version,protocol_version,fee_model_id,freeze_rules_sha256,quantity,entry_notional_cny,commission_cny,transfer_fee_cny,entry_fees_cny,total_cost_cny,quote_at,execution_evidence_hash,execution_evidence_json,first_bar_evidence_hash,second_bar_evidence_hash) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (record_id, "B", forward.ACCOUNTING_VERSION, forward.PROTOCOL_VERSION,
+                     forward.FEE_MODEL_ID, frozen_rules["rules_sha256"], terms["quantity"],
+                     str(terms["entry_notional_cny"]), str(terms["commission_cny"]),
+                     str(terms["transfer_fee_cny"]), str(terms["entry_fees_cny"]),
+                     str(terms["total_cost_cny"]), quote_time.isoformat(), execution_digest,
+                     json.dumps(execution_evidence, sort_keys=True, separators=(",", ":")),
+                     first_row["evidence_sha256"], bar_digest),
+                )
+            return dict(db.execute("SELECT * FROM paper_simulated_entries WHERE record_id=?", (record_id,)).fetchone())
+
+    def record_paper_action_evidence(self, code: str, trade_date: str, status: str,
+                                     *, observed_at, received_at) -> str:
+        """Save explicit local fixture coverage; no market source is enabled."""
+        from . import paper_forward as forward
+        if status not in {"none", "action", "conflict"} or not str(code).isdigit():
+            raise ValueError("paper_action_evidence_invalid")
+        observed, received = forward.aware(observed_at), forward.aware(received_at)
+        if (observed.astimezone(forward.CHINA).date().isoformat() != trade_date
+                or observed.astimezone(forward.CHINA).time() < datetime_time(15)
+                or received < observed):
+            raise ValueError("paper_action_time_unverified")
+        payload = {"code": str(code), "trade_date": trade_date, "status": status,
+                   "observed_at": observed.isoformat(), "received_at": received.isoformat(),
+                   "source": "synthetic_fixture"}
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        with self._connect() as db:
+            db.execute("INSERT OR IGNORE INTO paper_no_action_evidence(code,trade_date,source,observed_at,received_at,response_sha256,status) VALUES(?,?,?,?,?,?,?)",
+                       (str(code), trade_date, "synthetic_fixture", observed.isoformat(),
+                        received.isoformat(), digest, status))
+        return digest
+
+    def record_screen_gate_diagnostics(self, job_key: str, trade_date: str, phase: str, diagnostics: dict) -> None:
+        """Keep one bounded summary per automatic attempt, including failed gates."""
+        keys = ("input", "risk_tuple_complete", "tradable", "indicator_targets", "indicator_raw_batch",
+                "indicator_network", "indicator_memory_cache", "indicator_persistent_cache",
+                "indicator_failed", "enriched", "indicator_coverage", "screen_min_indicator_coverage",
+                "candidate_count", "valid_empty", "raw_batch_id")
+        summary = {key: diagnostics.get(key) for key in keys if key in diagnostics}
+        with self._connect() as db:
+            row = db.execute("SELECT automatic_attempts FROM job_runs WHERE job_key=?", (job_key,)).fetchone()
+            attempt = int(row[0] or 0) if row else 0
+            db.execute(
+                "INSERT OR IGNORE INTO screen_gate_diagnostics(job_key,attempt,trade_date,phase,diagnostics_json,recorded_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (job_key, attempt, trade_date, str(phase), json.dumps(summary, sort_keys=True, ensure_ascii=False,
+                                                                     allow_nan=False, default=str), _utcnow_naive().isoformat()),
+            )
+
+    def current_research_radar(self, code: str, run_id: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT p.*,r.trade_date,r.batch_id FROM research_pool_picks p JOIN research_pool_runs r ON r.run_id=p.run_id "
+                "WHERE p.code=? AND p.run_id=? AND p.pool='radar' AND r.run_id=(SELECT run_id FROM research_pool_runs ORDER BY trade_date DESC,frozen_at DESC LIMIT 1)",
+                (str(code), str(run_id)),
+            ).fetchone()
+            return dict(row) if row else None
 
     @contextmanager
     def pin_active_raw_batch(self, dataset_key: str = "tushare_daily", *, as_of: str = "", max_stale_trading_days: int = 2, reader: str = "", ttl_seconds: int = 900):
@@ -4318,7 +5713,7 @@ class StockStore:
             ).fetchone()
             if row:
                 try:
-                    self._validate_published_raw_batch_in_tx(db, row)
+                    self._validate_published_raw_batch_cached(db, row)
                     if str(row["dataset_id"]) != str(row["batch_dataset_id"]) or int(row["active_generation"]) != int(row["batch_generation"]):
                         raise RuntimeError("active raw generation pointer mismatch")
                 except (RuntimeError, ValueError, TypeError, KeyError, OverflowError):
@@ -4327,7 +5722,7 @@ class StockStore:
                 age = self._raw_age_days(db, str(row["actual_trade_date"] or ""), as_of)
                 valid = age is not None and age <= max(0, int(max_stale_trading_days)) and str(row["basis"] or "").lower() == "unadjusted"
                 if valid:
-                    now = datetime.utcnow()
+                    now = _utcnow_naive()
                     expires = now + timedelta(seconds=max(60, int(ttl_seconds)))
                     with self._connect() as write_db:
                         write_db.execute(
@@ -4344,7 +5739,7 @@ class StockStore:
             db.close()
             if read is not None:
                 with self._connect() as write_db:
-                    write_db.execute("UPDATE read_provenance SET pinned=0,closed_at=? WHERE read_id=?", (datetime.utcnow().isoformat(), read_id))
+                    write_db.execute("UPDATE read_provenance SET pinned=0,closed_at=? WHERE read_id=?", (_utcnow_naive().isoformat(), read_id))
 
     pin_active_batch = pin_active_raw_batch
 
@@ -4353,7 +5748,7 @@ class StockStore:
         import json
         if not as_of or not rows:
             return
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         values = [(as_of, code, json.dumps(payload, ensure_ascii=False, default=str), source, str(payload.get("quality") or quality), now) for code, payload in rows.items()]
         with self._connect() as db:
             db.executemany("INSERT OR REPLACE INTO factor_snapshots(as_of,code,payload,source,quality,fetched_at) VALUES(?,?,?,?,?,?)", values)
@@ -4363,10 +5758,10 @@ class StockStore:
         if not as_of:
             return
         with self._connect() as db:
-            db.execute("INSERT OR REPLACE INTO market_contexts(as_of,payload,source,quality,fetched_at) VALUES(?,?,?,?,?)", (as_of, json.dumps(payload, ensure_ascii=False), source, quality, datetime.utcnow().isoformat()))
+            db.execute("INSERT OR REPLACE INTO market_contexts(as_of,payload,source,quality,fetched_at) VALUES(?,?,?,?,?)", (as_of, json.dumps(payload, ensure_ascii=False), source, quality, _utcnow_naive().isoformat()))
 
     def transition_price_state(self, origin: str, code: str, state: str, run_id: str | None = None) -> bool:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         run_id = str(run_id or "legacy")
         with self._connect() as db:
             row = db.execute("SELECT state FROM price_states WHERE origin=? AND code=? AND run_id=?", (origin, code, run_id)).fetchone()
@@ -4381,7 +5776,7 @@ class StockStore:
             return str(row[0]) if row else None
 
     def set_price_state(self, origin: str, code: str, state: str, run_id: str | None = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         run_id = str(run_id or "legacy")
         with self._connect() as db:
             db.execute("INSERT INTO price_states(origin,code,run_id,state,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(origin,code,run_id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", (origin, code, run_id, state, now))
@@ -4458,7 +5853,7 @@ class StockStore:
             db.execute(
                 "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
-                (normalized_code, display, normalized_name, str(source or "")[:80], datetime.utcnow().isoformat()),
+                (normalized_code, display, normalized_name, str(source or "")[:80], _utcnow_naive().isoformat()),
             )
         return True
 
@@ -4587,7 +5982,7 @@ class StockStore:
                 "INSERT INTO watchlist(scope, code, created_at, cost_price, name) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(scope, code) DO UPDATE SET cost_price=COALESCE(excluded.cost_price, watchlist.cost_price), "
                 "name=COALESCE(excluded.name, watchlist.name)",
-                (scope, code, datetime.utcnow().isoformat(), cost_price, clean_name),
+                (scope, code, _utcnow_naive().isoformat(), cost_price, clean_name),
             )
             if clean_name and clean_name != code:
                 from .core import normalize_stock_name
@@ -4597,7 +5992,7 @@ class StockStore:
                     db.execute(
                         "INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?) "
                         "ON CONFLICT(code) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,source=excluded.source,updated_at=excluded.updated_at",
-                        (code, clean_name, normalized_name, "watchlist", datetime.utcnow().isoformat()),
+                        (code, clean_name, normalized_name, "watchlist", _utcnow_naive().isoformat()),
                     )
             return True
 
@@ -4664,7 +6059,7 @@ class StockStore:
 
     def set_subscription(self, origin: str, enabled: bool) -> None:
         with self._connect() as db:
-            db.execute("INSERT INTO subscriptions VALUES (?, ?, ?) ON CONFLICT(origin) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at", (origin, int(enabled), datetime.utcnow().isoformat()))
+            db.execute("INSERT INTO subscriptions VALUES (?, ?, ?) ON CONFLICT(origin) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at", (origin, int(enabled), _utcnow_naive().isoformat()))
 
     def is_subscribed(self, origin: str) -> bool:
         with self._connect() as db:
@@ -4675,11 +6070,40 @@ class StockStore:
         with self._connect() as db:
             return [str(row[0]) for row in db.execute("SELECT origin FROM subscriptions WHERE enabled=1")]
 
+    def set_intraday_enabled(self, origin: str, enabled: bool) -> None:
+        value = str(origin or "").strip()
+        if not value:
+            raise ValueError("intraday origin is required")
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO intraday_origin_preferences(origin,enabled,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(origin) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at",
+                (value, int(bool(enabled)), _utcnow_naive().isoformat()),
+            )
+
+    def is_intraday_enabled(self, origin: str) -> bool:
+        value = str(origin or "").strip()
+        if not value:
+            return False
+        with self._connect() as db:
+            row = db.execute("SELECT enabled FROM intraday_origin_preferences WHERE origin=?", (value,)).fetchone()
+            return bool(row[0]) if row else True
+
+    def intraday_subscriptions(self) -> list[str]:
+        with self._connect() as db:
+            return [
+                str(row[0])
+                for row in db.execute(
+                    "SELECT s.origin FROM subscriptions s LEFT JOIN intraday_origin_preferences p ON p.origin=s.origin "
+                    "WHERE s.enabled=1 AND COALESCE(p.enabled,1)=1 ORDER BY s.origin"
+                )
+            ]
+
     def set_whitelist(self, origin: str, enabled: bool) -> None:
         with self._connect() as db:
             db.execute(
                 "INSERT INTO whitelist VALUES (?, ?, ?) ON CONFLICT(origin) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at",
-                (origin, int(enabled), datetime.utcnow().isoformat()),
+                (origin, int(enabled), _utcnow_naive().isoformat()),
             )
 
     def is_whitelisted(self, origin: str) -> bool:
@@ -4697,14 +6121,20 @@ class StockStore:
         normalized_trade_date = self._date_norm(trade_date)
         rows = []
         symbols = []
-        symbol_timestamp = now_text or datetime.utcnow().isoformat()
+        symbol_timestamp = now_text or _utcnow_naive().isoformat()
         for quote in quotes or []:
             code = normalize_code(getattr(quote, "code", ""))
             if not re.fullmatch(r"\d{6}", code):
                 continue
+            def explicit_flag(field):
+                value = getattr(quote, field, None)
+                return int(value) if isinstance(value, bool) else None
             rows.append(
                 (normalized_trade_date, code, quote.name, quote.price, quote.prev_close, quote.amount,
-                 quote.pct_change, quote.volume, quote.fetched_at.isoformat(), getattr(quote, "source", ""), quote.provider_ts.isoformat() if getattr(quote, "provider_ts", None) else None)
+                 quote.pct_change, quote.volume, quote.fetched_at.isoformat(), getattr(quote, "source", ""), quote.provider_ts.isoformat() if getattr(quote, "provider_ts", None) else None,
+                 explicit_flag("suspended"), explicit_flag("limit_up"), explicit_flag("limit_down"),
+                 explicit_flag("st"), str(getattr(quote, "risk_source", "") or "")[:120],
+                 str(getattr(quote, "risk_scenario_version", "") or "")[:120])
             )
             name = self._stock_display_name(getattr(quote, "name", ""))
             normalized_name = normalize_stock_name(name)
@@ -4720,11 +6150,13 @@ class StockStore:
         # A partial retry may contain fewer symbols and must not erase a
         # usable old quote from the same trading date.
         db.executemany(
-            "INSERT INTO daily_quotes(trade_date,code,name,price,prev_close,amount,pct_change,volume,fetched_at,source,provider_ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO daily_quotes(trade_date,code,name,price,prev_close,amount,pct_change,volume,fetched_at,source,provider_ts,suspended,limit_up,limit_down,st,risk_source,risk_scenario_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(trade_date,code) DO UPDATE SET name=excluded.name,price=excluded.price,"
             "prev_close=excluded.prev_close,amount=excluded.amount,pct_change=excluded.pct_change,"
-            "volume=excluded.volume,fetched_at=excluded.fetched_at,source=excluded.source,provider_ts=excluded.provider_ts",
+            "volume=excluded.volume,fetched_at=excluded.fetched_at,source=excluded.source,provider_ts=excluded.provider_ts,"
+                "suspended=excluded.suspended,limit_up=excluded.limit_up,limit_down=excluded.limit_down,st=excluded.st,"
+                "risk_source=excluded.risk_source,risk_scenario_version=excluded.risk_scenario_version",
             rows,
         )
         if symbols:
@@ -4766,7 +6198,7 @@ class StockStore:
             return
         source = str(source or "unknown")
         quality = str(quality or "unknown").lower()
-        now = now_text or datetime.utcnow().isoformat()
+        now = now_text or _utcnow_naive().isoformat()
         current = db.execute("SELECT * FROM daily_snapshot_meta WHERE trade_date=?", (trade_date,)).fetchone()
         # A later, smaller response is a retry state, not a replacement
         # for a good snapshot. Keep the good payload and only advance
@@ -4850,7 +6282,60 @@ class StockStore:
                 terminal=terminal,
             )
 
-    def save_tushare_snapshot_owned(
+    @staticmethod
+    def _snapshot_diagnostic_failure_kind(diagnostics) -> str | None:
+        """Return only an explicitly classified, durable retry reason."""
+        if not isinstance(diagnostics, dict):
+            return None
+        for key in ("internal_error", "unexpected_error", "programming_error", "cancelled", "canceled", "invalid_date", "future_date"):
+            value = diagnostics.get(key)
+            if value is True or str(value or "").strip().lower() in {"1", "true", "yes", "on"}:
+                return None
+        value = str(diagnostics.get("failure_kind") or "").strip().lower()
+        aliases = {
+            "network_failed": "network",
+            "rate_limited": "rate_limit",
+            "breaker_open": "breaker",
+            "calendar_unavailable": "calendar",
+            "publish_failed": "publish",
+            "coverage_failed": "coverage",
+            "history": "history_invalid",
+        }
+        value = aliases.get(value, value)
+        return value if value in {"network", "timeout", "breaker", "rate_limit", "not_published", "calendar", "publish", "coverage", "history_invalid"} else None
+
+    @staticmethod
+    def _snapshot_exception_failure_kind(exception) -> str | None:
+        """Classify provider exceptions without importing the provider module."""
+        if exception is None:
+            return None
+        if isinstance(exception, asyncio.CancelledError) or type(exception).__name__ in {"CancelledError", "CancelledError"}:
+            raise exception
+        names = {
+            "TushareCircuitOpen": "breaker",
+            "TushareRateLimitError": "rate_limit",
+            "TushareNetworkError": "network",
+            "TushareNotPublishedError": "not_published",
+            "TusharePublishError": "publish",
+            "TushareCoverageError": "coverage",
+            "TushareHistoryError": "history_invalid",
+            "TushareCalendarError": "calendar",
+        }
+        return names.get(type(exception).__name__)
+
+    @staticmethod
+    def _snapshot_result_is_typed(result) -> bool:
+        if isinstance(result, dict):
+            return all(key in result for key in ("quotes", "trade_date", "complete"))
+        return all(hasattr(result, key) for key in ("quotes", "trade_date", "complete"))
+
+    @staticmethod
+    def _snapshot_result_value(result, key: str, default=None):
+        if isinstance(result, dict):
+            return result.get(key, default)
+        return getattr(result, key, default)
+
+    def finalize_snapshot_request_owned(
         self,
         request_id: str,
         requested_date: str,
@@ -4883,13 +6368,15 @@ class StockStore:
         persist_meta: bool = True,
         lease_ttl_seconds: float | None = None,
         now: float | None = None,
+        result=None,
+        exception=None,
+        diagnostics: dict | None = None,
     ) -> dict:
-        """Persist a Tushare snapshot and request outcome under one fence.
+        """CAS-finalize exactly one live ``fetching`` snapshot request.
 
-        The lease check, quote upsert, metadata update, and request update all
-        share one ``BEGIN IMMEDIATE`` transaction.  A stale owner therefore
-        either writes nothing or receives ``SnapshotLeaseLostError``; it can
-        never leave a new quote paired with an old request outcome.
+        Durable classified state wins over cleanup.  Invalid or untyped results,
+        unexpected exceptions, and cancellation intentionally leave the request
+        in ``fetching``; the latter is re-raised to preserve task cancellation.
         """
         request_key = str(request_id or "").strip()
         requested_value = self._date_norm(requested_date)
@@ -4902,13 +6389,28 @@ class StockStore:
             raise ValueError("snapshot lease identity is required")
         if len(owner_value) > 160:
             raise ValueError("snapshot lease owner is too long")
+        result_invalid = False
+        if result is not None:
+            if not self._snapshot_result_is_typed(result):
+                result_invalid = True
+            else:
+                if quotes is None:
+                    quotes = self._snapshot_result_value(result, "quotes", [])
+                if actual_trade_date is None:
+                    actual_trade_date = self._snapshot_result_value(result, "trade_date")
+                if diagnostics is None:
+                    diagnostics = self._snapshot_result_value(result, "diagnostics", {})
+                if state is None and bool(self._snapshot_result_value(result, "complete", False)):
+                    state = "complete"
         actual_value = self._date_norm(actual_trade_date) if actual_trade_date else None
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", requested_value):
             raise ValueError("snapshot requested date is invalid")
         if actual_value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", actual_value):
-            raise ValueError("snapshot actual trade date is invalid")
+            result_invalid = True
+        if actual_value and actual_value > requested_value:
+            result_invalid = True
         current = self._snapshot_lease_epoch(now)
-        now_text = datetime.utcnow().isoformat()
+        now_text = _utcnow_naive().isoformat()
         calendar_text = json.dumps(calendar_evidence or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         provenance_text = json.dumps(provenance or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         request_state_value = str(request_state if request_state is not None else state or "pending")[:32]
@@ -4921,10 +6423,57 @@ class StockStore:
         request_terminal_value = int(bool(request_terminal if request_terminal is not None else terminal))
         request_failure_value = str(request_failure_kind if request_failure_kind is not None else failure_kind or "")[:64]
         request_attempts = max(0, int(attempts or 0))
+        diagnostic_failure = self._snapshot_diagnostic_failure_kind(diagnostics)
+        explicit_state = str(request_state if request_state is not None else state or "").strip().lower()
 
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._assert_snapshot_lease_in_tx(db, request_key, owner_value, fence_value, now=current)
+            row = self._assert_snapshot_lease_owner_in_tx(db, request_key, owner_value, fence_value, now=current)
+            persisted_state = str(row["state"] or "").strip().lower()
+            if persisted_state != "fetching":
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = persisted_state
+                return preserved
+            if isinstance(exception, asyncio.CancelledError) or (exception is not None and type(exception).__name__ == "CancelledError"):
+                raise exception
+            exception_failure = self._snapshot_exception_failure_kind(exception)
+            if result_invalid:
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = "fetching"
+                preserved["finalizer_reason"] = "invalid_result"
+                return preserved
+            if diagnostic_failure:
+                request_state_value = "retry"
+                request_failure_value = diagnostic_failure
+                request_terminal_value = 0
+                if not request_error_value:
+                    request_error_value = "classified provider diagnostic"
+            elif exception_failure:
+                request_state_value = "retry"
+                request_failure_value = exception_failure
+                request_terminal_value = 0
+                if not request_error_value:
+                    request_error_value = f"typed provider exception: {exception_failure}"
+            elif exception is not None:
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = "fetching"
+                preserved["finalizer_reason"] = "internal_error"
+                return preserved
+            elif explicit_state not in {"retry", "partial", "complete", "terminal", "failed", "shadow"}:
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = "fetching"
+                preserved["finalizer_reason"] = "unclassified"
+                return preserved
+            else:
+                request_state_value = explicit_state
+            if request_state_value in {"complete", "terminal"}:
+                request_terminal_value = 1
+            if request_state_value == "retry":
+                request_terminal_value = 0
             saved = 0
             if persist_meta and actual_value:
                 saved = self._save_daily_quotes_in_tx(
@@ -4939,15 +6488,15 @@ class StockStore:
                     actual_value,
                     source,
                     quality,
-                    complete,
+                    request_state_value in {"complete", "terminal"} or complete,
                     requested_value,
                     note,
                     snapshot_version=snapshot_version,
-                    state=state,
+                    state=request_state_value,
                     attempts=request_attempts,
-                    last_error=last_error,
-                    next_retry_at=next_retry_at,
-                    terminal=terminal,
+                    last_error=request_error_value,
+                    next_retry_at=request_retry_value,
+                    terminal=bool(request_terminal_value),
                     now_text=now_text,
                 )
             elif quotes and actual_value:
@@ -4990,26 +6539,57 @@ class StockStore:
                 values.extend((new_expiry, now_text))
             values.extend((request_key, owner_value, fence_value, current))
             cursor = db.execute(
-                f"UPDATE snapshot_requests SET {assignments} WHERE request_id=? AND lease_owner=? AND lease_fence=? AND lease_expires_at>? AND terminal=0",
+                f"UPDATE snapshot_requests SET {assignments} WHERE request_id=? AND lease_owner=? AND lease_fence=? AND lease_expires_at>? AND terminal=0 AND state='fetching'",
                 values,
             )
             if cursor.rowcount <= 0:
+                current_row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+                if current_row and str(current_row["lease_owner"] or "") == owner_value and int(current_row["lease_fence"] or 0) == fence_value and str(current_row["state"] or "").strip().lower() != "fetching":
+                    preserved = self._snapshot_lease_view(current_row, current, acquired=True, owner=owner_value, fence=fence_value)
+                    preserved["finalized"] = False
+                    preserved["preserved_state"] = str(current_row["state"] or "").strip().lower()
+                    return preserved
                 raise SnapshotLeaseLostError("snapshot lease update lost ownership")
             refreshed = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
             result = self._snapshot_lease_view(refreshed, current, acquired=True, owner=owner_value, fence=fence_value)
             result["saved_quotes"] = saved
+            result["finalized"] = True
             return result
+
+    def save_tushare_snapshot_owned(self, *args, **kwargs) -> dict:
+        """Compatibility wrapper for the fenced snapshot finalizer."""
+        return self.finalize_snapshot_request_owned(*args, **kwargs)
 
     # Compatibility spellings for integrations that describe the operation as
     # a generic snapshot-result persistence call.
-    persist_tushare_snapshot_owned = save_tushare_snapshot_owned
-    save_snapshot_result_owned = save_tushare_snapshot_owned
-    persist_snapshot_result_owned = save_tushare_snapshot_owned
+    persist_tushare_snapshot_owned = finalize_snapshot_request_owned
+    save_snapshot_result_owned = finalize_snapshot_request_owned
+    persist_snapshot_result_owned = finalize_snapshot_request_owned
 
     def snapshot_meta(self, trade_date: str) -> dict | None:
         with self._connect() as db:
             row = db.execute("SELECT * FROM daily_snapshot_meta WHERE trade_date=?", (trade_date,)).fetchone()
             return dict(row) if row else None
+
+    def recommendation_checkpoint_due(self, before_or_equal: str) -> str | None:
+        """Find a completed close with unevaluated older recommendations."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT MAX(trade_date) FROM daily_snapshot_meta "
+                "WHERE trade_date<=? AND complete=1 AND quality='good'",
+                (before_or_equal,),
+            ).fetchone()
+            trade_date = str(row[0] or "") if row else ""
+            if not trade_date:
+                return None
+            due = db.execute(
+                "SELECT 1 FROM recommendation_records r WHERE r.recommended_date<? AND "
+                "(SELECT COUNT(*) FROM recommendation_outcomes o "
+                "WHERE o.recommendation_id=r.recommendation_id AND o.horizon IN (1,3,5,10) "
+                "AND o.evaluated_through>=?)<4 LIMIT 1",
+                (trade_date, trade_date),
+            ).fetchone()
+            return trade_date if due else None
 
     def latest_snapshot_meta(self, before_or_equal: str = "") -> dict | None:
         with self._connect() as db:
@@ -5080,6 +6660,32 @@ class StockStore:
         ):
             raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
 
+    @classmethod
+    def _assert_snapshot_lease_owner_in_tx(cls, db, request_id: str, owner: str, fence: int, *, now: float | None = None):
+        """Check owner/fence without treating an already-finalized row as lost."""
+        request_key = str(request_id or "").strip()
+        owner_value = str(owner or "").strip()
+        try:
+            fence_value = int(fence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SnapshotLeaseLostError("snapshot lease fence is invalid") from exc
+        if not request_key or not owner_value or fence_value < 1:
+            raise SnapshotLeaseLostError("snapshot lease identity is incomplete")
+        current = cls._snapshot_lease_epoch(now)
+        row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+        try:
+            expiry = float(row["lease_expires_at"] or 0) if row else 0.0
+        except (TypeError, ValueError, OverflowError):
+            expiry = 0.0
+        if (
+            not row
+            or str(row["lease_owner"] or "") != owner_value
+            or int(row["lease_fence"] or 0) != fence_value
+            or expiry <= current
+        ):
+            raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
+        return row
+
     def snapshot_lease_state(self, request_id: str, *, now: float | None = None) -> dict | None:
         """Read request state and whether its durable lease is currently live."""
         current = self._snapshot_lease_epoch(now)
@@ -5112,7 +6718,7 @@ class StockStore:
         current = self._snapshot_lease_epoch(now)
         ttl = self._snapshot_lease_ttl(ttl_seconds)
         expiry = current + ttl
-        now_text = datetime.utcnow().isoformat()
+        now_text = _utcnow_naive().isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
@@ -5188,7 +6794,7 @@ class StockStore:
             raise ValueError("snapshot lease identity is required")
         current = self._snapshot_lease_epoch(now)
         expiry = current + self._snapshot_lease_ttl(ttl_seconds)
-        now_text = datetime.utcnow().isoformat()
+        now_text = _utcnow_naive().isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
@@ -5212,7 +6818,7 @@ class StockStore:
         if not request_key or not owner_value or fence_value < 1:
             return False
         self._snapshot_lease_epoch(now)
-        now_text = datetime.utcnow().isoformat()
+        now_text = _utcnow_naive().isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
@@ -5253,7 +6859,7 @@ class StockStore:
         if not request_key or not date_value or not owner_value or fence_value < 1:
             raise ValueError("snapshot lease identity is required")
         current = self._snapshot_lease_epoch(now)
-        now_text = datetime.utcnow().isoformat()
+        now_text = _utcnow_naive().isoformat()
         calendar_text = json.dumps(calendar_evidence or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         provenance_text = json.dumps(provenance or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         fields = {
@@ -5281,6 +6887,11 @@ class StockStore:
                 expiry = 0.0
             if str(row["lease_owner"] or "") != owner_value or int(row["lease_fence"] or 0) != fence_value or expiry <= current:
                 raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
+            # This method is only the pre-fetch marker.  Classified retry or
+            # terminal outcomes must use the CAS finalizer below, otherwise a
+            # late cleanup could overwrite a durable result.
+            if str(state or "").strip().lower() != "fetching" or str(row["state"] or "").strip().lower() != "fetching":
+                return self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
             assignments = ",".join(f"{name}=?" for name in fields)
             values = list(fields.values())
             if lease_ttl_seconds is not None:
@@ -5313,7 +6924,7 @@ class StockStore:
     ) -> None:
         if not request_id or not requested_date:
             return
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         with self._connect() as db:
             db.execute(
                 "INSERT INTO snapshot_requests(request_id,requested_date,actual_trade_date,state,attempts,source,quality,last_error,next_retry_at,terminal,created_at,updated_at) "
@@ -5322,6 +6933,20 @@ class StockStore:
                 "next_retry_at=excluded.next_retry_at,terminal=excluded.terminal,updated_at=excluded.updated_at",
                 (request_id, requested_date, actual_trade_date, state, max(0, int(attempts)), source or "", quality or "unknown", last_error, next_retry_at, int(bool(terminal)), now, now),
             )
+
+    def reopen_snapshot_request(self, request_id: str, *, expected_updated_at: str) -> bool:
+        """Reopen obsolete completion without replacing a live owner's lease."""
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE snapshot_requests SET state='pending',terminal=0,next_retry_at=NULL,"
+                "calendar_evidence_json='{}',updated_at=? "
+                "WHERE request_id=? AND updated_at=? AND "
+                "(terminal=1 OR state IN ('complete','terminal')) AND "
+                "(lease_owner='' OR lease_expires_at<=?)",
+                (_utcnow_naive().isoformat(), request_id, expected_updated_at,
+                 self._snapshot_lease_epoch(None)),
+            )
+            return cursor.rowcount == 1
 
     def snapshot_request(self, request_id: str) -> dict | None:
         with self._connect() as db:
@@ -5336,6 +6961,111 @@ class StockStore:
                 (max(1, min(int(limit), 100)),),
             )
             return [dict(row) for row in rows]
+
+    def terminalize_prior_snapshot_requests(self, current_date: str, *, reason: str, limit: int = 20, now=None) -> list[dict]:
+        """Close unfinished prior-date requests so reload cannot fetch stale sessions."""
+        current = self._automatic_delivery_clock(now)
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            keys = [str(row[0]) for row in db.execute(
+                "SELECT request_id FROM snapshot_requests WHERE requested_date<? AND terminal=0 AND state NOT IN ('complete','terminal') "
+                "ORDER BY requested_date,updated_at LIMIT ?",
+                (str(current_date), max(1, min(int(limit), 100))),
+            )]
+            if not keys:
+                return []
+            placeholders = ",".join("?" for _ in keys)
+            db.execute(
+                f"UPDATE snapshot_requests SET state='terminal',terminal=1,next_retry_at=NULL,last_error=?,lease_owner='',lease_expires_at=0,lease_updated_at=?,updated_at=? "
+                f"WHERE request_id IN ({placeholders})",
+                (str(reason or "prior-date snapshot request expired")[:500], now_text, now_text, *keys),
+            )
+            return [dict(row) for row in db.execute(
+                f"SELECT * FROM snapshot_requests WHERE request_id IN ({placeholders}) ORDER BY requested_date,updated_at",
+                keys,
+            )]
+
+    def save_corporate_action_factors(self, rows, source: str = "tushare_adj_factor") -> int:
+        values = []
+        now = _utcnow_naive().isoformat()
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            code_info = self._canonical_raw_code(item.get("ts_code") or item.get("code"))
+            code = code_info[0] if code_info else ""
+            ts_code = code_info[1] if code_info else ""
+            trade_date = self._date_norm(item.get("trade_date"))
+            try:
+                factor = float(item.get("adj_factor") if item.get("adj_factor") is not None else item.get("corporate_action_factor"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not code or not trade_date or not math.isfinite(factor) or factor <= 0:
+                continue
+            captured = factor_capture({**item, "adj_factor": factor}, code, trade_date)
+            if not captured or evidence_stamp(captured["observed_at"]) > datetime.now(timezone.utc):
+                continue
+            values.append((code, trade_date, factor, captured["source"], captured["evidence"], now,
+                           captured["observed_at"], captured["response_sha256"]))
+        if not values:
+            return 0
+        with self._connect() as db:
+            db.executemany(
+                "INSERT INTO corporate_action_factors(code,trade_date,adj_factor,source,evidence,fetched_at,observed_at,response_sha256) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(code,trade_date) DO UPDATE SET fetched_at=excluded.fetched_at, "
+                "conflicted=CASE WHEN corporate_action_factors.adj_factor!=excluded.adj_factor "
+                "OR corporate_action_factors.source!=excluded.source OR corporate_action_factors.evidence!=excluded.evidence "
+                "THEN 1 ELSE corporate_action_factors.conflicted END, "
+                "observed_at=CASE WHEN corporate_action_factors.observed_at='' OR corporate_action_factors.response_sha256='' THEN excluded.observed_at ELSE corporate_action_factors.observed_at END, "
+                "response_sha256=CASE WHEN corporate_action_factors.observed_at='' OR corporate_action_factors.response_sha256='' THEN excluded.response_sha256 ELSE corporate_action_factors.response_sha256 END",
+                values,
+            )
+        return len(values)
+
+    def corporate_action_factors(self, codes=None, dates=None) -> dict[str, dict]:
+        normalized_codes = sorted({item[0] for value in (codes or []) if (item := self._canonical_raw_code(value))})
+        normalized_dates = sorted({self._date_norm(value) for value in (dates or []) if self._date_norm(value)})
+        clauses, params = [], []
+        if normalized_codes:
+            clauses.append("code IN (" + ",".join("?" for _ in normalized_codes) + ")")
+            params.extend(normalized_codes)
+        if normalized_dates:
+            clauses.append("trade_date IN (" + ",".join("?" for _ in normalized_dates) + ")")
+            params.extend(normalized_dates)
+        sql = "SELECT code,trade_date,adj_factor,source,evidence,observed_at,response_sha256,conflicted FROM corporate_action_factors"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with self._connect() as db:
+            rows = [dict(row) for row in db.execute(sql, params)]
+        return {f"{row['code']}:{row['trade_date']}": row for row in rows}
+
+    @staticmethod
+    def _factor_cutoff(trade_date: str, observed_deadline: datetime) -> str:
+        close = datetime.combine(datetime.strptime(trade_date, "%Y-%m-%d").date(),
+                                 datetime_time(23, 59, 59), timezone(timedelta(hours=8)))
+        return min(observed_deadline, close.astimezone(timezone.utc), datetime.now(timezone.utc)).isoformat()
+
+    @staticmethod
+    def _matching_factor(db, code: str, trade_date: str, evidence: dict, cutoff: str) -> dict | None:
+        captured = factor_capture(evidence, code, trade_date, cutoff)
+        if not captured:
+            return None
+        row = db.execute(
+            "SELECT adj_factor,source,evidence,observed_at,response_sha256,conflicted "
+            "FROM corporate_action_factors WHERE code=? AND trade_date=?", (code, trade_date),
+        ).fetchone()
+        if not row or not factor_capture(dict(row), code, trade_date, cutoff):
+            return None
+        return captured if (math.isclose(float(row["adj_factor"]), captured["factor"], rel_tol=1e-12)
+                            and row["observed_at"] == evidence.get("observed_at")
+                            and row["response_sha256"] == captured["response_sha256"]) else None
+
+    def recommendation_codes_for_outcomes(self) -> list[str]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT code FROM recommendation_records WHERE plan_status='validated' AND comparability_status='comparable' ORDER BY code"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
 
     def save_daily_bars(self, code: str, bars, source: str = "", price_basis: str | None = None) -> int:
         from .core import normalize_code
@@ -5353,19 +7083,26 @@ class StockStore:
                 if not all(math.isfinite(value) for value in values):
                     continue
                 basis = str(item.get("price_basis") or price_basis or "unknown").strip().lower() or "unknown"
-                rows.append((normalized_code, trade_date, *values, str(item.get("source") or source or ""), datetime.utcnow().isoformat(), basis))
+                factor = item.get("corporate_action_factor")
+                factor = float(factor) if factor is not None else None
+                if factor is not None and (not math.isfinite(factor) or factor <= 0):
+                    continue
+                evidence = str(item.get("corporate_action_evidence") or "")[:500]
+                observed_at = str(item.get("corporate_action_observed_at") or "")
+                response_sha256 = str(item.get("corporate_action_response_sha256") or "")
+                rows.append((normalized_code, trade_date, *values, str(item.get("source") or source or ""), _utcnow_naive().isoformat(), basis, factor, evidence, observed_at, response_sha256))
             except (AttributeError, TypeError, ValueError, OverflowError):
                 continue
         if not rows:
             return 0
         with self._connect() as db:
-            db.executemany("INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis) VALUES(?,?,?,?,?,?,?,?,?,?,?)", rows)
+            db.executemany("INSERT OR REPLACE INTO daily_bars(code,trade_date,open,high,low,close,volume,amount,source,fetched_at,price_basis,corporate_action_factor,corporate_action_evidence,corporate_action_observed_at,corporate_action_response_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         return len(rows)
 
-    def save_minute_bars(self, bars, keep_days: int = 7, source: str = "sina") -> int:
+    def save_minute_bars(self, bars, keep_days: int = 7, source: str = "sina", cleanup_limit: int = 5000) -> int:
         """Batch-persist completed minute bars and prune old dates in one transaction."""
         import dataclasses
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         rows = []
         for bar in bars or []:
             try:
@@ -5396,7 +7133,7 @@ class StockStore:
                 "close=excluded.close,volume=excluded.volume,amount=excluded.amount,source=excluded.source,completed_at=excluded.completed_at",
                 rows,
             )
-            db.execute("DELETE FROM minute_bars WHERE trade_date < ?", (cutoff,))
+            self._cleanup_minute_bars_in_tx(db, cutoff, cleanup_limit)
         return len(rows)
 
     def minute_bars(self, code: str | None = None, trade_date: str | None = None, limit: int = 120) -> list[dict]:
@@ -5433,10 +7170,21 @@ class StockStore:
             args.append(per_code_limit)
             return [dict(row) for row in db.execute(sql, args)]
 
-    def cleanup_minute_bars(self, keep_days: int = 7, before: str | None = None) -> int:
+    @staticmethod
+    def _cleanup_minute_bars_in_tx(db, cutoff: str, limit: int) -> int:
+        bounded = max(1, min(int(limit), 5000))
+        cursor = db.execute(
+            "DELETE FROM minute_bars WHERE rowid IN ("
+            "SELECT rowid FROM minute_bars WHERE trade_date < ? "
+            "ORDER BY trade_date,start_at LIMIT ?)",
+            (cutoff, bounded),
+        )
+        return int(cursor.rowcount or 0)
+
+    def cleanup_minute_bars(self, keep_days: int = 7, before: str | None = None, limit: int = 5000) -> int:
         cutoff = self._date_norm(before) if before else (datetime.now(timezone.utc).date() - timedelta(days=max(0, int(keep_days)))).isoformat()
         with self._connect() as db:
-            return db.execute("DELETE FROM minute_bars WHERE trade_date < ?", (cutoff,)).rowcount
+            return self._cleanup_minute_bars_in_tx(db, cutoff, limit)
 
     def daily_bars(self, code: str, after: str = "", before_or_equal: str = "") -> list[dict]:
         after = self._date_norm(after) if after else ""
@@ -5475,7 +7223,7 @@ class StockStore:
 
         with self._connect() as db:
             rows = db.execute(
-                "SELECT code, name, price, prev_close, amount, pct_change, volume, fetched_at, source, provider_ts FROM daily_quotes WHERE trade_date=? ORDER BY code",
+                "SELECT code, name, price, prev_close, amount, pct_change, volume, fetched_at, source, provider_ts, suspended, limit_up, limit_down, st, risk_source, risk_scenario_version FROM daily_quotes WHERE trade_date=? ORDER BY code",
                 (trade_date,),
             )
             result = []
@@ -5489,7 +7237,11 @@ class StockStore:
                     provider_ts = datetime.fromisoformat(str(row[9])) if row[9] else None
                 except ValueError:
                     provider_ts = None
-                result.append(Quote(str(row[0]), str(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), source=str(row[8] or ""), provider_ts=provider_ts, fetched_at=fetched_at))
+                def explicit_flag(value):
+                    if isinstance(value, bool):
+                        return value
+                    return bool(value) if value in (0, 1) else None
+                result.append(Quote(str(row[0]), str(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), source=str(row[8] or ""), provider_ts=provider_ts, fetched_at=fetched_at, suspended=explicit_flag(row[10]), limit_up=explicit_flag(row[11]), limit_down=explicit_flag(row[12]), st=explicit_flag(row[13]), risk_source=str(row[14] or ""), risk_scenario_version=str(row[15] or "")))
             return result
 
     def latest_quote_names(self, codes) -> dict[str, str]:
@@ -5633,7 +7385,7 @@ class StockStore:
                         "INSERT INTO active_candidate_runs(scope,run_id,requested_date,actual_trade_date,valid_until,status,quality,coverage,updated_at) "
                         "VALUES('global',?,?,?,?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET run_id=excluded.run_id,requested_date=excluded.requested_date,"
                         "actual_trade_date=excluded.actual_trade_date,valid_until=excluded.valid_until,status=excluded.status,quality=excluded.quality,coverage=excluded.coverage,updated_at=excluded.updated_at",
-                        (run_id, run["requested_date"], run["actual_trade_date"], valid_until, run["status"], run["quality"], float(run["coverage"] or 0), datetime.utcnow().isoformat()),
+                        (run_id, run["requested_date"], run["actual_trade_date"], valid_until, run["status"], run["quality"], float(run["coverage"] or 0), _utcnow_naive().isoformat()),
                     )
         return len(rows)
 
@@ -5654,9 +7406,392 @@ class StockStore:
             "INSERT INTO report_versions(report_key,report_version,run_id,quality,updated_at) VALUES(?,?,?,?,?) "
             "ON CONFLICT(report_key) DO UPDATE SET report_version=excluded.report_version,run_id=excluded.run_id,"
             "quality=excluded.quality,updated_at=excluded.updated_at",
-            (report_key, allocated, run_id, quality or "unknown", datetime.utcnow().isoformat()),
+            (report_key, allocated, run_id, quality or "unknown", _utcnow_naive().isoformat()),
         )
         return True, allocated
+
+    @staticmethod
+    def _recommendation_prediction(plan: dict, *, candidate_price: float | None) -> dict:
+        """Build an auditable range, never a probability or point forecast."""
+        try:
+            reference = float(plan.get("reference_price") or candidate_price or 0)
+            atr = float(plan.get("atr") or 0)
+            resistance = float(plan.get("resistance") or 0)
+            invalidation = float(plan.get("invalidation") or 0)
+            target_low = float(plan.get("sell_low") or 0)
+            target_high = float(plan.get("sell_high") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return {"status": "insufficient_data", "reason": "price_plan_invalid"}
+        if not all(math.isfinite(value) for value in (reference, atr, resistance, invalidation, target_low, target_high)) or reference <= 0 or atr <= 0:
+            return {"status": "insufficient_data", "reason": "atr_or_reference_missing"}
+        ceilings = [value for value in (resistance, target_low, reference + atr) if value > reference]
+        if not ceilings:
+            return {"status": "insufficient_data", "reason": "resistance_or_target_invalid"}
+        upper = min(ceilings)
+        lower = max(reference, min(upper, reference + atr * 0.5))
+        risk = reference - invalidation if invalidation > 0 else 0
+        reward = upper - reference
+        if risk <= 0 or reward <= 0 or reward / risk < 1:
+            return {"status": "insufficient_data", "reason": "risk_reward_inadequate"}
+        return {"status": "available", "scenario_gain_pct_range": [round((lower / reference - 1) * 100, 2), round((upper / reference - 1) * 100, 2)], "basis": ["ATR", "resistance", "risk_reward"], "coverage": "plan_only", "confidence": "low", "risk_reward": round(reward / risk, 2)}
+
+    def _save_recommendations_in_tx(self, db, run_id: str, actual_date: str, source: str, candidates, *, origin: str = "global", visibility: str = "public", caller_identity: str = "system:daily_screen") -> None:
+        from .core import price_plan_is_validated
+
+        created_at = _utcnow_naive().isoformat()
+        for candidate in candidates:
+            plan_obj = getattr(candidate, "price_plan", None)
+            quote = getattr(candidate, "quote", None)
+            if quote is None:
+                continue
+            plan = {key: getattr(plan_obj, key) for key in plan_obj.__dataclass_fields__} if plan_obj is not None else {}
+            provenance = plan.get("provenance") if isinstance(plan.get("provenance"), dict) else {}
+            basis = str(provenance.get("basis") or "unknown").strip().lower()
+            comparability = provenance.get("corporate_action_evidence") if isinstance(provenance.get("corporate_action_evidence"), dict) else {}
+            try:
+                corporate_action_factor = float(comparability.get("factor"))
+            except (TypeError, ValueError, OverflowError):
+                corporate_action_factor = None
+            code = str(getattr(quote, "code", ""))
+            freeze_cutoff = self._factor_cutoff(
+                actual_date, datetime.fromisoformat(created_at).replace(tzinfo=timezone.utc))
+            captured = self._matching_factor(db, code, actual_date, comparability, freeze_cutoff)
+            comparable = comparability.get("comparable") is True and captured is not None
+            plan_valid = price_plan_is_validated(plan_obj) and provenance.get("actual_date") == actual_date
+            plan_reason = "" if plan_valid else ("price_plan_missing" if not plan else "price_plan_or_basis_unverified")
+            comparability_status = "comparable" if comparable else "unknown"
+            try:
+                candidate_price = float(getattr(quote, "price", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                candidate_price = None
+            prediction = self._recommendation_prediction(plan, candidate_price=candidate_price) if plan_valid else {"status": "insufficient_data", "reason": plan_reason}
+            overlay = getattr(candidate, "factor_overlay", None)
+            regime = str(getattr(overlay, "market_regime", "unknown") or "unknown").strip().lower()
+            strategy_version = "price-plan-config-v1:" + hashlib.sha256(json.dumps({"price_plan_algorithm": 1, "tolerance_pct": provenance.get("tolerance_pct"), "basis": basis}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+            plan_version = "plan:" + hashlib.sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+            recommendation_id = "rec:" + hashlib.sha256(f"{run_id}|{getattr(quote, 'code', '')}".encode("utf-8")).hexdigest()[:32]
+            timestamp = str(provenance.get("as_of") or provenance.get("last_date") or actual_date)
+            freshness = "verified_close" if timestamp == actual_date else "unknown"
+            db.execute(
+                "INSERT OR IGNORE INTO recommendation_records(recommendation_id,run_id,recommended_date,code,name,candidate_price,confirmation_price,attention_low,attention_high,invalidation_price,confirmation_level,target_low,target_high,plan_version,market_regime,data_timestamp,freshness,source,caller_identity,price_basis,prediction_json,created_at,origin,visibility,strategy_version,plan_status,plan_reason,comparability_status,corporate_action_factor,corporate_action_observed_at,corporate_action_response_sha256,corporate_action_evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (recommendation_id, run_id, actual_date, code, str(getattr(quote, "name", "")), candidate_price, plan.get("reference_price"), plan.get("attention_low"), plan.get("attention_high"), plan.get("invalidation"), plan.get("confirmation"), plan.get("sell_low"), plan.get("sell_high"), plan_version, regime, timestamp, freshness, str(source or ""), caller_identity, basis, json.dumps(prediction, ensure_ascii=False, sort_keys=True, separators=(",", ":")), created_at, str(origin or "global"), str(visibility or "public"), strategy_version, "validated" if plan_valid else "unknown", plan_reason, comparability_status, corporate_action_factor if comparable else None, captured["observed_at"] if comparable else "", captured["response_sha256"] if comparable else "", captured["evidence"] if comparable else ""),
+            )
+
+    def begin_recommendation_ai_review(
+        self,
+        run_id: str,
+        *,
+        model: str,
+        prompt_version: str,
+        input_sha256: str,
+    ) -> dict:
+        run_id = str(run_id or "").strip()
+        model = str(model or "").strip()
+        prompt_version = str(prompt_version or "").strip()
+        input_sha256 = str(input_sha256 or "").strip().lower()
+        if not run_id or not model or not prompt_version or not re.fullmatch(r"[0-9a-f]{64}", input_sha256):
+            raise ValueError("AI review identity is invalid")
+        review_batch_id = "air:" + hashlib.sha256(
+            f"{run_id}|{prompt_version}|{model}|{input_sha256}".encode("utf-8")
+        ).hexdigest()[:32]
+        requested_at = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            records = [dict(row) for row in db.execute(
+                "SELECT recommendation_id,run_id,recommended_date,code,name FROM recommendation_records WHERE run_id=? ORDER BY code",
+                (run_id,),
+            )]
+            if not records:
+                return {"claimed": False, "status": "skipped", "reason": "recommendations_missing", "records": []}
+            recommended_dates = {str(row["recommended_date"]) for row in records}
+            if len(recommended_dates) != 1:
+                raise ValueError("AI review recommendations span multiple dates")
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO recommendation_ai_review_batches(review_batch_id,run_id,recommended_date,model_requested,prompt_version,input_sha256,status,requested_at) VALUES(?,?,?,?,?,?,?,?)",
+                (review_batch_id, run_id, next(iter(recommended_dates)), model, prompt_version, input_sha256, "pending", requested_at),
+            )
+            batch = dict(db.execute(
+                "SELECT * FROM recommendation_ai_review_batches WHERE run_id=? AND prompt_version=? AND model_requested=?",
+                (run_id, prompt_version, model),
+            ).fetchone())
+            return {
+                "claimed": cursor.rowcount == 1,
+                "status": str(batch["status"]),
+                "review_batch_id": str(batch["review_batch_id"]),
+                "records": records,
+            }
+
+    def finish_recommendation_ai_review(
+        self,
+        review_batch_id: str,
+        *,
+        status: str,
+        model_returned: str = "",
+        usage: dict | None = None,
+        error: str = "",
+        decisions: list[dict] | None = None,
+    ) -> bool:
+        review_batch_id = str(review_batch_id or "").strip()
+        status = str(status or "").strip().lower()
+        if status not in {"complete", "unknown", "failed", "skipped"}:
+            raise ValueError("AI review terminal status is invalid")
+        usage_json = json.dumps(usage or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        completed_at = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            batch = db.execute(
+                "SELECT * FROM recommendation_ai_review_batches WHERE review_batch_id=?",
+                (review_batch_id,),
+            ).fetchone()
+            if not batch or str(batch["status"]) != "pending":
+                return False
+            records = [dict(row) for row in db.execute(
+                "SELECT recommendation_id,code FROM recommendation_records WHERE run_id=? ORDER BY code",
+                (str(batch["run_id"]),),
+            )]
+            by_code = {str(row["code"]): str(row["recommendation_id"]) for row in records}
+            normalized = []
+            if status == "complete":
+                raw = decisions if isinstance(decisions, list) else []
+                if len(raw) != len(by_code):
+                    raise ValueError("AI review must cover every recommendation")
+                seen = set()
+                for item in raw:
+                    if not isinstance(item, dict):
+                        raise ValueError("AI review decision must be an object")
+                    code = str(item.get("code") or "").strip()
+                    decision = str(item.get("decision") or "").strip().lower()
+                    adjustment = item.get("score_adjustment", item.get("adjustment", 0))
+                    if isinstance(adjustment, bool):
+                        raise ValueError("AI review adjustment is invalid")
+                    adjustment = int(adjustment)
+                    tags = item.get("risk_tags")
+                    reason = re.sub(r"[\x00-\x1f\x7f]", " ", str(item.get("reason") or "")).strip()
+                    if code not in by_code or code in seen or decision not in {"keep", "watch", "veto"}:
+                        raise ValueError("AI review decision identity is invalid")
+                    if not -5 <= adjustment <= 0 or not isinstance(tags, list) or len(tags) > 8 or not reason or len(reason) > 400:
+                        raise ValueError("AI review decision payload is invalid")
+                    clean_tags = []
+                    for tag in tags:
+                        clean = re.sub(r"[\x00-\x1f\x7f]", " ", str(tag or "")).strip()
+                        if not clean or len(clean) > 80:
+                            raise ValueError("AI review risk tag is invalid")
+                        clean_tags.append(clean)
+                    seen.add(code)
+                    normalized.append((
+                        review_batch_id, by_code[code], code, decision, adjustment,
+                        json.dumps(clean_tags, ensure_ascii=False, separators=(",", ":")), reason, completed_at,
+                    ))
+                if seen != set(by_code):
+                    raise ValueError("AI review omitted recommendations")
+                db.executemany(
+                    "INSERT INTO recommendation_ai_reviews(review_batch_id,recommendation_id,code,decision,score_adjustment,risk_tags_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    normalized,
+                )
+            cursor = db.execute(
+                "UPDATE recommendation_ai_review_batches SET model_returned=?,status=?,error=?,usage_json=?,completed_at=? WHERE review_batch_id=? AND status='pending'",
+                (str(model_returned or ""), status, str(error or "")[:500], usage_json, completed_at, review_batch_id),
+            )
+            return cursor.rowcount == 1
+
+    def recommendation_ai_review(self, run_id: str) -> dict | None:
+        with self._connect() as db:
+            batch = db.execute(
+                "SELECT * FROM recommendation_ai_review_batches WHERE run_id=? ORDER BY requested_at DESC LIMIT 1",
+                (str(run_id or ""),),
+            ).fetchone()
+            if not batch:
+                return None
+            result = dict(batch)
+            result["decisions"] = [dict(row) for row in db.execute(
+                "SELECT * FROM recommendation_ai_reviews WHERE review_batch_id=? ORDER BY code",
+                (str(batch["review_batch_id"]),),
+            )]
+            return result
+
+    @staticmethod
+    def _outcome_order(days: list[dict], level: float | None, invalidation: float | None, key: str) -> tuple[str, str]:
+        if not level or level <= 0:
+            return "not_applicable", ""
+        for item in days:
+            hit = float(item["high"]) >= level if key != "invalidation" else float(item["low"]) <= level
+            if not hit:
+                continue
+            return "touched", str(item["trade_date"])
+        return "not_touched", ""
+
+    @staticmethod
+    def _recommendation_bar_is_usable(bar: dict, basis: str, base_factor: float, cutoff: str) -> bool:
+        try:
+            values = [float(bar[key]) for key in ("open", "high", "low", "close", "volume", "amount")]
+            if not all(math.isfinite(value) and value > 0 for value in values):
+                return False
+            open_, high, low, close, _volume, _amount = values
+            if high < low or high < max(open_, close) or low > min(open_, close):
+                return False
+            factor = float(bar.get("corporate_action_factor"))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        return (
+            str(bar.get("price_basis") or "").lower() == basis == "unadjusted"
+            and math.isclose(factor, base_factor, rel_tol=1e-10, abs_tol=1e-12)
+            and factor_capture({"adj_factor": factor, "source": "tushare_adj_factor",
+                                "evidence": bar.get("corporate_action_evidence"),
+                                "observed_at": bar.get("corporate_action_observed_at"),
+                                "response_sha256": bar.get("corporate_action_response_sha256")},
+                               bar["code"], bar["trade_date"], cutoff) is not None
+        )
+
+    @staticmethod
+    def _calendar_window(db, start: str, cutoff: str) -> tuple[list[str], str | None]:
+        cursor = datetime.strptime(start, "%Y-%m-%d").date() + timedelta(days=1)
+        end = datetime.strptime(cutoff, "%Y-%m-%d").date()
+        open_days: list[str] = []
+        while cursor <= end:
+            value = cursor.isoformat()
+            row = db.execute("SELECT is_open,status FROM trading_calendar WHERE trade_date=?", (value,)).fetchone()
+            if not row or str(row["status"] or "").lower() not in {"open", "closed"}:
+                return open_days, "calendar_window_unverified"
+            if str(row["status"]).lower() == "open" and int(row["is_open"] or 0) == 1:
+                open_days.append(value)
+            cursor += timedelta(days=1)
+        return open_days, None
+
+    def evaluate_recommendation_outcomes(self, *, as_of: str | datetime | None = None, horizons=(1, 3, 5, 10)) -> dict:
+        china_tz = timezone(timedelta(hours=8))
+        if isinstance(as_of, datetime):
+            current = as_of.replace(tzinfo=china_tz) if as_of.tzinfo is None else as_of.astimezone(china_tz)
+            cutoff = current.date().isoformat()
+        elif as_of is None:
+            current = datetime.now(china_tz)
+            cutoff = current.date().isoformat()
+        else:
+            current = None
+            cutoff = self._date_norm(as_of)
+        evaluation_cutoff = self._factor_cutoff(cutoff, current.astimezone(timezone.utc) if current else datetime.now(timezone.utc))
+        result = {"evaluated": 0, "complete": 0, "pending": 0, "unknown": 0, "unknown_order": 0}
+        with self._connect() as db:
+            rows = [dict(row) for row in db.execute(
+                "SELECT * FROM recommendation_records WHERE recommended_date<=? ORDER BY recommended_date,recommendation_id",
+                (cutoff,),
+            )]
+            for record in rows:
+                known_open, calendar_reason = self._calendar_window(db, record["recommended_date"], cutoff)
+                for horizon in horizons:
+                    horizon = int(horizon)
+                    if str(record.get("plan_status")) != "validated":
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "unknown", reason=str(record.get("plan_reason") or "price_plan_unverified"))
+                        result["unknown"] += 1
+                        continue
+                    if len(known_open) < horizon:
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "pending", reason=calendar_reason or "observation_window_not_mature")
+                        result["pending"] += 1
+                        continue
+                    if str(record.get("comparability_status") or "unknown") != "comparable":
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "unknown", reason="corporate_action_evidence_missing")
+                        result["unknown"] += 1
+                        continue
+                    try:
+                        base_factor = float(record.get("corporate_action_factor"))
+                    except (TypeError, ValueError, OverflowError):
+                        base_factor = 0.0
+                    if not math.isfinite(base_factor) or base_factor <= 0:
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "unknown", reason="corporate_action_base_factor_missing")
+                        result["unknown"] += 1
+                        continue
+                    freeze_at = evidence_stamp(str(record.get("created_at") or "") + "+00:00")
+                    base_cutoff = self._factor_cutoff(record["recommended_date"], freeze_at) if freeze_at else ""
+                    if not self._matching_factor(db, record["code"], record["recommended_date"], {
+                        "adj_factor": base_factor, "source": "tushare_adj_factor",
+                        "evidence": record.get("corporate_action_evidence"),
+                        "observed_at": record.get("corporate_action_observed_at"),
+                        "response_sha256": record.get("corporate_action_response_sha256"),
+                    }, base_cutoff):
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "unknown", reason="corporate_action_time_evidence_missing")
+                        result["unknown"] += 1
+                        continue
+                    dates = known_open[:horizon]
+                    if current and dates[-1] == cutoff and current.time() < datetime.strptime("15:00", "%H:%M").time():
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "pending", reason="session_not_complete")
+                        result["pending"] += 1
+                        continue
+                    complete = [db.execute("SELECT complete FROM daily_snapshot_meta WHERE trade_date=?", (day,)).fetchone() for day in dates]
+                    if any(not item or int(item["complete"] or 0) != 1 for item in complete):
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "pending", reason="completed_session_evidence_missing")
+                        result["pending"] += 1
+                        continue
+                    placeholders = ",".join("?" for _ in dates)
+                    bars = [dict(row) for row in db.execute(f"SELECT * FROM daily_bars WHERE code=? AND trade_date IN ({placeholders}) ORDER BY trade_date", (record["code"], *dates))]
+                    if len(bars) != horizon or any(
+                        not self._recommendation_bar_is_usable(bar, str(record.get("price_basis") or "unknown"), base_factor, evaluation_cutoff)
+                        or not self._matching_factor(db, bar["code"], bar["trade_date"], {
+                            "adj_factor": bar.get("corporate_action_factor"), "source": "tushare_adj_factor",
+                            "evidence": bar.get("corporate_action_evidence"),
+                            "observed_at": bar.get("corporate_action_observed_at"),
+                            "response_sha256": bar.get("corporate_action_response_sha256"),
+                        }, evaluation_cutoff)
+                        for bar in bars
+                    ):
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "unknown", reason="missing_suspended_or_price_not_comparable")
+                        result["unknown"] += 1
+                        continue
+                    base = float(record.get("confirmation_price") or record.get("candidate_price") or 0)
+                    if not math.isfinite(base) or base <= 0:
+                        self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, "unknown", reason="reference_price_invalid")
+                        result["unknown"] += 1
+                        continue
+                    invalidation = float(record.get("invalidation_price") or 0)
+                    confirmation, confirmation_date = self._outcome_order(bars, float(record.get("confirmation_level") or 0), invalidation, "confirmation")
+                    target, target_date = self._outcome_order(bars, float(record.get("target_low") or 0), invalidation, "target")
+                    invalidated, invalidated_date = self._outcome_order(bars, invalidation, None, "invalidation")
+                    target_vs_invalidation = "not_touched"
+                    if target == "touched" and invalidated == "touched":
+                        target_vs_invalidation = "unknown_order" if target_date == invalidated_date else ("target_before_invalidation" if target_date < invalidated_date else "invalidation_before_target")
+                    elif target == "touched":
+                        target_vs_invalidation = "target_before_invalidation"
+                    elif invalidated == "touched":
+                        target_vs_invalidation = "invalidation_before_target"
+                    order_unknown = target_vs_invalidation == "unknown_order"
+                    status = "unknown_order" if order_unknown else "complete"
+                    closes = [float(bar["close"]) for bar in bars]
+                    peak, drawdown = base, 0.0
+                    for close in closes:
+                        peak = max(peak, close)
+                        drawdown = min(drawdown, (close / peak - 1) * 100)
+                    first = min((date for date in (confirmation_date, target_date, invalidated_date) if date), default="")
+                    self._upsert_recommendation_outcome(db, record["recommendation_id"], horizon, cutoff, status, close_price=closes[-1], return_pct=(closes[-1] / base - 1) * 100, max_gain_pct=max((float(bar["high"]) / base - 1) * 100 for bar in bars), max_drawdown_pct=drawdown, confirmation_order=confirmation, target_order=target, invalidation_order=invalidated, first_touch=first, reason="daily_bar_order_unprovable" if order_unknown else "", sample_complete=not order_unknown, session_complete=True, price_basis=str(record.get("price_basis") or "unknown"), event_order=target_vs_invalidation)
+                    result[status] += 1
+                    result["evaluated"] += 1
+        return result
+
+    @staticmethod
+    def _upsert_recommendation_outcome(db, recommendation_id: str, horizon: int, evaluated_through: str, status: str, *, close_price=None, return_pct=None, max_gain_pct=None, max_drawdown_pct=None, confirmation_order="not_touched", target_order="not_touched", invalidation_order="not_touched", first_touch="", reason="", sample_complete=False, session_complete=False, price_basis="unknown", event_order="not_touched") -> None:
+        db.execute("INSERT INTO recommendation_outcomes(recommendation_id,horizon,evaluated_through,status,close_price,return_pct,max_gain_pct,max_drawdown_pct,confirmation_order,target_order,invalidation_order,first_touch,reason,sample_complete,updated_at,session_complete,price_basis,event_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(recommendation_id,horizon) DO UPDATE SET evaluated_through=excluded.evaluated_through,status=excluded.status,close_price=excluded.close_price,return_pct=excluded.return_pct,max_gain_pct=excluded.max_gain_pct,max_drawdown_pct=excluded.max_drawdown_pct,confirmation_order=excluded.confirmation_order,target_order=excluded.target_order,invalidation_order=excluded.invalidation_order,first_touch=excluded.first_touch,reason=excluded.reason,sample_complete=excluded.sample_complete,updated_at=excluded.updated_at,session_complete=excluded.session_complete,price_basis=excluded.price_basis,event_order=excluded.event_order", (recommendation_id, horizon, evaluated_through, status, close_price, return_pct, max_gain_pct, max_drawdown_pct, confirmation_order, target_order, invalidation_order, first_touch, reason, int(bool(sample_complete)), _utcnow_naive().isoformat(), int(bool(session_complete)), price_basis, event_order))
+
+    def recommendation_reviews(self, origin: str = "", limit: int = 20) -> list[dict]:
+        with self._connect() as db:
+            rows = db.execute("SELECT r.*,o.horizon,o.status,o.return_pct,o.max_gain_pct,o.max_drawdown_pct,o.confirmation_order,o.target_order,o.invalidation_order,o.event_order,o.first_touch,o.reason FROM recommendation_records r LEFT JOIN recommendation_outcomes o ON o.recommendation_id=r.recommendation_id AND o.horizon=5 WHERE r.visibility='public' OR r.origin=? ORDER BY r.recommended_date DESC,r.code LIMIT ?", (str(origin or ""), max(1, min(int(limit), 100)))).fetchall()
+            return [dict(row) for row in rows]
+
+    def recommendation_performance(self, horizon: int = 5, origin: str = "") -> list[dict]:
+        with self._connect() as db:
+            rows = [dict(row) for row in db.execute("SELECT r.strategy_version,r.market_regime,o.* FROM recommendation_records r LEFT JOIN recommendation_outcomes o ON o.recommendation_id=r.recommendation_id AND o.horizon=? WHERE r.visibility='public' OR r.origin=? ORDER BY r.strategy_version,r.market_regime", (max(1, min(int(horizon), 10)), str(origin or "")))]
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for row in rows:
+            groups.setdefault((str(row["strategy_version"]), str(row["market_regime"])), []).append(row)
+        result = []
+        for (version, regime), items in groups.items():
+            mature = [item for item in items if item.get("status") in {"complete", "unknown_order"}]
+            price_evaluable = [item for item in mature if item.get("return_pct") is not None]
+            order_evaluable = [item for item in items if item.get("status") == "complete"]
+            returns = sorted(float(item["return_pct"]) for item in price_evaluable)
+            gains = sorted(float(item["max_gain_pct"]) for item in price_evaluable if item.get("max_gain_pct") is not None)
+            drawdowns = [float(item["max_drawdown_pct"]) for item in price_evaluable if item.get("max_drawdown_pct") is not None]
+            median = (returns[(len(returns) - 1) // 2] + returns[len(returns) // 2]) / 2 if returns else None
+            median_gain = (gains[(len(gains) - 1) // 2] + gains[len(gains) // 2]) / 2 if gains else None
+            invalidation_count = sum(item.get("invalidation_order") == "touched" for item in order_evaluable)
+            target_count = sum(item.get("target_order") == "touched" for item in order_evaluable)
+            result.append({"strategy_version": version, "market_regime": regime, "sample_count": len(items), "mature_count": len(mature), "evaluable_count": len(price_evaluable), "price_evaluable_count": len(price_evaluable), "order_evaluable_count": len(order_evaluable), "pending_count": sum(item.get("status") == "pending" or item.get("status") is None for item in items), "unknown_count": sum(item.get("status") == "unknown" for item in items), "unknown_order_count": sum(item.get("status") == "unknown_order" for item in items), "positive_return_rate": sum(value > 0 for value in returns) / len(returns) if returns else None, "target_hit_rate": target_count / len(order_evaluable) if order_evaluable else None, "invalidation_count": invalidation_count, "invalidation_eligible_count": len(order_evaluable), "invalidation_rate": invalidation_count / len(order_evaluable) if order_evaluable else None, "median_return_pct": median, "median_max_gain_pct": median_gain, "return_distribution": {"min": returns[0], "max": returns[-1]} if returns else {}, "max_drawdown_pct": min(drawdowns) if drawdowns else None})
+        return result
 
     def save_screen_bundle_atomic(
         self,
@@ -5672,6 +7807,10 @@ class StockStore:
         scope: str = "global",
         valid_until: str | None = None,
         coverage_floor: float = 0.8,
+        publication_key: str = "",
+        publication_payload: str = "",
+        publication_invocation_id: str = "",
+        publication_origins=None,
     ) -> dict:
         run_id = str(run_args[0])
         import json
@@ -5688,11 +7827,36 @@ class StockStore:
         values[2], values[3] = requested_date, actual_date
         status, quality, error = str(values[9]), str(values[10]), values[11]
         coverage_value = max(0.0, min(1.0, float(coverage)))
+        valid_empty = False
         if isinstance(diagnostics, dict):
+            try:
+                valid_empty = (
+                    diagnostics.get("valid_empty") is True
+                    and int(diagnostics.get("input", 0)) > 0
+                    and int(diagnostics.get("risk_tuple_complete", -1)) == int(diagnostics["input"])
+                    and int(diagnostics.get("tradable", -1)) == 0
+                    and int(diagnostics.get("indicator_targets", -1)) == 0
+                    and int(diagnostics.get("candidate_count", -1)) == 0
+                )
+            except (ValueError, TypeError, KeyError):
+                valid_empty = False
             diagnostics = json.dumps(diagnostics, ensure_ascii=False, default=str)
         diagnostics = str(diagnostics or "{}")
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            publication_key = str(publication_key or "").strip()
+            if publication_key:
+                existing = db.execute(
+                    "SELECT run_id FROM automatic_close_publications WHERE publication_key=?",
+                    (publication_key,),
+                ).fetchone()
+                if existing:
+                    return {
+                        "run_id": str(existing["run_id"]),
+                        "report_claimed": True,
+                        "report_version": 0,
+                        "idempotent": True,
+                    }
             report_claimed, allocated_version = self._claim_report_version_in_tx(
                 db, report_key, run_id, report_version, quality
             )
@@ -5711,6 +7875,12 @@ class StockStore:
                 rows.append((run_id,c.quote.code,c.quote.name,c.score,c.score_max,c.risk_level,json.dumps(c.risk_flags,ensure_ascii=False),json.dumps(pdata,ensure_ascii=False,default=str),json.dumps(c.reasons,ensure_ascii=False),json.dumps(odata,ensure_ascii=False,default=str)))
             if rows:
                 db.executemany("INSERT INTO screen_candidates(run_id,code,name,score,score_max,risk_level,risk_flags,price_plan,reasons,factor_payload) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+                # The recommendation snapshot is created in the same
+                # transaction as the immutable candidate; a later review can
+                # therefore never silently use a replaced plan.
+                recommendation_origin = str(scope or "global")
+                visibility = "public" if recommendation_origin == "global" else "private"
+                self._save_recommendations_in_tx(db, run_id, actual_date, str(values[4] or ""), candidates, origin=recommendation_origin, visibility=visibility, caller_identity=f"screen:{recommendation_origin}")
             # A completed non-empty run becomes the active candidate source.
             # Empty degraded/failed runs intentionally leave the previous
             # source untouched so a transient outage cannot empty monitoring.
@@ -5723,11 +7893,34 @@ class StockStore:
                     "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET run_id=excluded.run_id,requested_date=excluded.requested_date,"
                     "actual_trade_date=excluded.actual_trade_date,valid_until=excluded.valid_until,status=excluded.status,quality=excluded.quality,"
                     "coverage=excluded.coverage,updated_at=excluded.updated_at",
-                    (scope or "global", run_id, values[2], values[3], valid_until, status, quality, coverage_value, datetime.utcnow().isoformat()),
+                    (scope or "global", run_id, values[2], values[3], valid_until, status, quality, coverage_value, _utcnow_naive().isoformat()),
                 )
-            elif report_claimed and status == "completed" and not rows and coverage_value >= max(0.0, min(1.0, float(coverage_floor))):
+            elif (report_claimed and status == "completed" and quality == "good" and not rows
+                  and (valid_empty or coverage_value >= max(0.0, min(1.0, float(coverage_floor))))):
                 db.execute("DELETE FROM active_candidate_runs WHERE scope=?", (scope or "global",))
-        return {"run_id": run_id, "report_claimed": report_claimed, "report_version": allocated_version}
+            if publication_key and report_claimed:
+                payload = str(publication_payload or "")
+                invocation = str(publication_invocation_id or "").strip()
+                if not payload or not invocation:
+                    raise ValueError("automatic close publication requires payload and invocation")
+                origins = sorted({str(value).strip() for value in (publication_origins or []) if str(value).strip()})
+                now_text = _utcnow_naive().isoformat()
+                db.execute(
+                    "INSERT INTO automatic_close_publications(publication_key,actual_trade_date,requested_date,run_id,invocation_id,payload,payload_hash,origins_json,outbox_prepared,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,0,?,?)",
+                    (
+                        publication_key,
+                        actual_date,
+                        requested_date,
+                        run_id,
+                        invocation,
+                        payload,
+                        hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                        json.dumps(origins, ensure_ascii=False, separators=(",", ":")),
+                        now_text,
+                        now_text,
+                    ),
+                )
+        return {"run_id": run_id, "report_claimed": report_claimed, "report_version": allocated_version, "idempotent": False}
 
     def save_screen_bundle(
         self,
@@ -5739,7 +7932,7 @@ class StockStore:
         return str(self.save_screen_bundle_atomic(run_args, candidates, **kwargs)["run_id"])
 
     def update_provider_health(self, provider: str, success: bool, quality: str, error: str | None = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         with self._connect() as db:
             db.execute("INSERT INTO provider_health(provider,last_success_at,last_error_at,success_count,error_count,last_quality) VALUES(?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET last_success_at=CASE WHEN ? THEN excluded.last_success_at ELSE provider_health.last_success_at END,last_error_at=CASE WHEN ? THEN provider_health.last_error_at ELSE excluded.last_error_at END,success_count=provider_health.success_count+CASE WHEN ? THEN 1 ELSE 0 END,error_count=provider_health.error_count+CASE WHEN ? THEN 0 ELSE 1 END,last_quality=excluded.last_quality", (provider, now if success else None, None if success else now, int(success), int(not success), quality, int(success), int(success), int(success), int(success)))
 
@@ -5771,7 +7964,7 @@ class StockStore:
                 "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET run_id=excluded.run_id,requested_date=excluded.requested_date,"
                 "actual_trade_date=excluded.actual_trade_date,valid_until=excluded.valid_until,status=excluded.status,quality=excluded.quality,"
                 "coverage=excluded.coverage,updated_at=excluded.updated_at",
-                (scope or "global", run_id, requested_date, actual_trade_date, valid_until, status, quality, max(0.0, min(1.0, float(coverage))), datetime.utcnow().isoformat()),
+                (scope or "global", run_id, requested_date, actual_trade_date, valid_until, status, quality, max(0.0, min(1.0, float(coverage))), _utcnow_naive().isoformat()),
             )
 
     def clear_active_candidate_run(self, scope: str = "global") -> None:
@@ -5820,6 +8013,574 @@ class StockStore:
             row = db.execute("SELECT * FROM report_versions WHERE report_key=?", (report_key,)).fetchone()
             return dict(row) if row else None
 
+    def automatic_close_publication(self, publication_key: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM automatic_close_publications WHERE publication_key=?",
+                (str(publication_key or ""),),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            origins = json.loads(str(result.get("origins_json") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            origins = []
+        result["origins"] = [str(value) for value in origins if str(value).strip()] if isinstance(origins, list) else []
+        return result
+
+    @staticmethod
+    def _automatic_delivery_clock(now=None) -> float:
+        if now is None:
+            return time.time()
+        if isinstance(now, datetime):
+            value = now
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.timestamp()
+        value = float(now)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("automatic delivery clock is invalid")
+        return value
+
+    def prepare_automatic_close_deliveries(self, publication_key: str) -> list[dict]:
+        key = str(publication_key or "").strip()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            publication = db.execute(
+                "SELECT * FROM automatic_close_publications WHERE publication_key=?",
+                (key,),
+            ).fetchone()
+            if not publication:
+                raise KeyError(f"unknown automatic close publication {key}")
+            try:
+                origins = json.loads(str(publication["origins_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("automatic close publication destinations are invalid") from exc
+            if not isinstance(origins, list):
+                raise RuntimeError("automatic close publication destinations are invalid")
+            now_text = _utcnow_naive().isoformat()
+            for origin in sorted({str(value).strip() for value in origins if str(value).strip()}):
+                delivery_id = hashlib.sha256(f"{key}\0{origin}".encode("utf-8")).hexdigest()
+                db.execute(
+                    "INSERT OR IGNORE INTO automatic_close_deliveries(delivery_id,publication_key,actual_trade_date,origin,run_id,payload,payload_hash,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'pending',?,?)",
+                    (
+                        delivery_id,
+                        key,
+                        str(publication["actual_trade_date"]),
+                        origin,
+                        str(publication["run_id"]),
+                        str(publication["payload"]),
+                        str(publication["payload_hash"]),
+                        now_text,
+                        now_text,
+                    ),
+                )
+            db.execute(
+                "UPDATE automatic_close_publications SET outbox_prepared=1,updated_at=? WHERE publication_key=?",
+                (now_text, key),
+            )
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM automatic_close_deliveries WHERE publication_key=? ORDER BY origin",
+                (key,),
+            )]
+
+    def prepare_all_automatic_close_deliveries(self, *, limit: int = 20) -> int:
+        with self._connect() as db:
+            keys = [str(row[0]) for row in db.execute(
+                "SELECT publication_key FROM automatic_close_publications WHERE outbox_prepared=0 ORDER BY created_at LIMIT ?",
+                (max(1, min(int(limit), 100)),),
+            )]
+        for key in keys:
+            self.prepare_automatic_close_deliveries(key)
+        return len(keys)
+
+    def recoverable_automatic_close_deliveries(
+        self,
+        *,
+        now=None,
+        limit: int = 100,
+        max_attempts: int = 5,
+        retry_window_seconds: float = 3600,
+    ) -> list[dict]:
+        current = self._automatic_delivery_clock(now)
+        cutoff = datetime.fromtimestamp(current - max(60.0, float(retry_window_seconds)), timezone.utc).replace(tzinfo=None).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE automatic_close_deliveries SET state='unknown_delivery',lease_owner='',lease_expires_at=0,last_error=CASE WHEN last_error='' THEN 'delivery outcome unknown after sender interruption' ELSE last_error END,updated_at=? "
+                "WHERE state='sending' AND lease_expires_at<=?",
+                (_utcnow_naive().isoformat(), current),
+            )
+            db.execute(
+                "UPDATE automatic_close_deliveries SET state='cancelled',next_retry_at=0,last_error=CASE WHEN last_error='' THEN 'confirmed send failures exhausted retry bounds' ELSE last_error || '; retry bounds exhausted' END,updated_at=? "
+                "WHERE state='failed' AND (attempts>=? OR created_at<=?)",
+                (_utcnow_naive().isoformat(), max(1, int(max_attempts)), cutoff),
+            )
+            rows = db.execute(
+                "SELECT * FROM automatic_close_deliveries WHERE state='pending' OR (state='failed' AND next_retry_at<=?) ORDER BY created_at,origin LIMIT ?",
+                (current, max(1, min(int(limit), 1000))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def claim_automatic_close_delivery(self, delivery_id: str, owner: str, *, ttl_seconds: float = 120, now=None) -> dict:
+        current = self._automatic_delivery_clock(now)
+        ttl = max(5.0, min(float(ttl_seconds), 3600.0))
+        owner_value = str(owner or "").strip()[:160]
+        if not owner_value:
+            raise ValueError("automatic delivery owner is required")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM automatic_close_deliveries WHERE delivery_id=?", (str(delivery_id),)).fetchone()
+            if not row:
+                raise KeyError(f"unknown automatic close delivery {delivery_id}")
+            state = str(row["state"])
+            expiry = float(row["lease_expires_at"] or 0)
+            if state == "sending" and expiry <= current:
+                db.execute(
+                    "UPDATE automatic_close_deliveries SET state='unknown_delivery',lease_owner='',lease_expires_at=0,last_error=CASE WHEN last_error='' THEN 'delivery outcome unknown after sender interruption' ELSE last_error END,updated_at=? WHERE delivery_id=?",
+                    (_utcnow_naive().isoformat(), str(delivery_id)),
+                )
+                row = db.execute("SELECT * FROM automatic_close_deliveries WHERE delivery_id=?", (str(delivery_id),)).fetchone()
+                return {**dict(row), "acquired": False, "reason": "unknown_delivery"}
+            if state in {"sent", "unknown_delivery", "cancelled"}:
+                return {**dict(row), "acquired": False, "reason": state}
+            if state == "sending" and expiry > current:
+                return {**dict(row), "acquired": False, "reason": "contended"}
+            if state == "failed" and float(row["next_retry_at"] or 0) > current:
+                return {**dict(row), "acquired": False, "reason": "backoff"}
+            fence = max(0, int(row["lease_fence"] or 0)) + 1
+            db.execute(
+                "UPDATE automatic_close_deliveries SET state='sending',attempts=attempts+1,lease_owner=?,lease_fence=?,lease_expires_at=?,updated_at=? WHERE delivery_id=? AND state IN ('pending','failed')",
+                (owner_value, fence, current + ttl, _utcnow_naive().isoformat(), str(delivery_id)),
+            )
+            refreshed = db.execute("SELECT * FROM automatic_close_deliveries WHERE delivery_id=?", (str(delivery_id),)).fetchone()
+            return {**dict(refreshed), "acquired": True, "owner": owner_value, "fence": fence}
+
+    def finish_automatic_close_delivery(
+        self,
+        delivery_id: str,
+        owner: str,
+        fence: int,
+        *,
+        sent: bool,
+        error: str = "",
+        retry_after_seconds: float = 60,
+        max_attempts: int = 5,
+        retry_window_seconds: float = 3600,
+        now=None,
+    ) -> dict:
+        current = self._automatic_delivery_clock(now)
+        now_text = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current_row = db.execute(
+                "SELECT attempts,created_at FROM automatic_close_deliveries WHERE delivery_id=?",
+                (str(delivery_id),),
+            ).fetchone()
+            if not current_row:
+                raise KeyError(f"unknown automatic close delivery {delivery_id}")
+            exhausted = False
+            if not sent:
+                try:
+                    created = datetime.fromisoformat(str(current_row["created_at"])).replace(tzinfo=timezone.utc).timestamp()
+                except (TypeError, ValueError):
+                    created = current
+                exhausted = int(current_row["attempts"] or 0) >= max(1, int(max_attempts)) or current - created >= max(60.0, float(retry_window_seconds))
+            state = "sent" if sent else ("cancelled" if exhausted else "failed")
+            retry_at = 0.0 if sent or exhausted else current + max(1.0, min(float(retry_after_seconds), 3600.0))
+            final_error = str(error or "")[:500]
+            if exhausted:
+                final_error = (final_error + "; retry bounds exhausted").strip("; ")[:500]
+            changed = db.execute(
+                "UPDATE automatic_close_deliveries SET state=?,lease_owner='',lease_expires_at=0,next_retry_at=?,last_error=?,updated_at=?,sent_at=? "
+                "WHERE delivery_id=? AND state='sending' AND lease_owner=? AND lease_fence=? AND lease_expires_at>?",
+                (
+                    state,
+                    retry_at,
+                    final_error,
+                    now_text,
+                    now_text if sent else None,
+                    str(delivery_id),
+                    str(owner or ""),
+                    int(fence),
+                    current,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("automatic delivery acknowledgement lost ownership")
+            row = db.execute("SELECT * FROM automatic_close_deliveries WHERE delivery_id=?", (str(delivery_id),)).fetchone()
+            return dict(row)
+
+    def mark_automatic_close_delivery_unknown(self, delivery_id: str, owner: str, fence: int, *, error: str, now=None) -> dict:
+        current = self._automatic_delivery_clock(now)
+        now_text = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE automatic_close_deliveries SET state='unknown_delivery',lease_owner='',lease_expires_at=0,next_retry_at=0,last_error=?,updated_at=? "
+                "WHERE delivery_id=? AND state='sending' AND lease_owner=? AND lease_fence=? AND lease_expires_at>?",
+                (str(error or "delivery outcome unknown")[:500], now_text, str(delivery_id), str(owner or ""), int(fence), current),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("automatic unknown-delivery marker lost ownership")
+            row = db.execute("SELECT * FROM automatic_close_deliveries WHERE delivery_id=?", (str(delivery_id),)).fetchone()
+            return dict(row)
+
+    def cancel_automatic_close_delivery(self, delivery_id: str, reason: str) -> bool:
+        with self._connect() as db:
+            changed = db.execute(
+                "UPDATE automatic_close_deliveries SET state='cancelled',lease_owner='',lease_expires_at=0,last_error=?,updated_at=? WHERE delivery_id=? AND state IN ('pending','failed')",
+                (str(reason or "cancelled")[:500], _utcnow_naive().isoformat(), str(delivery_id)),
+            ).rowcount
+            return changed == 1
+
+    def automatic_close_delivery_summary(self, publication_key: str | None = None) -> dict[str, int]:
+        with self._connect() as db:
+            if publication_key:
+                rows = db.execute(
+                    "SELECT state,COUNT(*) FROM automatic_close_deliveries WHERE publication_key=? GROUP BY state",
+                    (str(publication_key),),
+                ).fetchall()
+            else:
+                rows = db.execute("SELECT state,COUNT(*) FROM automatic_close_deliveries GROUP BY state").fetchall()
+        result = {state: 0 for state in ("pending", "sending", "sent", "failed", "unknown_delivery", "cancelled")}
+        result.update({str(row[0]): int(row[1]) for row in rows})
+        return result
+
+    @staticmethod
+    def _acceptance_timestamp(value: str) -> datetime | None:
+        text = str(value or "").strip().replace("Z", "+00:00")
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    def evaluate_daily_acceptance(
+        self,
+        trade_date: str,
+        *,
+        now: datetime | None = None,
+        calendar_state: bool | None = True,
+        ai_expected: bool = False,
+        ai_pending_stale_minutes: int = 30,
+        outcome_overdue_days: int = 2,
+        alert_origins=(),
+        alert_message=None,
+    ) -> dict:
+        trade_date = self._date_norm(trade_date)
+        current = now or _utcnow_naive()
+        if current.tzinfo is not None:
+            current = current.astimezone(timezone.utc).replace(tzinfo=None)
+        checked_at = current.isoformat()
+        findings: list[dict] = []
+
+        def finding(code: str, severity: str, message: str, *, count: int = 0, identities=()) -> None:
+            findings.append({
+                "code": code,
+                "severity": severity,
+                "message": message,
+                "count": int(count or 0),
+                "identities": sorted({str(item) for item in identities if str(item)}),
+            })
+
+        with self._connect() as db:
+            if calendar_state is None:
+                finding("calendar_unverified", "warning", "交易日状态未能确认，验收按未知处理")
+
+            snapshot = db.execute(
+                "SELECT * FROM daily_snapshot_meta WHERE trade_date=?",
+                (trade_date,),
+            ).fetchone()
+            if not snapshot:
+                finding("daily_snapshot_missing", "critical", "没有找到同日收盘快照")
+            else:
+                snapshot = dict(snapshot)
+                snapshot_state = str(snapshot.get("state") or ("complete" if snapshot.get("complete") else "unknown"))
+                snapshot_quality = str(snapshot.get("quality") or "unknown")
+                if int(snapshot.get("complete") or 0) != 1 or snapshot_state != "complete" or snapshot_quality != "good":
+                    finding(
+                        "daily_snapshot_incomplete",
+                        "critical",
+                        f"同日收盘快照未通过完整性门控：state={snapshot_state}, quality={snapshot_quality}",
+                        identities=(snapshot_state, snapshot_quality),
+                    )
+
+            screen = db.execute(
+                "SELECT * FROM screen_runs WHERE actual_trade_date=? AND job_name IN ('automatic_close','daily_screen') "
+                "AND status='completed' ORDER BY finished_at DESC,started_at DESC LIMIT 1",
+                (trade_date,),
+            ).fetchone()
+            run_id = ""
+            candidate_count = 0
+            if not screen:
+                finding("candidate_freeze_missing", "critical", "收盘截止后仍没有同日已完成的冻结候选运行")
+            else:
+                screen = dict(screen)
+                run_id = str(screen.get("run_id") or "")
+                candidate_count = int(screen.get("candidate_count") or 0)
+                if str(screen.get("quality") or "unknown") != "good":
+                    finding(
+                        "candidate_run_low_quality",
+                        "critical",
+                        f"同日候选运行质量不是 good：{screen.get('quality') or 'unknown'}",
+                        identities=(screen.get("quality") or "unknown",),
+                    )
+                if candidate_count > 0:
+                    frozen_count = int(db.execute(
+                        "SELECT COUNT(*) FROM recommendation_records WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()[0])
+                    if frozen_count != candidate_count:
+                        finding(
+                            "recommendation_freeze_mismatch",
+                            "critical",
+                            f"候选数与冻结推荐数不一致：candidate={candidate_count}, frozen={frozen_count}",
+                            count=abs(candidate_count - frozen_count),
+                        )
+
+            if ai_expected and run_id and candidate_count > 0:
+                ai_batch = db.execute(
+                    "SELECT * FROM recommendation_ai_review_batches WHERE run_id=? ORDER BY requested_at DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if not ai_batch:
+                    finding("ai_review_missing", "warning", "候选已冻结，但没有同批 AI 影子评审记录")
+                else:
+                    ai_batch = dict(ai_batch)
+                    ai_status = str(ai_batch.get("status") or "unknown")
+                    if ai_status in {"unknown", "failed"}:
+                        reason = str(ai_batch.get("error") or ai_status)
+                        finding("ai_review_terminal_problem", "warning", f"AI 影子评审状态为 {ai_status}：{reason}", identities=(ai_status, reason))
+                    elif ai_status == "pending":
+                        requested_at = self._acceptance_timestamp(ai_batch.get("requested_at"))
+                        age_minutes = None if requested_at is None else max(0, int((current - requested_at).total_seconds() // 60))
+                        if age_minutes is None or age_minutes >= max(1, int(ai_pending_stale_minutes)):
+                            finding("ai_review_stale_pending", "warning", f"AI 影子评审 pending 已超时：{age_minutes if age_minutes is not None else 'unknown'} 分钟")
+
+            cutoff = (datetime.strptime(trade_date, "%Y-%m-%d").date() - timedelta(days=max(0, int(outcome_overdue_days)))).isoformat()
+            blocked = list(db.execute(
+                "SELECT COALESCE(NULLIF(o.reason,''),'unknown_reason') AS reason,o.horizon,COUNT(*) AS n "
+                "FROM recommendation_outcomes o JOIN recommendation_records r ON r.recommendation_id=o.recommendation_id "
+                "WHERE r.recommended_date<=? AND o.status IN ('unknown','unknown_order') "
+                "GROUP BY reason,o.horizon ORDER BY reason,o.horizon",
+                (cutoff,),
+            ))
+            if blocked:
+                identities = [f"{row['reason']}:T+{row['horizon']}" for row in blocked]
+                detail = "；".join(f"{row['reason']} T+{row['horizon']}={row['n']}" for row in blocked[:8])
+                total = sum(int(row["n"]) for row in blocked)
+                finding("recommendation_outcomes_blocked", "warning", f"到期推荐结果仍不可验证：{detail}", count=total, identities=identities)
+
+            overdue_pending = list(db.execute(
+                "SELECT o.horizon,COALESCE(NULLIF(o.reason,''),'unknown_reason') AS reason,COUNT(*) AS n "
+                "FROM recommendation_outcomes o JOIN recommendation_records r ON r.recommendation_id=o.recommendation_id "
+                "WHERE o.status='pending' AND julianday(?) - julianday(r.recommended_date) > (o.horizon * 2 + ?) "
+                "GROUP BY o.horizon,reason ORDER BY o.horizon,reason",
+                (trade_date, max(0, int(outcome_overdue_days))),
+            ))
+            if overdue_pending:
+                identities = [f"{row['reason']}:T+{row['horizon']}" for row in overdue_pending]
+                detail = "；".join(f"{row['reason']} T+{row['horizon']}={row['n']}" for row in overdue_pending[:8])
+                total = sum(int(row["n"]) for row in overdue_pending)
+                finding("recommendation_outcomes_overdue", "warning", f"推荐结果 pending 超过宽限期：{detail}", count=total, identities=identities)
+
+            severity_rank = {"warning": 1, "critical": 2}
+            status = "healthy"
+            if findings:
+                status = max((item["severity"] for item in findings), key=lambda value: severity_rank.get(value, 0))
+            identity_payload = [
+                {"code": item["code"], "identities": item["identities"]}
+                for item in sorted(findings, key=lambda item: item["code"])
+            ]
+            fingerprint = "healthy" if not identity_payload else hashlib.sha256(
+                json.dumps(identity_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            summary = "每日链路验收通过" if not findings else f"每日链路验收发现 {len(findings)} 类异常"
+            findings_json = json.dumps(findings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute("SELECT * FROM daily_acceptance_state WHERE scope='global'").fetchone()
+            previous_fingerprint = str(previous["fingerprint"] or "") if previous else ""
+            changed = previous is None or previous_fingerprint != fingerprint
+            event_id = ""
+            event_kind = ""
+            if changed and (findings or (previous and previous_fingerprint != "healthy")):
+                event_kind = "anomaly" if findings else "recovery"
+                event_id = "acceptance:" + hashlib.sha256(
+                    f"{trade_date}|{previous_fingerprint}|{fingerprint}|{checked_at}".encode("utf-8")
+                ).hexdigest()[:32]
+                db.execute(
+                    "INSERT INTO daily_acceptance_events(event_id,trade_date,event_kind,previous_fingerprint,fingerprint,status,summary,findings_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (event_id, trade_date, event_kind, previous_fingerprint, fingerprint, status, summary, findings_json, checked_at),
+                )
+                origins = sorted({str(origin or "").strip() for origin in alert_origins if str(origin or "").strip()})
+                if origins:
+                    if not callable(alert_message):
+                        raise ValueError("daily acceptance alert formatter is required for destinations")
+                    payload = str(alert_message({
+                        "trade_date": trade_date, "status": status,
+                        "event_kind": event_kind, "findings": findings,
+                    }) or "").strip()
+                    if not payload:
+                        raise ValueError("daily acceptance alert payload is empty")
+                    payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                    for origin in origins:
+                        alert_id = "daa:" + hashlib.sha256(f"{event_id}|{origin}".encode("utf-8")).hexdigest()[:32]
+                        db.execute(
+                            "INSERT INTO daily_acceptance_alerts(alert_id,event_id,trade_date,origin,payload,payload_hash,state,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',?,?)",
+                            (alert_id, event_id, trade_date, origin, payload, payload_hash, checked_at, checked_at),
+                        )
+            previous_run = db.execute("SELECT changed_at,event_id FROM daily_acceptance_runs WHERE trade_date=?", (trade_date,)).fetchone()
+            changed_at = checked_at if changed or not previous_run else str(previous_run["changed_at"])
+            run_event_id = event_id or (str(previous_run["event_id"] or "") if previous_run and previous_fingerprint == fingerprint else "")
+            db.execute(
+                "INSERT INTO daily_acceptance_runs(trade_date,checked_at,status,fingerprint,summary,findings_json,event_id,changed_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(trade_date) DO UPDATE SET checked_at=excluded.checked_at,status=excluded.status,fingerprint=excluded.fingerprint,summary=excluded.summary,findings_json=excluded.findings_json,event_id=excluded.event_id,changed_at=excluded.changed_at",
+                (trade_date, checked_at, status, fingerprint, summary, findings_json, run_event_id, changed_at),
+            )
+            db.execute(
+                "INSERT INTO daily_acceptance_state(scope,trade_date,status,fingerprint,event_id,updated_at) VALUES('global',?,?,?,?,?) "
+                "ON CONFLICT(scope) DO UPDATE SET trade_date=excluded.trade_date,status=excluded.status,fingerprint=excluded.fingerprint,event_id=excluded.event_id,updated_at=excluded.updated_at",
+                (trade_date, status, fingerprint, event_id or (str(previous["event_id"] or "") if previous and not changed else ""), checked_at),
+            )
+        return {
+            "trade_date": trade_date,
+            "checked_at": checked_at,
+            "status": status,
+            "fingerprint": fingerprint,
+            "summary": summary,
+            "findings": findings,
+            "changed": changed,
+            "event_id": event_id,
+            "event_kind": event_kind,
+        }
+
+    def prepare_daily_acceptance_alerts(self, event_id: str, origins, payload: str) -> int:
+        event_id = str(event_id or "").strip()
+        payload = str(payload or "").strip()
+        if not event_id or not payload:
+            return 0
+        now_text = _utcnow_naive().isoformat()
+        payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        prepared = 0
+        with self._connect() as db:
+            event = db.execute("SELECT trade_date FROM daily_acceptance_events WHERE event_id=?", (event_id,)).fetchone()
+            if not event:
+                return 0
+            for origin in sorted({str(item or "").strip() for item in origins or () if str(item or "").strip()}):
+                alert_id = "daa:" + hashlib.sha256(f"{event_id}|{origin}".encode("utf-8")).hexdigest()[:32]
+                prepared += db.execute(
+                    "INSERT OR IGNORE INTO daily_acceptance_alerts(alert_id,event_id,trade_date,origin,payload,payload_hash,state,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',?,?)",
+                    (alert_id, event_id, str(event["trade_date"]), origin, payload, payload_hash, now_text, now_text),
+                ).rowcount
+        return prepared
+
+    def recoverable_daily_acceptance_alerts(self, *, limit: int = 100, max_attempts: int = 5, retry_window_seconds: int = 3600, now=None) -> list[dict]:
+        current = self._automatic_delivery_clock(now)
+        now_text = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute(
+                "UPDATE daily_acceptance_alerts SET state='unknown_delivery',lease_owner='',lease_expires_at=0,next_retry_at=0,last_error=CASE WHEN last_error='' THEN 'delivery outcome unknown after sender interruption' ELSE last_error END,updated_at=? WHERE state='sending' AND lease_expires_at<=?",
+                (now_text, current),
+            )
+            rows = db.execute(
+                "SELECT * FROM daily_acceptance_alerts WHERE state IN ('pending','failed') AND attempts<? AND next_retry_at<=? AND (? - CAST(strftime('%s',created_at) AS REAL))<=? ORDER BY created_at,alert_id LIMIT ?",
+                (max(1, int(max_attempts)), current, current, max(60, int(retry_window_seconds)), max(1, min(int(limit), 500))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def claim_daily_acceptance_alert(self, alert_id: str, owner: str, *, ttl_seconds: float = 120, now=None) -> dict:
+        current = self._automatic_delivery_clock(now)
+        owner = str(owner or "").strip()
+        if not owner:
+            raise ValueError("daily acceptance alert owner is required")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM daily_acceptance_alerts WHERE alert_id=?", (str(alert_id),)).fetchone()
+            if not row:
+                raise KeyError(f"unknown daily acceptance alert {alert_id}")
+            active = db.execute("SELECT event_id FROM daily_acceptance_state WHERE scope='global'").fetchone()
+            if not active or str(active["event_id"] or "") != str(row["event_id"]):
+                if str(row["state"]) in {"pending", "failed"}:
+                    db.execute(
+                        "UPDATE daily_acceptance_alerts SET state='cancelled',last_error='superseded acceptance event',updated_at=? WHERE alert_id=?",
+                        (_utcnow_naive().isoformat(), str(alert_id)),
+                    )
+                return {"acquired": False, "reason": "superseded"}
+            if str(row["state"]) not in {"pending", "failed"} or int(row["attempts"] or 0) >= 20 or float(row["next_retry_at"] or 0) > current:
+                return {"acquired": False, "reason": str(row["state"]), **dict(row)}
+            fence = int(row["lease_fence"] or 0) + 1
+            changed = db.execute(
+                "UPDATE daily_acceptance_alerts SET state='sending',attempts=attempts+1,lease_owner=?,lease_fence=?,lease_expires_at=?,updated_at=? WHERE alert_id=? AND state IN ('pending','failed')",
+                (owner, fence, current + max(5, float(ttl_seconds)), _utcnow_naive().isoformat(), str(alert_id)),
+            ).rowcount
+            refreshed = dict(db.execute("SELECT * FROM daily_acceptance_alerts WHERE alert_id=?", (str(alert_id),)).fetchone())
+            return {"acquired": changed == 1, "fence": fence, **refreshed}
+
+    def finish_daily_acceptance_alert(self, alert_id: str, owner: str, fence: int, *, sent: bool, error: str = "", retry_after_seconds: float = 60, max_attempts: int = 5, retry_window_seconds: int = 3600, now=None) -> dict:
+        current = self._automatic_delivery_clock(now)
+        now_text = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM daily_acceptance_alerts WHERE alert_id=?", (str(alert_id),)).fetchone()
+            if not row or str(row["state"]) != "sending" or str(row["lease_owner"]) != str(owner) or int(row["lease_fence"] or 0) != int(fence):
+                raise RuntimeError("daily acceptance alert lease lost")
+            if sent:
+                state, next_retry_at, sent_at = "sent", 0, now_text
+            else:
+                created = self._acceptance_timestamp(row["created_at"])
+                age = 0 if created is None else max(0, current - created.replace(tzinfo=timezone.utc).timestamp())
+                terminal = int(row["attempts"] or 0) >= max(1, int(max_attempts)) or age >= max(60, int(retry_window_seconds))
+                state, next_retry_at, sent_at = ("cancelled", 0, None) if terminal else ("failed", current + max(1, float(retry_after_seconds)), None)
+            db.execute(
+                "UPDATE daily_acceptance_alerts SET state=?,lease_owner='',lease_expires_at=0,next_retry_at=?,last_error=?,updated_at=?,sent_at=COALESCE(?,sent_at) WHERE alert_id=?",
+                (state, next_retry_at, str(error or "")[:500], now_text, sent_at, str(alert_id)),
+            )
+            return dict(db.execute("SELECT * FROM daily_acceptance_alerts WHERE alert_id=?", (str(alert_id),)).fetchone())
+
+    def mark_daily_acceptance_alert_unknown(self, alert_id: str, owner: str, fence: int, *, error: str = "", now=None) -> dict:
+        current = self._automatic_delivery_clock(now)
+        with self._connect() as db:
+            changed = db.execute(
+                "UPDATE daily_acceptance_alerts SET state='unknown_delivery',lease_owner='',lease_expires_at=0,next_retry_at=0,last_error=?,updated_at=? WHERE alert_id=? AND state='sending' AND lease_owner=? AND lease_fence=? AND lease_expires_at>?",
+                (str(error or "delivery outcome unknown")[:500], _utcnow_naive().isoformat(), str(alert_id), str(owner), int(fence), current),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("daily acceptance unknown-delivery marker lost ownership")
+            return dict(db.execute("SELECT * FROM daily_acceptance_alerts WHERE alert_id=?", (str(alert_id),)).fetchone())
+
+    def cancel_daily_acceptance_alert(self, alert_id: str, reason: str) -> bool:
+        with self._connect() as db:
+            return db.execute(
+                "UPDATE daily_acceptance_alerts SET state='cancelled',lease_owner='',lease_expires_at=0,last_error=?,updated_at=? WHERE alert_id=? AND state IN ('pending','failed')",
+                (str(reason or "cancelled")[:500], _utcnow_naive().isoformat(), str(alert_id)),
+            ).rowcount == 1
+
+    def daily_acceptance_alert_summary(self) -> dict[str, int]:
+        with self._connect() as db:
+            rows = db.execute("SELECT state,COUNT(*) FROM daily_acceptance_alerts GROUP BY state").fetchall()
+        result = {state: 0 for state in ("pending", "sending", "sent", "failed", "unknown_delivery", "cancelled")}
+        result.update({str(row[0]): int(row[1]) for row in rows})
+        return result
+
+    def latest_daily_acceptance(self) -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM daily_acceptance_runs ORDER BY trade_date DESC,checked_at DESC LIMIT 1").fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            try:
+                result["findings"] = json.loads(str(result.get("findings_json") or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["findings"] = []
+            return result
+
     def latest_screen_candidates(self, limit: int = 30, scope: str = "global") -> list[dict]:
         with self._connect() as db:
             active = db.execute("SELECT * FROM active_candidate_runs WHERE scope=?", (scope or "global",)).fetchone()
@@ -5840,7 +8601,8 @@ class StockStore:
             # active pointer. Legacy rows have coverage=0 and keep the v0.10
             # compatibility fallback below.
             empty = db.execute(
-                "SELECT started_at FROM screen_runs WHERE status='completed' AND candidate_count=0 AND coverage>=0.8 "
+                "SELECT started_at FROM screen_runs WHERE status='completed' AND quality='good' AND candidate_count=0 "
+                "AND (coverage>=0.8 OR (CASE WHEN json_valid(diagnostics) THEN json_extract(diagnostics,'$.valid_empty') ELSE 0 END)=1) "
                 "ORDER BY started_at DESC LIMIT 1"
             ).fetchone()
             if empty:
@@ -5860,8 +8622,45 @@ class StockStore:
                 (max(1, min(int(limit), 100)),
             ))]
 
+    def latest_screen_candidates_for_intraday(self, limit: int = 30, scope: str = "global") -> list[dict]:
+        """Read the active candidate run even when its plan is expired.
+
+        Expired rows are returned only for a durable invalidation notice; the
+        caller must still reject them as opportunity targets.
+        """
+        with self._connect() as db:
+            active = db.execute("SELECT * FROM active_candidate_runs WHERE scope=?", (scope or "global",)).fetchone()
+            if not active:
+                return []
+            rows = db.execute(
+                "SELECT c.*,r.actual_trade_date,r.source,r.quality,r.status,r.coverage,a.valid_until FROM screen_candidates c "
+                "JOIN screen_runs r ON r.run_id=c.run_id JOIN active_candidate_runs a ON a.run_id=c.run_id AND a.scope=? "
+                "WHERE c.run_id=? ORDER BY c.score DESC,c.code ASC LIMIT ?",
+                (scope or "global", str(active["run_id"]), max(1, min(int(limit), 100))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def current_intraday_candidate(self, code: str, scope: str = "global") -> dict | None:
+        """Return the currently published candidate for one code, if any.
+
+        Delivery uses this narrow lookup immediately before sending a queued
+        opportunity notification.  It deliberately does not treat a historic
+        candidate row as current merely because its outbox row is recoverable.
+        """
+        code_value = str(code or "").strip()
+        if not code_value:
+            return None
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT c.*,r.actual_trade_date,r.source,r.quality,r.status,r.coverage,a.valid_until FROM screen_candidates c "
+                "JOIN screen_runs r ON r.run_id=c.run_id JOIN active_candidate_runs a ON a.run_id=c.run_id AND a.scope=? "
+                "WHERE c.run_id=a.run_id AND c.code=? LIMIT 1",
+                (scope or "global", code_value),
+            ).fetchone()
+            return dict(row) if row else None
+
     def begin_job(self, job_key: str, job_name: str, trade_date: str, lease_seconds: int = 900) -> bool:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow_naive().isoformat()
         with self._connect() as db:
             try:
                 db.execute("INSERT INTO job_runs(job_key,job_name,trade_date,started_at,status) VALUES(?,?,?,?,?)", (job_key, job_name, trade_date, now, "running"))
@@ -5871,7 +8670,7 @@ class StockStore:
                 stale = False
                 if row and str(row[0]) == "running":
                     try:
-                        stale = (datetime.utcnow() - datetime.fromisoformat(str(row[1]))).total_seconds() >= max(60, int(lease_seconds))
+                        stale = (_utcnow_naive() - datetime.fromisoformat(str(row[1]))).total_seconds() >= max(60, int(lease_seconds))
                     except (TypeError, ValueError):
                         stale = True
                 if row and (str(row[0]) == "failed" or stale):
@@ -5879,9 +8678,130 @@ class StockStore:
                     return True
                 return False
 
+    def job_run(self, job_key: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key or ""),)).fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def _automatic_job_time(value: str | None, fallback: float) -> float:
+        try:
+            parsed = datetime.fromisoformat(str(value or ""))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError):
+            return fallback
+
+    def claim_automatic_close_job(
+        self,
+        job_key: str,
+        trade_date: str,
+        *,
+        lease_seconds: int = 900,
+        max_attempts: int = 6,
+        retry_window_seconds: int = 14400,
+        now=None,
+    ) -> dict:
+        current = self._automatic_delivery_clock(now)
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
+            if not row:
+                db.execute(
+                    "INSERT INTO job_runs(job_key,job_name,trade_date,started_at,status,automatic_attempts,automatic_first_started_at,automatic_next_retry_at) VALUES(?,?,?,?,?,?,?,0)",
+                    (str(job_key), "automatic_close", str(trade_date), now_text, "running", 1, now_text),
+                )
+                value = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
+                return {**dict(value), "acquired": True, "reason": "started"}
+            value = dict(row)
+            status = str(value.get("status") or "")
+            if status in {"completed", "missed", "cancelled"}:
+                return {**value, "acquired": False, "reason": status}
+            started = self._automatic_job_time(value.get("started_at"), current)
+            if status == "running" and current - started < max(60, int(lease_seconds)):
+                return {**value, "acquired": False, "reason": "contended"}
+            if status == "failed" and float(value.get("automatic_next_retry_at") or 0) > current:
+                return {**value, "acquired": False, "reason": "backoff"}
+            attempts = max(0, int(value.get("automatic_attempts") or 0))
+            first_started = self._automatic_job_time(value.get("automatic_first_started_at") or value.get("started_at"), current)
+            if attempts >= max(1, int(max_attempts)) or current - first_started >= max(300, int(retry_window_seconds)):
+                reason = "automatic close retry bounds exhausted"
+                db.execute(
+                    "UPDATE job_runs SET finished_at=?,status='missed',error=?,automatic_terminal_reason=?,automatic_next_retry_at=0 WHERE job_key=?",
+                    (now_text, reason, reason, str(job_key)),
+                )
+                terminal = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
+                return {**dict(terminal), "acquired": False, "reason": "missed"}
+            db.execute(
+                "UPDATE job_runs SET started_at=?,finished_at=NULL,status='running',error=NULL,automatic_attempts=?,automatic_first_started_at=COALESCE(automatic_first_started_at,?),automatic_next_retry_at=0 WHERE job_key=?",
+                (now_text, attempts + 1, now_text, str(job_key)),
+            )
+            claimed = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
+            return {**dict(claimed), "acquired": True, "reason": "resumed"}
+
+    def finish_automatic_close_job(
+        self,
+        job_key: str,
+        *,
+        status: str,
+        error: str | None = None,
+        retry_after_seconds: int = 300,
+        max_attempts: int = 6,
+        retry_window_seconds: int = 14400,
+        now=None,
+    ) -> dict:
+        current = self._automatic_delivery_clock(now)
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
+            if not row:
+                raise KeyError(f"unknown automatic close job {job_key}")
+            value = dict(row)
+            final_status = str(status or "failed")
+            terminal_reason = ""
+            next_retry = 0.0
+            if final_status == "failed":
+                attempts = max(0, int(value.get("automatic_attempts") or 0))
+                first_started = self._automatic_job_time(value.get("automatic_first_started_at") or value.get("started_at"), current)
+                if attempts >= max(1, int(max_attempts)) or current - first_started >= max(300, int(retry_window_seconds)):
+                    final_status = "missed"
+                    terminal_reason = "automatic close retry bounds exhausted"
+                else:
+                    next_retry = current + max(30, min(int(retry_after_seconds), 3600))
+            db.execute(
+                "UPDATE job_runs SET finished_at=?,status=?,error=?,automatic_next_retry_at=?,automatic_terminal_reason=? WHERE job_key=?",
+                (now_text, final_status, error, next_retry, terminal_reason, str(job_key)),
+            )
+            finished = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
+            return dict(finished)
+
+    def terminalize_prior_automatic_close_jobs(self, current_date: str, *, reason: str, limit: int = 20, now=None) -> list[dict]:
+        current = self._automatic_delivery_clock(now)
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            keys = [str(row[0]) for row in db.execute(
+                "SELECT job_key FROM job_runs WHERE job_name='automatic_close' AND trade_date<? AND status IN ('running','failed') ORDER BY trade_date,started_at LIMIT ?",
+                (str(current_date), max(1, min(int(limit), 100))),
+            )]
+            if not keys:
+                return []
+            placeholders = ",".join("?" for _ in keys)
+            db.execute(
+                f"UPDATE job_runs SET finished_at=?,status='missed',error=?,automatic_terminal_reason=?,automatic_next_retry_at=0 WHERE job_key IN ({placeholders})",
+                (now_text, str(reason)[:500], str(reason)[:500], *keys),
+            )
+            return [dict(row) for row in db.execute(
+                f"SELECT * FROM job_runs WHERE job_key IN ({placeholders}) ORDER BY trade_date,started_at",
+                keys,
+            )]
+
     def finish_job(self, job_key: str, status: str = "completed", error: str | None = None) -> None:
         with self._connect() as db:
-            db.execute("UPDATE job_runs SET finished_at=?, status=?, error=? WHERE job_key=?", (datetime.utcnow().isoformat(), status, error, job_key))
+            db.execute("UPDATE job_runs SET finished_at=?, status=?, error=? WHERE job_key=?", (_utcnow_naive().isoformat(), status, error, job_key))
 
     def save_calendar(
         self,
@@ -5910,8 +8830,8 @@ class StockStore:
             status = "unknown"
         is_open_value = 1 if status == "open" else 0
         if expires_at is None:
-            expires_at = (datetime.utcnow() + timedelta(seconds=max(0, int(ttl_seconds)))).isoformat()
-        now = datetime.utcnow().isoformat()
+            expires_at = (_utcnow_naive() + timedelta(seconds=max(0, int(ttl_seconds)))).isoformat()
+        now = _utcnow_naive().isoformat()
         with self._connect() as db:
             db.execute(
                 "INSERT INTO trading_calendar(trade_date,is_open,status,source,fetched_at,expires_at) VALUES(?,?,?,?,?,?) "
@@ -5948,7 +8868,7 @@ class StockStore:
         """
         with self._connect() as db:
             row = db.execute("SELECT * FROM trading_calendar WHERE trade_date=?", (trade_date,)).fetchone()
-        current = now or datetime.utcnow()
+        current = now or _utcnow_naive()
         if current.tzinfo is not None:
             current = current.astimezone(timezone.utc).replace(tzinfo=None)
         if not row:
@@ -5969,7 +8889,7 @@ class StockStore:
         start, end = self._date_norm(start_date), self._date_norm(end_date)
         if not start or not end or start > end:
             return {}
-        current = now or datetime.utcnow()
+        current = now or _utcnow_naive()
         if current.tzinfo is not None:
             current = current.astimezone(timezone.utc).replace(tzinfo=None)
         with self._connect() as db:
@@ -6044,7 +8964,7 @@ class StockStore:
             db.execute(
                 "INSERT INTO result_evaluations(evaluation_id,run_id,code,as_of,horizon,status,close,return_pct,mfe_pct,mae_pct,first_touch,sample_complete,created_at,price_basis,plan_validated,evaluation_dataset_id,evaluation_batch_id,evaluation_generation) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(evaluation_id) DO UPDATE SET status=excluded.status,close=excluded.close,return_pct=excluded.return_pct,mfe_pct=excluded.mfe_pct,mae_pct=excluded.mae_pct,first_touch=excluded.first_touch,sample_complete=excluded.sample_complete,price_basis=excluded.price_basis,plan_validated=excluded.plan_validated,evaluation_dataset_id=excluded.evaluation_dataset_id,evaluation_batch_id=excluded.evaluation_batch_id,evaluation_generation=excluded.evaluation_generation,created_at=excluded.created_at",
-                (evaluation_id, run_id, code, as_of, int(horizon), status, close, return_pct, mfe_pct, mae_pct, first_touch, int(sample_complete), datetime.utcnow().isoformat(), str(price_basis or "unknown").strip().lower(), int(bool(plan_validated)), str(evaluation_dataset_id).strip() if evaluation_dataset_id else None, str(evaluation_batch_id).strip() if evaluation_batch_id else None, generation),
+                (evaluation_id, run_id, code, as_of, int(horizon), status, close, return_pct, mfe_pct, mae_pct, first_touch, int(sample_complete), _utcnow_naive().isoformat(), str(price_basis or "unknown").strip().lower(), int(bool(plan_validated)), str(evaluation_dataset_id).strip() if evaluation_dataset_id else None, str(evaluation_batch_id).strip() if evaluation_batch_id else None, generation),
             )
 
     def evaluations(self, run_id: str | None = None, limit: int = 50) -> list[dict]:
@@ -6056,12 +8976,12 @@ class StockStore:
             return [dict(row) for row in rows]
 
     def mark_news_seen(self, fingerprint: str, keep_days: int = 14) -> bool:
-        cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
+        cutoff = (_utcnow_naive() - timedelta(days=keep_days)).isoformat()
         with self._connect() as db:
             db.execute("DELETE FROM seen_news WHERE created_at < ?", (cutoff,))
             if db.execute("SELECT 1 FROM seen_news WHERE fingerprint=?", (fingerprint,)).fetchone():
                 return False
-            db.execute("INSERT INTO seen_news VALUES (?, ?)", (fingerprint, datetime.utcnow().isoformat()))
+            db.execute("INSERT INTO seen_news VALUES (?, ?)", (fingerprint, _utcnow_naive().isoformat()))
             return True
 
     def claim_signal(
@@ -6082,7 +9002,7 @@ class StockStore:
             else:
                 run_id, cooldown_seconds = cooldown_seconds, 600
         run_id = str(run_id or "legacy")
-        current = now or datetime.utcnow()
+        current = now or _utcnow_naive()
         if current.tzinfo is not None:
             current = current.astimezone(timezone.utc).replace(tzinfo=None)
         current_iso = current.isoformat()
@@ -6160,7 +9080,7 @@ class StockStore:
             max_gap_seconds = max(0, int(max_gap_seconds))
         except (TypeError, ValueError):
             max_gap_seconds = 0
-        current = now or datetime.utcnow()
+        current = now or _utcnow_naive()
         if current.tzinfo is not None:
             current = current.astimezone(timezone.utc).replace(tzinfo=None)
         current_iso = current.isoformat()
@@ -6204,3 +9124,494 @@ class StockStore:
         now: datetime | None = None,
     ) -> bool:
         return self.observe_confirmation(origin, code, required, max_gap_seconds, qualifies, now, run_id=run_id)
+
+    @staticmethod
+    def _intraday_event_key(origin: str, code: str, signal: str, plan_version: str, sequence: int) -> str:
+        digest = hashlib.sha256(f"{origin}\0{code}\0{signal}\0{plan_version}\0{sequence}".encode("utf-8")).hexdigest()
+        return f"intraday:{digest}"
+
+    @staticmethod
+    def _intraday_event_fields(event: dict | None) -> dict | None:
+        if event is None:
+            return None
+        values = {
+            "name": str(event.get("name") or "")[:120],
+            "run_id": str(event.get("run_id") or ""),
+            "invocation_id": str(event.get("invocation_id") or "").strip(),
+            "payload": str(event.get("payload") or ""),
+            "quote_fetched_at": str(event.get("quote_fetched_at") or ""),
+            "candidate_valid_until": str(event.get("candidate_valid_until") or ""),
+            "market_regime": str(event.get("market_regime") or ""),
+            "market_snapshot_at": str(event.get("market_snapshot_at") or ""),
+            "risk_event": int(bool(event.get("risk_event"))),
+        }
+        if not values["invocation_id"] or not values["payload"]:
+            raise ValueError("intraday event publication is incomplete")
+        return values
+
+    def _advance_intraday_signal_in_tx(
+        self,
+        db,
+        keys: tuple[str, str, str, str],
+        *,
+        qualifies: bool,
+        rearm_ready: bool,
+        required: int,
+        max_gap_seconds: float,
+        cooldown_seconds: float,
+        reason: str,
+        current: float,
+        now_text: str,
+        event: dict | None = None,
+        observation_time: float | None = None,
+    ) -> dict:
+        row = db.execute(
+            "SELECT * FROM intraday_signal_states WHERE origin=? AND code=? AND signal=? AND plan_version=?",
+            keys,
+        ).fetchone()
+        armed = bool(row["armed"]) if row else True
+        count = int(row["consecutive_count"] or 0) if row else 0
+        previous_observed = float(row["last_observed_at"] or 0) if row else 0.0
+        observed = observation_time if observation_time is not None else current
+        previous_triggered = float(row["last_triggered_at"] or 0) if row else 0.0
+        trigger_count = int(row["trigger_count"] or 0) if row else 0
+        outcome_reason = str(reason or "condition_false")[:300]
+        triggered = False
+        required_count = max(1, min(int(required), 20))
+        max_gap = max(1.0, min(float(max_gap_seconds), 3600.0))
+        cooldown = max(0.0, min(float(cooldown_seconds), 86400.0))
+
+        # A completed minute bar has one stable observation clock. Replaying
+        # that bar cannot manufacture the second independent confirmation.
+        if (qualifies and observation_time is not None and row and count > 0
+                and bool(row["last_condition"]) and observed <= previous_observed):
+            return {"origin": keys[0], "code": keys[1], "signal": keys[2],
+                    "plan_version": keys[3], "triggered": False, "armed": armed,
+                    "consecutive_count": count, "event_sequence": trigger_count,
+                    "reason": "duplicate_or_out_of_order_observation"}
+
+        if not qualifies:
+            count = 0
+            if rearm_ready:
+                armed = True
+                outcome_reason = "rearmed"
+        elif not armed:
+            count = 0
+            outcome_reason = "awaiting_hysteresis_rearm"
+        elif previous_triggered and current - previous_triggered < cooldown:
+            count = 0
+            outcome_reason = "cooldown"
+        else:
+            within_gap = (0 < observed - previous_observed <= max_gap if observation_time is not None
+                          else current - previous_observed <= max_gap)
+            count = count + 1 if previous_observed and within_gap else 1
+            if count >= required_count:
+                triggered = True
+                armed = False
+                count = 0
+                trigger_count += 1
+                previous_triggered = current
+                outcome_reason = "triggered"
+            else:
+                outcome_reason = f"debounce:{count}/{required_count}"
+
+        db.execute(
+            "INSERT INTO intraday_signal_states(origin,code,signal,plan_version,armed,consecutive_count,last_condition,last_observed_at,last_triggered_at,trigger_count,last_reason,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(origin,code,signal,plan_version) DO UPDATE SET "
+            "armed=excluded.armed,consecutive_count=excluded.consecutive_count,last_condition=excluded.last_condition,last_observed_at=excluded.last_observed_at,"
+            "last_triggered_at=excluded.last_triggered_at,trigger_count=excluded.trigger_count,last_reason=excluded.last_reason,updated_at=excluded.updated_at",
+            (*keys, int(armed), count, int(bool(qualifies)), observed, previous_triggered, trigger_count, outcome_reason, now_text),
+        )
+        result = {
+            "origin": keys[0], "code": keys[1], "signal": keys[2], "plan_version": keys[3],
+            "triggered": triggered, "armed": armed, "consecutive_count": count,
+            "event_sequence": trigger_count, "reason": outcome_reason,
+        }
+        if not triggered or event is None:
+            return result
+        event_key = self._intraday_event_key(*keys, trigger_count)
+        db.execute(
+            "INSERT OR IGNORE INTO intraday_event_outbox(event_key,origin,code,name,signal,plan_version,event_sequence,run_id,invocation_id,payload,payload_hash,quote_fetched_at,candidate_valid_until,market_regime,market_snapshot_at,risk_event,state,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)",
+            (
+                event_key, keys[0], keys[1], event["name"], keys[2], keys[3], trigger_count,
+                event["run_id"], event["invocation_id"], event["payload"],
+                hashlib.sha256(event["payload"].encode("utf-8")).hexdigest(),
+                event["quote_fetched_at"], event["candidate_valid_until"], event["market_regime"], event["market_snapshot_at"], event["risk_event"],
+                now_text, now_text,
+            ),
+        )
+        outbox = db.execute("SELECT * FROM intraday_event_outbox WHERE event_key=?", (event_key,)).fetchone()
+        if not outbox:
+            raise RuntimeError("intraday event intent was not persisted")
+        result["event_key"] = event_key
+        result["outbox"] = dict(outbox)
+        return result
+
+    def observe_intraday_signal(
+        self,
+        origin: str,
+        code: str,
+        signal: str,
+        plan_version: str,
+        *,
+        qualifies: bool,
+        rearm_ready: bool,
+        required: int = 2,
+        max_gap_seconds: float = 90,
+        cooldown_seconds: float = 1800,
+        reason: str = "",
+        now=None,
+    ) -> dict:
+        """Advance one durable debounce/hysteresis state machine."""
+        current = self._automatic_delivery_clock(now)
+        keys = tuple(str(value or "").strip() for value in (origin, code, signal, plan_version))
+        if not all(keys):
+            raise ValueError("intraday signal identity is incomplete")
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._advance_intraday_signal_in_tx(
+                db, keys, qualifies=qualifies, rearm_ready=rearm_ready, required=required,
+                max_gap_seconds=max_gap_seconds, cooldown_seconds=cooldown_seconds,
+                reason=reason, current=current, now_text=now_text,
+            )
+
+    def observe_and_enqueue_intraday_event(
+        self,
+        origin: str,
+        code: str,
+        signal: str,
+        plan_version: str,
+        *,
+        qualifies: bool,
+        rearm_ready: bool,
+        required: int = 2,
+        max_gap_seconds: float = 90,
+        cooldown_seconds: float = 1800,
+        reason: str = "",
+        name: str = "",
+        run_id: str = "",
+        invocation_id: str = "",
+        payload: str = "",
+        quote_fetched_at: str = "",
+        candidate_valid_until: str = "",
+        market_regime: str = "",
+        market_snapshot_at: str = "",
+        risk_event: bool = False,
+        observation_at=None,
+        now=None,
+    ) -> dict:
+        """Atomically persist a triggered FSM transition and its outbox intent."""
+        current = self._automatic_delivery_clock(now)
+        observation_time = self._automatic_delivery_clock(observation_at) if observation_at is not None else None
+        if observation_time is not None and observation_time > current:
+            raise ValueError("intraday observation is in the future")
+        keys = tuple(str(value or "").strip() for value in (origin, code, signal, plan_version))
+        if not all(keys):
+            raise ValueError("intraday signal identity is incomplete")
+        event = self._intraday_event_fields({
+            "name": name, "run_id": run_id, "invocation_id": invocation_id, "payload": payload,
+            "quote_fetched_at": quote_fetched_at, "candidate_valid_until": candidate_valid_until,
+            "market_regime": market_regime, "market_snapshot_at": market_snapshot_at,
+            "risk_event": risk_event,
+        })
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._advance_intraday_signal_in_tx(
+                db, keys, qualifies=qualifies, rearm_ready=rearm_ready, required=required,
+                max_gap_seconds=max_gap_seconds, cooldown_seconds=cooldown_seconds,
+                reason=reason, current=current, now_text=now_text, event=event,
+                observation_time=observation_time,
+            )
+
+    def invalidate_intraday_observations(
+        self,
+        origin: str,
+        code: str,
+        plan_version: str,
+        reason: str,
+        *,
+        keep_signals=None,
+        now=None,
+    ) -> int:
+        """Break debounce continuity when critical evidence is unavailable."""
+        current = self._automatic_delivery_clock(now)
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        keep = sorted({str(value or "").strip() for value in (keep_signals or ()) if str(value or "").strip()})
+        clauses = ["origin=?", "code=?", "plan_version=?"]
+        values = [str(origin), str(code), str(plan_version)]
+        if keep:
+            clauses.append("signal NOT IN (" + ",".join("?" for _ in keep) + ")")
+            values.extend(keep)
+        with self._connect() as db:
+            return db.execute(
+                "UPDATE intraday_signal_states SET consecutive_count=0,last_condition=0,last_observed_at=?,last_reason=?,updated_at=? "
+                "WHERE " + " AND ".join(clauses),
+                (
+                    current,
+                    str(reason or "critical_evidence_missing")[:300],
+                    now_text,
+                    *values,
+                ),
+            ).rowcount
+
+    def invalidate_intraday_target_states(self, targets, reason: str, *, now=None) -> int:
+        """Clear confirmation continuity for a bounded batch of skipped targets."""
+        current = self._automatic_delivery_clock(now)
+        now_text = datetime.fromtimestamp(current, timezone.utc).replace(tzinfo=None).isoformat()
+        rows = sorted({
+            (str(origin or "").strip(), str(code or "").strip(), str(plan_version or "").strip())
+            for origin, code, plan_version in (targets or ())
+            if str(origin or "").strip() and str(code or "").strip() and str(plan_version or "").strip()
+        })
+        if not rows:
+            return 0
+        changed = 0
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for origin, code, plan_version in rows:
+                changed += db.execute(
+                    "UPDATE intraday_signal_states SET consecutive_count=0,last_condition=0,last_observed_at=?,last_reason=?,updated_at=? "
+                    "WHERE origin=? AND code=? AND plan_version=?",
+                    (current, str(reason or "critical_evidence_missing")[:300], now_text, origin, code, plan_version),
+                ).rowcount
+        return changed
+
+    def enqueue_intraday_event(
+        self,
+        event_key: str,
+        *,
+        origin: str,
+        code: str,
+        name: str,
+        signal: str,
+        plan_version: str,
+        event_sequence: int,
+        run_id: str,
+        invocation_id: str,
+        payload: str,
+        quote_fetched_at: str = "",
+        candidate_valid_until: str = "",
+        market_regime: str = "",
+        market_snapshot_at: str = "",
+        risk_event: bool = False,
+    ) -> dict:
+        values = {
+            "event_key": str(event_key or "").strip(), "origin": str(origin or "").strip(),
+            "code": str(code or "").strip(), "signal": str(signal or "").strip(),
+            "plan_version": str(plan_version or "").strip(), "invocation_id": str(invocation_id or "").strip(),
+            "payload": str(payload or ""),
+        }
+        if not all(values.values()) or int(event_sequence) < 1:
+            raise ValueError("intraday event publication is incomplete")
+        now_text = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT OR IGNORE INTO intraday_event_outbox(event_key,origin,code,name,signal,plan_version,event_sequence,run_id,invocation_id,payload,payload_hash,quote_fetched_at,candidate_valid_until,market_regime,market_snapshot_at,risk_event,state,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)",
+                (
+                    values["event_key"], values["origin"], values["code"], str(name or "")[:120],
+                    values["signal"], values["plan_version"], int(event_sequence), str(run_id or ""),
+                    values["invocation_id"], values["payload"], hashlib.sha256(values["payload"].encode("utf-8")).hexdigest(),
+                    str(quote_fetched_at or ""), str(candidate_valid_until or ""), str(market_regime or ""), str(market_snapshot_at or ""), int(bool(risk_event)),
+                    now_text, now_text,
+                ),
+            )
+            row = db.execute("SELECT * FROM intraday_event_outbox WHERE event_key=?", (values["event_key"],)).fetchone()
+            return dict(row)
+
+    def recoverable_intraday_deliveries(
+        self,
+        *,
+        now=None,
+        limit: int = 100,
+        max_attempts: int = 5,
+        retry_window_seconds: float = 3600,
+    ) -> list[dict]:
+        current = self._automatic_delivery_clock(now)
+        cutoff = datetime.fromtimestamp(current - max(60.0, float(retry_window_seconds)), timezone.utc).replace(tzinfo=None).isoformat()
+        now_text = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE intraday_event_outbox SET state='unknown_delivery',lease_owner='',lease_expires_at=0,next_retry_at=0,"
+                "last_error=CASE WHEN last_error='' THEN 'delivery outcome unknown after sender interruption' ELSE last_error END,updated_at=? "
+                "WHERE state='sending' AND lease_expires_at<=?",
+                (now_text, current),
+            )
+            db.execute(
+                "UPDATE intraday_event_outbox SET state='cancelled',next_retry_at=0,last_error=CASE WHEN last_error='' THEN "
+                "'confirmed send failures exhausted retry bounds' ELSE last_error || '; retry bounds exhausted' END,updated_at=? "
+                "WHERE state='failed' AND (attempts>=? OR created_at<=?)",
+                (now_text, max(1, int(max_attempts)), cutoff),
+            )
+            db.execute(
+                "UPDATE intraday_event_outbox SET state='cancelled',next_retry_at=0,last_error='intraday event expired before delivery',updated_at=? "
+                "WHERE state='pending' AND created_at<=?",
+                (now_text, cutoff),
+            )
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM intraday_event_outbox WHERE state='pending' OR (state='failed' AND next_retry_at<=?) ORDER BY created_at,event_key LIMIT ?",
+                (current, max(1, min(int(limit), 1000))),
+            )]
+
+    def claim_intraday_delivery(self, event_key: str, owner: str, *, ttl_seconds: float = 120, now=None) -> dict:
+        current = self._automatic_delivery_clock(now)
+        ttl = max(5.0, min(float(ttl_seconds), 3600.0))
+        owner_value = str(owner or "").strip()[:160]
+        if not owner_value:
+            raise ValueError("intraday delivery owner is required")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM intraday_event_outbox WHERE event_key=?", (str(event_key),)).fetchone()
+            if not row:
+                raise KeyError(f"unknown intraday event {event_key}")
+            state = str(row["state"])
+            expiry = float(row["lease_expires_at"] or 0)
+            if state == "sending" and expiry <= current:
+                db.execute(
+                    "UPDATE intraday_event_outbox SET state='unknown_delivery',lease_owner='',lease_expires_at=0,next_retry_at=0,"
+                    "last_error=CASE WHEN last_error='' THEN 'delivery outcome unknown after sender interruption' ELSE last_error END,updated_at=? WHERE event_key=?",
+                    (_utcnow_naive().isoformat(), str(event_key)),
+                )
+                row = db.execute("SELECT * FROM intraday_event_outbox WHERE event_key=?", (str(event_key),)).fetchone()
+                return {**dict(row), "acquired": False, "reason": "unknown_delivery"}
+            if state in {"sent", "unknown_delivery", "cancelled"}:
+                return {**dict(row), "acquired": False, "reason": state}
+            if state == "sending":
+                return {**dict(row), "acquired": False, "reason": "contended"}
+            if state == "failed" and float(row["next_retry_at"] or 0) > current:
+                return {**dict(row), "acquired": False, "reason": "backoff"}
+            fence = int(row["lease_fence"] or 0) + 1
+            db.execute(
+                "UPDATE intraday_event_outbox SET state='sending',attempts=attempts+1,lease_owner=?,lease_fence=?,lease_expires_at=?,updated_at=? "
+                "WHERE event_key=? AND state IN ('pending','failed')",
+                (owner_value, fence, current + ttl, _utcnow_naive().isoformat(), str(event_key)),
+            )
+            refreshed = db.execute("SELECT * FROM intraday_event_outbox WHERE event_key=?", (str(event_key),)).fetchone()
+            return {**dict(refreshed), "acquired": True, "owner": owner_value, "fence": fence}
+
+    def finish_intraday_delivery(
+        self,
+        event_key: str,
+        owner: str,
+        fence: int,
+        *,
+        sent: bool,
+        error: str = "",
+        retry_after_seconds: float = 60,
+        max_attempts: int = 5,
+        retry_window_seconds: float = 3600,
+        now=None,
+    ) -> dict:
+        current = self._automatic_delivery_clock(now)
+        now_text = _utcnow_naive().isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT attempts,created_at FROM intraday_event_outbox WHERE event_key=?", (str(event_key),)).fetchone()
+            if not row:
+                raise KeyError(f"unknown intraday event {event_key}")
+            try:
+                created = datetime.fromisoformat(str(row["created_at"])).replace(tzinfo=timezone.utc).timestamp()
+            except (TypeError, ValueError):
+                created = current
+            exhausted = not sent and (int(row["attempts"] or 0) >= max(1, int(max_attempts)) or current - created >= max(60.0, float(retry_window_seconds)))
+            state = "sent" if sent else ("cancelled" if exhausted else "failed")
+            retry_at = 0.0 if sent or exhausted else current + max(1.0, min(float(retry_after_seconds), 3600.0))
+            final_error = str(error or "")[:500]
+            if exhausted:
+                final_error = (final_error + "; retry bounds exhausted").strip("; ")[:500]
+            changed = db.execute(
+                "UPDATE intraday_event_outbox SET state=?,lease_owner='',lease_expires_at=0,next_retry_at=?,last_error=?,updated_at=?,sent_at=? "
+                "WHERE event_key=? AND state='sending' AND lease_owner=? AND lease_fence=? AND lease_expires_at>?",
+                (state, retry_at, final_error, now_text, now_text if sent else None, str(event_key), str(owner), int(fence), current),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("intraday delivery acknowledgement lost ownership")
+            return dict(db.execute("SELECT * FROM intraday_event_outbox WHERE event_key=?", (str(event_key),)).fetchone())
+
+    def mark_intraday_delivery_unknown(self, event_key: str, owner: str, fence: int, *, error: str, now=None) -> dict:
+        current = self._automatic_delivery_clock(now)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE intraday_event_outbox SET state='unknown_delivery',lease_owner='',lease_expires_at=0,next_retry_at=0,last_error=?,updated_at=? "
+                "WHERE event_key=? AND state='sending' AND lease_owner=? AND lease_fence=? AND lease_expires_at>?",
+                (str(error or "delivery outcome unknown")[:500], _utcnow_naive().isoformat(), str(event_key), str(owner), int(fence), current),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("intraday unknown-delivery marker lost ownership")
+            return dict(db.execute("SELECT * FROM intraday_event_outbox WHERE event_key=?", (str(event_key),)).fetchone())
+
+    def cancel_intraday_delivery(self, event_key: str, reason: str, *, owner: str = "", fence: int = 0) -> bool:
+        """Cancel a queued event, including a lease held by this sender.
+
+        The owned-sending branch exists for pre-send validation: an event is
+        claimed first to fence concurrent recovery workers, then cancelled
+        before any transport call if its quote or plan is no longer valid.
+        """
+        owned = bool(str(owner or "").strip()) and int(fence or 0) > 0
+        with self._connect() as db:
+            if owned:
+                changed = db.execute(
+                    "UPDATE intraday_event_outbox SET state='cancelled',lease_owner='',lease_expires_at=0,next_retry_at=0,last_error=?,updated_at=? "
+                    "WHERE event_key=? AND (state IN ('pending','failed') OR (state='sending' AND lease_owner=? AND lease_fence=?))",
+                    (str(reason or "cancelled")[:500], _utcnow_naive().isoformat(), str(event_key), str(owner), int(fence)),
+                ).rowcount
+            else:
+                changed = db.execute(
+                    "UPDATE intraday_event_outbox SET state='cancelled',lease_owner='',lease_expires_at=0,next_retry_at=0,last_error=?,updated_at=? "
+                    "WHERE event_key=? AND state IN ('pending','failed')",
+                    (str(reason or "cancelled")[:500], _utcnow_naive().isoformat(), str(event_key)),
+                ).rowcount
+            return changed == 1
+
+    def cleanup_intraday_terminal_outbox(self, before: str, *, limit: int = 500) -> int:
+        """Delete a bounded set of explicitly terminal, old intraday rows.
+
+        Delivery-recovery/manual-review states are deliberately excluded:
+        ``pending``, ``sending``, ``failed`` and ``unknown_delivery`` remain
+        durable regardless of age.  Signal-state pruning is intentionally not
+        coupled here because an old FSM row can still be required by an active
+        candidate/plan; no safe proof exists at this storage boundary.
+        """
+        try:
+            cutoff = datetime.fromisoformat(str(before).strip().replace("Z", "+00:00"))
+            if cutoff.tzinfo is not None:
+                cutoff = cutoff.astimezone(timezone.utc).replace(tzinfo=None)
+            cutoff_text = cutoff.isoformat()
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("intraday terminal cleanup cutoff is invalid") from None
+        bounded = max(1, min(int(limit), 5000))
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                "DELETE FROM intraday_event_outbox WHERE event_key IN ("
+                "SELECT event_key FROM intraday_event_outbox "
+                "WHERE state IN ('sent','cancelled') AND updated_at<? "
+                "ORDER BY updated_at,event_key LIMIT ?)",
+                (cutoff_text, bounded),
+            )
+            return int(cursor.rowcount or 0)
+
+    def intraday_delivery_summary(self, origin: str | None = None) -> dict[str, int]:
+        with self._connect() as db:
+            if origin is None:
+                rows = db.execute("SELECT state,COUNT(*) FROM intraday_event_outbox GROUP BY state").fetchall()
+            else:
+                rows = db.execute("SELECT state,COUNT(*) FROM intraday_event_outbox WHERE origin=? GROUP BY state", (str(origin),)).fetchall()
+        result = {state: 0 for state in ("pending", "sending", "sent", "failed", "unknown_delivery", "cancelled")}
+        result.update({str(row[0]): int(row[1]) for row in rows})
+        return result
+
+    def recent_intraday_states(self, origin: str, limit: int = 10) -> list[dict]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT code,signal,plan_version,armed,consecutive_count,last_condition,last_observed_at,last_triggered_at,trigger_count,last_reason,updated_at "
+                "FROM intraday_signal_states WHERE origin=? ORDER BY updated_at DESC,code,signal LIMIT ?",
+                (str(origin), max(1, min(int(limit), 50))),
+            ).fetchall()
+            return [dict(row) for row in rows]

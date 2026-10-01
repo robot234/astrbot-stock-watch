@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import json
 import math
 import re
+import statistics
 import unicodedata
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -15,8 +16,13 @@ _RISK_LABELS = {
     "eligible": "可跟踪",
     "watch_only": "需复核",
     "blocked": "已拦截",
-    "unknown": "数据不足",
+    "unknown": "资料待核",
 }
+
+# A zone this far below the close observation is a conditional pullback
+# scenario, not a nearby setup. Keep the classification deterministic so a
+# persisted plan can be explained without moving its support level.
+DEEP_PULLBACK_WATCH_PCT = 10.0
 
 
 def risk_label(risk_level: str) -> str:
@@ -61,6 +67,14 @@ class Quote:
     indicator_last_close: float | None = None
     indicator_price_basis: str = "unknown"
     indicator_source: str = ""
+    corporate_action_factor: float | None = None
+    corporate_action_evidence: str = ""
+    corporate_action_observed_at: str = ""
+    corporate_action_response_sha256: str = ""
+    # Formal risk provenance is appended so legacy positional constructors stay valid.
+    st: bool | None = None
+    risk_source: str = ""
+    risk_scenario_version: str = ""
 
     @property
     def last_indicator_date(self) -> str:
@@ -116,6 +130,10 @@ class FactorOverlay:
     # after the legacy fields so existing positional construction remains
     # compatible with v0.11.0 payloads.
     current_industry_name: str = ""
+    fundamental_coverage: float = 0.0
+    fundamental_missing: tuple[str, ...] = ()
+    risk_factor_coverage: float = 0.0
+    risk_factor_missing: tuple[str, ...] = ()
 
     @property
     def adjustment(self) -> int:
@@ -126,7 +144,14 @@ class FactorOverlay:
 
 @dataclass(slots=True)
 class PricePlan:
-    """Reference levels for manual research; never an order or execution instruction."""
+    """A dated close reference, conditional watch zone, trigger and invalidation.
+
+    ``reference_price`` is the matching unadjusted daily-close observation.
+    ``attention_*`` is a setup-monitoring range, never an entry instruction;
+    a far-below range is explicitly a deep-pullback watch. ``confirmation``
+    is the observable upside trigger, while ``invalidation`` defeats the
+    setup. The object remains research-only and never authorizes an order.
+    """
 
     state: str
     reference_price: float
@@ -162,6 +187,9 @@ class MarketContext:
     declining: int
     total_amount: float
     evidence: list[str] = field(default_factory=list)
+    flat: int = 0
+    sample_size: int = 0
+    median_return: float | None = None
 
 
 def assess_market_context(quotes: Iterable[Quote]) -> MarketContext:
@@ -185,8 +213,62 @@ def assess_market_context(quotes: Iterable[Quote]) -> MarketContext:
         regime = "risk_off"
     else:
         regime = "neutral"
-    evidence = [f"上涨{advancing}只、下跌{declining}只、样本{len(rows)}只", f"上涨占比{breadth:.1%}"]
-    return MarketContext(regime, breadth, advancing, declining, sum(max(0.0, q.amount) for q in rows), evidence)
+    flat = max(0, len(rows) - advancing - declining)
+    median_return = statistics.median(float(q.pct_change) for q in rows) if rows else None
+    evidence = [
+        f"上涨{advancing}只、下跌{declining}只、平盘{flat}只、样本{len(rows)}只",
+        f"上涨占比{breadth:.1%}",
+    ]
+    if median_return is not None:
+        evidence.append(f"涨跌幅中位数{median_return:+.2f}%")
+    return MarketContext(
+        regime,
+        breadth,
+        advancing,
+        declining,
+        sum(max(0.0, q.amount) for q in rows),
+        evidence,
+        flat,
+        len(rows),
+        median_return,
+    )
+
+
+def candidate_rank_key(candidate: Candidate) -> tuple:
+    """Return one deterministic confidence-aware key for equal-score setups."""
+    quote = candidate.quote
+    risk_rank = {"eligible": 3, "watch_only": 2, "unknown": 1, "blocked": 0}
+    overlay = candidate.factor_overlay
+
+    def coverage(value) -> float:
+        try:
+            number = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return max(0.0, min(1.0, number)) if math.isfinite(number) else 0.0
+
+    fundamental_coverage = coverage(getattr(overlay, "fundamental_coverage", 0.0)) if overlay else 0.0
+    risk_coverage = coverage(getattr(overlay, "risk_factor_coverage", 0.0)) if overlay else 0.0
+    indicator_count = sum(
+        value is not None
+        for value in (quote.rsi6, quote.ma5, quote.ma10, quote.ma20, quote.momentum5, quote.momentum20, quote.atr14)
+    )
+    try:
+        amount = float(quote.amount or 0)
+        amount = amount if math.isfinite(amount) else 0.0
+    except (TypeError, ValueError, OverflowError):
+        amount = 0.0
+    return (
+        -int(candidate.score),
+        -int(candidate.base_score),
+        -risk_rank.get(candidate.risk_level, 0),
+        -fundamental_coverage,
+        -risk_coverage,
+        -max(0, int(quote.history_days or 0)),
+        -indicator_count,
+        -amount,
+        str(quote.code),
+    )
 
 
 @dataclass(slots=True)
@@ -532,6 +614,8 @@ def _plan_provenance(
     """Build the stable provenance shape persisted with every plan."""
     anchor = _finite_positive(reference_price)
     last_close = _finite_positive(getattr(quote, "indicator_last_close", None))
+    observed_at = getattr(quote, "provider_ts", None) or getattr(quote, "fetched_at", None)
+    observed_text = observed_at.isoformat() if isinstance(observed_at, datetime) else ""
     if deviation_pct is None and anchor is not None and last_close is not None:
         deviation_pct = abs(last_close - anchor) / anchor * 100
     return {
@@ -550,6 +634,7 @@ def _plan_provenance(
         "anchor_price": anchor,
         "reference_price": anchor,
         "anchor": anchor,
+        "reference_observed_at": observed_text,
         "reason": str(reason or ""),
     }
 
@@ -668,6 +753,20 @@ def validate_price_plan(
         tolerance_pct=tolerance,
         reference_price=reference,
     )
+    # These are descriptive metadata derived with the levels. They do not
+    # weaken validation, but preserving them keeps a persisted close plan
+    # explainable after the validation wrapper replaces its provenance.
+    prior_provenance = getattr(plan, "provenance", {}) if plan else {}
+    if isinstance(prior_provenance, dict):
+        kind = prior_provenance.get("attention_kind")
+        distance = _strict_nonnegative_number(prior_provenance.get("attention_distance_pct"))
+        observed_at = prior_provenance.get("reference_observed_at")
+        if kind in {"setup_monitoring", "deep_pullback_watch"}:
+            provenance["attention_kind"] = kind
+        if distance is not None:
+            provenance["attention_distance_pct"] = distance
+        if isinstance(observed_at, str):
+            provenance["reference_observed_at"] = observed_at[:64]
     failures: list[str] = []
     if context != "daily_close":
         failures.append("仅收盘日线计划可验证")
@@ -763,7 +862,18 @@ def build_price_plan(
     sell_high = sell_low + atr
     invalidation = max(0.01, support - atr)
     state = "invalidated" if price <= invalidation else "near_sell" if price >= sell_low else "confirmed" if price >= confirmation else "in_attention" if attention_low <= price <= attention_high else "between"
-    plan = PricePlan(state, price, rounded(atr), rounded(support), rounded(resistance), rounded(attention_low), rounded(attention_high), rounded(confirmation), rounded(sell_low), rounded(sell_high), rounded(invalidation), "good", evidence, _plan_provenance(quote, actual_date, context, tolerance_pct=tolerance_pct, reference_price=price), False)
+    attention_gap = max(0.0, (price - attention_high) / price * 100)
+    attention_kind = "deep_pullback_watch" if attention_gap >= DEEP_PULLBACK_WATCH_PCT else "setup_monitoring"
+    if attention_kind == "deep_pullback_watch":
+        evidence.append(f"风险区间距参考价{attention_gap:.1f}%，属于深回撤观察，非即时操作")
+    else:
+        evidence.append("风险区间为条件观察范围，不是即时操作指令")
+    provenance = _plan_provenance(quote, actual_date, context, tolerance_pct=tolerance_pct, reference_price=price)
+    provenance.update({
+        "attention_kind": attention_kind,
+        "attention_distance_pct": round(attention_gap, 6),
+    })
+    plan = PricePlan(state, price, rounded(atr), rounded(support), rounded(resistance), rounded(attention_low), rounded(attention_high), rounded(confirmation), rounded(sell_low), rounded(sell_high), rounded(invalidation), "good", evidence, provenance, False)
     return validate_price_plan(plan, quote, actual_date, tolerance_pct, context=context) if context == "daily_close" else plan
 
 
@@ -790,7 +900,43 @@ def format_plan_distance(plan: PricePlan | None, current_price) -> str:
     if distance is None:
         return ""
     absolute, percent = distance
+    if abs(percent) > 100:
+        return "现价与参考价偏离异常，距离未展示"
     return f"候选参考价{plan.reference_price:.2f}，实时当前价{float(current_price):.2f}，距离{absolute:+.2f}（{percent:+.2f}%）"
+
+
+def format_watch_range_distance(plan: PricePlan | None, current_price) -> str:
+    """Describe distance to a validated watch range without exposing bad levels."""
+    if not price_plan_is_validated(plan):
+        return ""
+    current = _finite_positive(current_price)
+    reference = _finite_positive(plan.reference_price)
+    low = _finite_positive(plan.attention_low)
+    high = _finite_positive(plan.attention_high)
+    if current is None or reference is None or low is None or high is None or low > high:
+        return "价位数据异常，距离未展示"
+    deviation = (current - reference) / reference * 100
+    if abs(deviation) > 100:
+        return "现价与参考价偏离异常，距离未展示"
+    if low <= current <= high:
+        return f"位于风险区间｜较参考价{deviation:+.1f}%"
+    boundary = low if current < low else high
+    distance = (current - boundary) / boundary * 100
+    direction = "低于" if current < low else "高于"
+    return f"{direction}风险区间{abs(distance):.1f}%｜较参考价{deviation:+.1f}%"
+
+
+def price_plan_attention_descriptor(plan: PricePlan | dict | None) -> str:
+    """Explain whether a validated plan's zone is nearby or deep-pullback only."""
+    getter = plan.get if isinstance(plan, dict) else (lambda name, default=None: getattr(plan, name, default))
+    reference = _finite_positive(getter("reference_price")) if plan is not None else None
+    high = _finite_positive(getter("attention_high")) if plan is not None else None
+    if reference is None or high is None or high > reference:
+        return "风险区间（非即时操作指令）"
+    distance = (reference - high) / reference * 100
+    if distance >= DEEP_PULLBACK_WATCH_PCT:
+        return f"深回撤风险区间（距参考价{distance:.1f}%，非即时操作指令）"
+    return "风险区间（非即时操作指令）"
 
 
 def _stored_plan_is_validated(plan: dict) -> bool:
@@ -839,6 +985,11 @@ def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
     elif quote.limit_up is None or quote.limit_down is None:
         flags.append("涨跌停状态未知")
         unknown_state = True
+    if quote.st is True:
+        flags.append("ST")
+    elif quote.st is None:
+        flags.append("ST状态未知")
+        unknown_state = True
     if not math.isfinite(float(quote.price)) or quote.price <= 0:
         flags.append("价格无效")
     plan = candidate.price_plan if candidate else None
@@ -850,7 +1001,7 @@ def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
         flags.append("技术趋势偏弱")
     if quote.volatility20 is not None and quote.volatility20 >= 0.08:
         flags.append("波动率偏高")
-    if flags and any(item in flags for item in ("停牌", "涨跌停", "价格无效", "跌破失效位")):
+    if flags and any(item in flags for item in ("停牌", "涨跌停", "ST", "价格无效", "跌破失效位")):
         return RiskReview("blocked", "high", flags, ["触发硬性交易状态过滤"])
     if unknown_state or not quote.history_days or quote.atr14 is None:
         return RiskReview("unknown", "unknown", flags + (["技术数据不完整"] if not quote.history_days or quote.atr14 is None else []), ["缺少足够行情状态或历史数据，不能判定风险"])
@@ -860,7 +1011,22 @@ def review_risk(quote: Quote, candidate: Candidate | None = None) -> RiskReview:
 
 
 def is_tradable(quote: Quote, price_min: float = 2, price_max: float = 80) -> bool:
-    return price_min <= quote.price <= price_max and quote.price > 0 and quote.suspended is not True and quote.limit_up is not True and quote.limit_down is not True
+    return (price_min <= quote.price <= price_max and quote.price > 0
+            and quote.suspended is not True and quote.limit_up is not True
+            and quote.limit_down is not True and quote.st is not True)
+
+
+def is_screenable(quote: Quote, price_min: float = 2, price_max: float = 80) -> bool:
+    """Full-market signals require explicitly validated, non-risk quote states.
+
+    ``is_tradable`` remains a broader mechanical helper for watchlist display.
+    A daily-screen signal must not promote a quote whose suspension, ST, or
+    limit-state evidence is absent or conflicted.
+    """
+    return is_tradable(quote, price_min, price_max) and all(
+        getattr(quote, field, None) is False
+        for field in ("suspended", "limit_up", "limit_down", "st")
+    )
 
 
 def score_quote(quote: Quote) -> Candidate:
@@ -939,6 +1105,50 @@ def _finite_format_number(value) -> float | None:
 def _format_pct_change(value) -> str:
     number = _finite_format_number(value)
     return f"{number:+.2f}%" if number is not None else "涨跌未记录"
+
+
+def _candidate_data_dimensions(candidate: Candidate) -> str:
+    quote = candidate.quote
+    history_days = max(0, int(getattr(quote, "history_days", 0) or 0))
+    technical = f"技术{history_days}日" + ("(历史<20日)" if history_days < 20 else "")
+    overlay = candidate.factor_overlay
+    fundamental_coverage = max(0.0, min(1.0, float(getattr(overlay, "fundamental_coverage", 0.0) or 0.0))) if overlay else 0.0
+    factor_risk_coverage = max(0.0, min(1.0, float(getattr(overlay, "risk_factor_coverage", 0.0) or 0.0))) if overlay else 0.0
+    quote_risk = {
+        "suspended": quote.suspended,
+        "limit_up": quote.limit_up,
+        "limit_down": quote.limit_down,
+        "st": quote.st,
+    }
+    quote_risk_known = sum(value is not None for value in quote_risk.values())
+    risk_coverage = (quote_risk_known + factor_risk_coverage * 2) / 6
+    labels = {
+        "fundamental_score": "综合",
+        "roe": "ROE",
+        "profit_growth": "利润增速",
+        "cash_quality": "现金质量",
+        "valuation": "估值",
+        "st_flag": "ST",
+        "audit_flag": "审计",
+        "suspended": "停牌",
+        "limit_up": "涨停",
+        "limit_down": "跌停",
+        "st": "ST",
+    }
+
+    def compact_missing(keys, fallback: str) -> str:
+        values = [labels.get(str(key), str(key)) for key in keys if str(key)]
+        if not values:
+            values = [fallback]
+        suffix = "/".join(values[:2]) + ("等" if len(values) > 2 else "")
+        return f"(缺{suffix})"
+
+    fundamental_missing = tuple(getattr(overlay, "fundamental_missing", ()) or ()) if overlay else ("未获取",)
+    risk_missing = [key for key, value in quote_risk.items() if value is None]
+    risk_missing.extend(tuple(getattr(overlay, "risk_factor_missing", ()) or ()) if overlay else ("未获取",))
+    fundamental_suffix = compact_missing(fundamental_missing, "字段") if fundamental_coverage < 1.0 else ""
+    risk_suffix = compact_missing(risk_missing, "状态") if risk_coverage < 1.0 else ""
+    return f"{technical}｜基本面{fundamental_coverage:.0%}{fundamental_suffix}｜风险{risk_coverage:.0%}{risk_suffix}"
 
 
 def _decode_stored_object(value) -> dict:
@@ -1026,9 +1236,9 @@ def format_stored_candidate(row: dict, index: int, pct_change=_PCT_UNSET) -> str
             and (plan.get("confirmation") is None or confirmation is not None)
         ):
             reference = _format_stored_price(plan.get("reference_price"))
-            levels = f"参考 {reference or '未知'}｜关注 {attention_low}-{attention_high}｜失效 {invalidation}"
+            levels = f"参考 {reference or '未知'}｜{price_plan_attention_descriptor(plan)} {attention_low}-{attention_high}｜失效 {invalidation}"
             if confirmation is not None:
-                levels = f"{levels}｜确认 {confirmation}"
+                levels = f"{levels}｜建议买入价 {confirmation}"
 
     raw_pct = row.get("pct_change") if pct_change is _PCT_UNSET else pct_change
     return (
@@ -1075,7 +1285,7 @@ def format_candidate(candidate: Candidate) -> str:
     risk_text = "；".join(risk_items) if risk_items else "暂未触发机械风险项，但指标可能滞后或不完整"
     plan = candidate.price_plan
     if price_plan_is_validated(plan):
-        levels = f"关注区{plan.attention_low:.2f}-{plan.attention_high:.2f}，确认位{plan.confirmation:.2f}，参考卖出区{plan.sell_low:.2f}-{plan.sell_high:.2f}，失效位{plan.invalidation:.2f}"
+        levels = f"{price_plan_attention_descriptor(plan)} {plan.attention_low:.2f}-{plan.attention_high:.2f}，建议买入价{plan.confirmation:.2f}，参考卖出区{plan.sell_low:.2f}-{plan.sell_high:.2f}，失效位{plan.invalidation:.2f}"
         distance = format_plan_distance(plan, quote.price)
         if distance:
             levels = f"{distance}；{levels}"
@@ -1102,7 +1312,7 @@ def format_candidate(candidate: Candidate) -> str:
 
 
 def format_compact_candidate(candidate: Candidate, index: int) -> str:
-    """Three-line market-screen summary; detailed reports keep using format_candidate."""
+    """Bounded market-screen summary; detailed reports keep using format_candidate."""
     quote = candidate.quote
     name = re.sub(r"[\x00-\x1f\x7f]", "", str(quote.name or "")).strip()[:24]
     if not name or name == quote.code:
@@ -1111,20 +1321,43 @@ def format_compact_candidate(candidate: Candidate, index: int) -> str:
     reasons = [re.sub(r"[+-]\d+$", "", str(item)) for item in candidate.reasons[:3]]
     reason_text = "、".join(reasons) or "技术指标有限"
     plan = candidate.price_plan
-    score_label = "综合" if candidate.composite_score is not None else "技术"
+    if candidate.composite_score is not None:
+        adjustment = int(candidate.composite_score) - int(candidate.base_score)
+        score_text = f"综合 {candidate.score}/{candidate.score_max}(技术{candidate.base_score}{adjustment:+d})"
+    else:
+        score_text = f"技术 {candidate.score}/{candidate.score_max}"
     if price_plan_is_validated(plan):
-        distance = format_plan_distance(plan, quote.price)
-        levels = f"参考 {plan.reference_price:.2f}｜关注 {plan.attention_low:.2f}-{plan.attention_high:.2f}｜失效 {plan.invalidation:.2f}"
+        distance = format_watch_range_distance(plan, quote.price)
+        levels = f"参考 {plan.reference_price:.2f}｜{price_plan_attention_descriptor(plan)} {plan.attention_low:.2f}-{plan.attention_high:.2f}｜失效 {plan.invalidation:.2f}"
         if plan.confirmation is not None:
-            levels = f"{levels}｜确认 {plan.confirmation:.2f}"
+            levels = f"{levels}｜建议买入价 {plan.confirmation:.2f}"
         if distance:
             levels = f"{levels}｜{distance}"
+        try:
+            reference, atr = float(plan.reference_price), float(plan.atr)
+            resistance = float(plan.resistance or 0)
+            risk_distance = reference - float(plan.invalidation)
+            ceilings = [value for value in (resistance, float(plan.sell_low or 0), reference + atr) if value > reference]
+            upper = min(ceilings) if ceilings else 0
+            lower = max(reference, min(upper, reference + atr * 0.5))
+            if reference > 0 and atr > 0 and risk_distance > 0 and upper > reference and (upper - reference) / risk_distance >= 1:
+                prediction = f"情景涨幅区间：{(lower / reference - 1) * 100:+.2f}%~{(upper / reference - 1) * 100:+.2f}%（ATR/阻力/盈亏比；覆盖计划层，低置信；非概率）"
+            elif all(math.isfinite(value) and value > 0 for value in (reference, atr, risk_distance)) and upper > reference and (upper - reference) / risk_distance < 1:
+                prediction = "情景空间不足：盈亏比未达到 1:1"
+            else:
+                prediction = "情景证据不足：ATR、参考价或风险距离不可用"
+        except (TypeError, ValueError, OverflowError):
+            prediction = "预计：数据不足（计划价位不完整）"
     elif plan is not None and plan.quality == "insufficient":
         levels = "历史数据不足"
+        prediction = "预计：数据不足"
     else:
         levels = "无已验证收盘计划"
+        prediction = "预计：数据不足"
     return (
-        f"{index}. {name}（{quote.code}）｜{score_label} {candidate.score}/{candidate.score_max}｜{_format_pct_change(quote.pct_change)}｜{risk}\n"
+        f"{index}. {name}（{quote.code}）｜{score_text}｜{_format_pct_change(quote.pct_change)}｜{risk}\n"
         f"   看点：{reason_text}\n"
-        f"   价位：{levels}"
+        f"   数据：{_candidate_data_dimensions(candidate)}\n"
+        f"   价位：{levels}\n"
+        f"   {prediction}"
     )

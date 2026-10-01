@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Stock Watch snapshot hourly
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Unit=stock-watch-web-snapshot.service
+
+[Install]
+WantedBy=timers.target

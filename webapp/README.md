@@ -1,0 +1,101 @@
+# Local Read-Only Web App
+
+Independent Python standard-library HTTP server, SQLite projections and native
+HTML/CSS/JavaScript. No frontend package install or plugin initialization.
+Python 3.10+ is required. Lucide icons and their license are vendored locally.
+
+Run from this repository's root:
+
+```powershell
+py -m webapp.demo --database .local_records/web-demo.sqlite3 --settings .local_records/web-demo-settings.json
+py -m webapp.server --database .local_records/web-demo.sqlite3 --settings .local_records/web-demo-settings.json --origin demo --port 8765
+```
+
+Open `http://127.0.0.1:8765`. The demo generator refuses existing output files.
+Its fixed July-September 2026 DEMO01-DEMO08 prices, calendars and performance
+are synthetic fixtures, not real market evidence. Every page labels them.
+
+For an authorized **local copy** of real plugin data, pass that file explicitly
+with `--database`. There is no implicit production path and no migration.
+The server binds only IPv4 loopback. Do not expose it with a proxy or tunnel:
+remote hosting, authentication and production permissions need separate work.
+Mobile acceptance here means a responsive browser viewport, not LAN access.
+
+## Views And Data
+
+- Overview: stored market date/quality/coverage, candidates and recent runs.
+- Monitor: fixed-origin outbox events, original plan identity and stored quotes.
+- Candidates: score/risk search, sorting, levels and stock links.
+- Stock: stored unadjusted OHLC, volume, MA5/10/20, plan and event history.
+- Performance: verified trading-day T+1/3/5/10 windows, gross close returns,
+  MFE, close-series drawdown and distinct price/path denominators.
+- Health: provider errors by sanitized category, batches, jobs and outboxes.
+- Settings: allowlisted public effective values and separate schema defaults.
+
+Only public recommendations and the server's fixed `--origin` are visible.
+The API ignores client attempts to change origin. Without `--origin`, private
+events are not exposed. This is a local trust boundary, not user authentication.
+Optional `--settings` must be an explicitly sanitized JSON file of the form
+`{"values":{"min_score":20,"paper_trading_only":true}}`; never pass credentials.
+Absent settings mean effective values are unknown, not equal to defaults.
+
+Each API request opens SQLite with `mode=ro`, enables `query_only`, and reads
+one transaction with a 3-second query budget. Missing files are never created.
+Missing/legacy/locked data is partial or unavailable, never a healthy default.
+The newest stored quote is not live; stale and future timestamps are checked.
+Monitor polling reads the local database every 15 seconds without provider calls.
+
+Performance is recomputed from the explicitly selected local snapshot. On real
+data it requires exact code/date Tushare adj_factor evidence at the base and
+every forward session, unchanged factors, complete daily snapshots and valid
+unadjusted OHLC. Missing or changed evidence is unknown. Immature windows are
+pending; absent calendar evidence is unknown. Daily target/invalidation order
+collisions never enter path denominators. No fees or execution fills are assumed.
+Same-window index benchmark remains unavailable; single-day market statistics
+are never substituted. Announcements are displayed only from persisted,
+body-bound evidence records; absent or unreadable evidence remains unavailable.
+Acquisition is an opt-in plugin deep-screen backend, never a Web refresh action.
+API lists are
+bounded (500 candidates, 200 events, 1,000 recommendations, 120 bars per stock),
+so aggregates describe the returned local sample, not unlimited lifetime history.
+
+## Checks
+
+```powershell
+py -m pytest tools/verification/test_v0144_web_dashboard.py -q
+node --check webapp/static/app.js
+node tools/verification/web_dashboard_browser.cjs http://127.0.0.1:8765
+py -m py_compile webapp/data.py webapp/server.py webapp/demo.py
+py -m pytest -q
+```
+
+The browser check requires Playwright on Node's module path and installed
+Microsoft Edge. In Codex's bundled environment, set `NODE_PATH` to the bundled
+`dependencies/node/node_modules` folder before running it. It launches and closes
+its own headless Edge instance, tests four viewport sizes and desktop/mobile
+workflows, and writes screenshots/report below `.local_records/web-browser`.
+It never attaches to the user's existing browser profile.
+
+No application route writes settings, sends messages, triggers screening or
+places trades. Deployment/reload, real-data acceptance and publication remain
+outside the first-version scope.
+
+## Explicit Existing Database
+
+Pass an already authorized, consistent **local** SQLite snapshot explicitly:
+
+```powershell
+py -m webapp.server --database "C:\approved-local-copy\stock_watch.sqlite3" --origin "fixed-authorized-origin" --port 8767
+```
+
+The path is an example, not a configured production location. Do not copy an
+active WAL database's main file alone. The Web server performs no source
+copying, provider requests, migration or credential loading. No automatic
+Desktop-worktree synchronization is performed.
+
+Every page has a source/date/collection-time disclosure; stock detail separates
+technical history, financial coverage and risk evidence. Stored price
+observations expose the common evidence fields but are labelled
+`stored_observation`, not promoted to verified upstream or live evidence.
+The new data contract, source audit, trusted adapter setup and local complete-
+schema fixture are documented in `tools/verification/DATA_EVIDENCE_REFERENCE.md`.

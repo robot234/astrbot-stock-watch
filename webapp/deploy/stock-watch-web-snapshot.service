@@ -1,0 +1,27 @@
+[Unit]
+Description=Stock Watch consistent read-only source snapshot
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=pi
+ExecStart=/usr/bin/python3 -I -B /opt/stock-watch-web-snapshot/current/snapshot.py
+TimeoutStartSec=300
+UMask=0027
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/stock-watch-web-snapshot /home/pi/astrbot/data/plugin_data/astrbot_stock_watch
+ReadOnlyPaths=/home/pi/astrbot/data/plugin_data/astrbot_stock_watch/stock_watch.sqlite3
+InaccessiblePaths=-/home/pi/.ssh -/home/pi/astrbot/data/config -/home/pi/astrbot/data/cmd_config.json
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX

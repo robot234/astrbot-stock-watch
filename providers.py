@@ -17,14 +17,76 @@ from typing import Iterable
 import httpx
 
 from .core import CHINA_TZ, Candidate, NewsItem, Quote, _finite_positive, _normalize_plan_date, _source_is_trusted, apply_daily_indicators, calculate_daily_indicators, normalize_code
+from .data_evidence import day as evidence_day, envelope as evidence_envelope, factor_capture
+from . import formal_source_policy
 
 
 DEFAULT_TUSHARE_MIN_SNAPSHOT_SIZE = 4000
 DEFAULT_TUSHARE_REQUIRE_UNIVERSE_EVIDENCE = True
+TUSHARE_DAILY_CALENDAR_SYMBOLS = ("600519.SH", "000858.SZ", "000001.SZ")
+TUSHARE_DAILY_CALENDAR_SOURCE = "tushare_daily_symbol_consensus"
+TUSHARE_DAILY_CALENDAR_RULE = "at_least_2_of_3"
+TUSHARE_DAILY_CALENDAR_EVIDENCE_VERSION = 1
+TUSHARE_DAILY_CALENDAR_POLICY_VERSION = "v1"
+TUSHARE_DAILY_CALENDAR_MAX_LAG_DAYS = 14
+EASTMONEY_INDEX_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+EASTMONEY_CALENDAR_MAX_LAG_DAYS = 14
+# The companion endpoint accepts a comma-delimited ``secids`` list.  Keep
+# daily risk reconciliation bounded even for a full A-share snapshot.
+DAILY_RISK_ENRICH_BATCH_SIZE = 500
+
+
+def _raw_six_digit_code(value, *, allow_exchange_prefix: bool = True) -> str:
+    """Validate a provider code before applying display normalization."""
+    raw = str(value or "").strip().lower()
+    pattern = r"(?:(?:sh|sz|bj))?\d{6}" if allow_exchange_prefix else r"\d{6}"
+    if not re.fullmatch(pattern, raw):
+        return ""
+    normalized = normalize_code(raw)
+    return normalized if re.fullmatch(r"\d{6}", normalized) else ""
+
+
+def completed_session_cutoff(end_date: str) -> str:
+    """Return the latest mainland session date that may be complete."""
+    text = str(end_date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError("end_date must be YYYY-MM-DD")
+    requested = datetime.strptime(text, "%Y-%m-%d").date()
+    today = datetime.now(CHINA_TZ).date()
+    if requested > today:
+        raise ValueError("end_date cannot be in the future")
+    # A same-day daily bar is provisional until the mainland close.
+    if requested == today and datetime.now(CHINA_TZ).time() < datetime_time(15, 0):
+        requested -= timedelta(days=1)
+    return requested.isoformat()
+
+
+def tushare_daily_calendar_digest(dates: Iterable[str]) -> str:
+    """Hash the exact newest-first session list used by calendar evidence."""
+    value = json.dumps(list(dates), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def tushare_daily_calendar_policy_fingerprint(session_count: int) -> str:
+    """Bind persisted evidence to the current calendar policy contract."""
+    payload = {
+        "evidence_version": TUSHARE_DAILY_CALENDAR_EVIDENCE_VERSION,
+        "policy_version": TUSHARE_DAILY_CALENDAR_POLICY_VERSION,
+        "source": TUSHARE_DAILY_CALENDAR_SOURCE,
+        "policy": TUSHARE_DAILY_CALENDAR_RULE,
+        "symbols": list(TUSHARE_DAILY_CALENDAR_SYMBOLS),
+        "consensus_rule": TUSHARE_DAILY_CALENDAR_RULE,
+        "session_count": int(session_count),
+        "fields": "ts_code,trade_date",
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _sina_symbol(code: str) -> str:
-    value = normalize_code(code)
+    value = _raw_six_digit_code(code)
+    if not value:
+        raise ValueError("Sina code is invalid")
     if value.startswith(("4", "8", "920")):
         return "bj" + value
     return ("sh" if value.startswith(("6", "68", "9")) else "sz") + value
@@ -37,6 +99,23 @@ class MarketSnapshotResult:
     source: str = ""
     quality: str = "unknown"
     fetched_at: datetime = field(default_factory=lambda: datetime.now(CHINA_TZ))
+
+
+@dataclass(slots=True)
+class IntradayMarketSnapshotResult:
+    """One bounded, source-timestamped cross-section for intraday regime use.
+
+    ``observed_at`` is collection metadata only.  Callers must use each
+    quote's provider timestamp when deciding freshness; it is never promoted
+    to quote evidence.
+    """
+
+    quotes: list[Quote]
+    expected_codes: tuple[str, ...]
+    source: str = "sina"
+    batch_count: int = 0
+    failed_batches: int = 0
+    observed_at: datetime = field(default_factory=lambda: datetime.now(CHINA_TZ))
 
 
 @dataclass(slots=True)
@@ -138,6 +217,23 @@ class TushareCalendarError(TushareBulkError):
         self.legacy_lookback = bool(legacy_lookback)
 
 
+class TushareCalendarEndpointError(TushareCalendarError, TushareNetworkError):
+    """The calendar endpoint remained unavailable after its bounded retry."""
+
+    def __init__(
+        self,
+        message: str = "Eastmoney SSE index calendar endpoint unavailable",
+        *,
+        category: str = "network",
+        attempts: int = 2,
+        required_sessions: int | None = None,
+    ):
+        super().__init__(message, required_sessions=required_sessions)
+        self.category = str(category or "network")[:32]
+        self.attempts = max(1, int(attempts))
+        self.failure_kind = "calendar_endpoint_unavailable"
+
+
 class TushareNotPublishedError(TushareBulkError):
     """The provider explicitly reported that the requested data is not published."""
 
@@ -154,6 +250,10 @@ class TushareHistoryError(TushareBulkError):
     """A provider explicitly reported invalid or unavailable history."""
 
 
+class TushareRealtimeQuoteError(TushareBulkError):
+    """The bounded Tushare rt_k response did not meet the quote contract."""
+
+
 class TushareRequestGateway:
     """Shared, cancellable and persisted gateway for Tushare requests.
 
@@ -166,7 +266,14 @@ class TushareRequestGateway:
     DEFAULT_BUCKETS = {
         "trade_cal": (1, 60.0),
         "stock_basic": (1, 60.0),
-        "daily": (30, 60.0),
+        "daily": (50, 60.0),
+        "adj_factor": (50, 60.0),
+        "daily_basic": (50, 60.0),
+        "fina_indicator": (1, 60.0),
+        # rt_k is intentionally conservative.  The target-quote router also
+        # applies its own interval so enabling shadow mode cannot turn a 5s
+        # polling loop into a high-frequency Tushare client.
+        "rt_k": (1, 60.0),
     }
 
     def __init__(
@@ -285,6 +392,10 @@ class TushareRequestGateway:
             return dict(self.storage.provider_api_state(api_name, bucket_limit=limit, window_seconds=int(window)))
         return dict(self._local_state(api_name))
 
+    async def _state_async(self, api_name: str) -> dict:
+        """Read durable gateway state without pausing the provider loop."""
+        return await asyncio.to_thread(self._state, api_name)
+
     def _check_open(self, api_name: str, now: float) -> None:
         state = self._state(api_name)
         until = max(float(state.get("blocked_until") or 0), float(state.get("circuit_open_until") or 0))
@@ -292,6 +403,14 @@ class TushareRequestGateway:
             raise TushareCircuitOpen(f"Tushare {api_name} gateway circuit is open")
         # A rate block is handled by _reserve.  A persisted circuit remains a
         # hard failure even if an older blocked_until has elapsed.
+        if until > now and float(state.get("circuit_open_until") or 0) <= now:
+            return
+
+    async def _check_open_async(self, api_name: str, now: float) -> None:
+        state = await self._state_async(api_name)
+        until = max(float(state.get("blocked_until") or 0), float(state.get("circuit_open_until") or 0))
+        if float(state.get("circuit_open_until") or 0) > now:
+            raise TushareCircuitOpen(f"Tushare {api_name} gateway circuit is open")
         if until > now and float(state.get("circuit_open_until") or 0) <= now:
             return
 
@@ -319,8 +438,8 @@ class TushareRequestGateway:
             return
         while True:
             now = self._now()
-            self._check_open(api_name, now)
-            state = self._reserve_once(api_name, now)
+            await self._check_open_async(api_name, now)
+            state = await asyncio.to_thread(self._reserve_once, api_name, now)
             if state.get("allowed"):
                 return
             wait = max(0.0, float(state.get("wait_seconds") or 0.0))
@@ -348,6 +467,9 @@ class TushareRequestGateway:
             state["last_error"] = str(kwargs["error"])[:240]
         return dict(state)
 
+    async def _update_state_async(self, api_name: str, **kwargs) -> dict:
+        return await asyncio.to_thread(self._update_state, api_name, **kwargs)
+
     def _cache_get(self, api_name: str, digest: str, now: float, cache_key: str | None = None) -> dict | None:
         if self.storage is not None and callable(getattr(self.storage, "get_provider_cache", None)):
             try:
@@ -362,6 +484,9 @@ class TushareRequestGateway:
             return dict(row["body"])
         return None
 
+    async def _cache_get_async(self, api_name: str, digest: str, now: float, cache_key: str | None = None) -> dict | None:
+        return await asyncio.to_thread(self._cache_get, api_name, digest, now, cache_key)
+
     def _cache_put(self, api_name: str, digest: str, payload: dict, body: dict, ttl: float, now: float, cache_key: str | None = None) -> None:
         if ttl <= 0:
             return
@@ -372,6 +497,9 @@ class TushareRequestGateway:
                 self.storage.save_provider_cache(api_name, cache_key or digest, body, ttl_seconds=ttl, payload_digest=digest, now=now)
             return
         self._local_cache[(api_name, str(cache_key or ""), digest)] = {"body": dict(body), "expires_at": now + ttl}
+
+    async def _cache_put_async(self, api_name: str, digest: str, payload: dict, body: dict, ttl: float, now: float, cache_key: str | None = None) -> None:
+        await asyncio.to_thread(self._cache_put, api_name, digest, payload, body, ttl, now, cache_key)
 
     @staticmethod
     def _response_message(body) -> str:
@@ -486,6 +614,7 @@ class TushareRequestGateway:
         api_name: str | None = None,
         cache_ttl: float = 0,
         cache_key: str | None = None,
+        rate_retry_enabled: bool = True,
     ) -> dict:
         if payload is None and isinstance(client, dict):
             payload, client = client, None
@@ -494,7 +623,7 @@ class TushareRequestGateway:
         digest = self.request_digest({**payload, "api_name": name})
         now = self._now()
         stable_cache_key = str(cache_key) if cache_key is not None else None
-        if cache_ttl and (cached := self._cache_get(name, digest, now, stable_cache_key)) is not None:
+        if cache_ttl and (cached := await self._cache_get_async(name, digest, now, stable_cache_key)) is not None:
             return cached
 
         loop = asyncio.get_running_loop()
@@ -520,7 +649,7 @@ class TushareRequestGateway:
                 # the first cache check and ownership acquisition.
                 now = self._now()
                 effective_ttl = float(entry.get("cache_ttl") or 0)
-                if effective_ttl and (cached := self._cache_get(name, digest, now, stable_cache_key)) is not None:
+                if effective_ttl and (cached := await self._cache_get_async(name, digest, now, stable_cache_key)) is not None:
                     self._complete_future(future, result=cached)
                     return
 
@@ -549,12 +678,12 @@ class TushareRequestGateway:
                     classification = self._classify_response(response, body)
                     if classification == "rate_limited":
                         now = self._now()
-                        state = self._state(name)
+                        state = await self._state_async(name)
                         previous = int(state.get("rate_limit_failures") or 0)
                         open_circuit = previous >= 1 or rate_retry
                         until = now + self.rate_limit_block_seconds
-                        self._update_state(name, now=now, blocked_until=until, rate_limited=True, open_circuit=open_circuit, error="rate limited")
-                        if rate_retry:
+                        await self._update_state_async(name, now=now, blocked_until=until, rate_limited=True, open_circuit=open_circuit, error="rate limited")
+                        if rate_retry or not rate_retry_enabled:
                             raise TushareRateLimitError(f"Tushare {name} rate limit persisted")
                         rate_retry = True
                         await self._sleep(self.rate_limit_block_seconds)
@@ -569,7 +698,7 @@ class TushareRequestGateway:
                             if self.enforce_rate_limits:
                                 await self._reserve(name)
                             continue
-                        self._update_state(name, error=f"HTTP {status}")
+                        await self._update_state_async(name, error=f"HTTP {status}")
                         raise error
                     if classification in {"permission_denied", "provider_unknown"}:
                         # Do not persist msg/body.  The numeric code and
@@ -577,20 +706,20 @@ class TushareRequestGateway:
                         # retry policy, even when a permission response is
                         # not valid JSON.
                         code = self._response_code(body)
-                        self._update_state(name, error=f"provider_{classification}")
+                        await self._update_state_async(name, error=f"provider_{classification}")
                         raise self._provider_error(classification, code)
                     if not isinstance(body, dict):
-                        self._update_state(name, error="invalid response")
+                        await self._update_state_async(name, error="invalid response")
                         raise ValueError("Tushare response is not an object")
                     code = self._response_code(body)
                     if code != 0:
-                        self._update_state(name, error="provider_unknown")
+                        await self._update_state_async(name, error="provider_unknown")
                         raise self._provider_error("provider_unknown", code)
                     if hasattr(response, "raise_for_status"):
                         response.raise_for_status()
-                    self._update_state(name, now=self._now(), success=True)
+                    await self._update_state_async(name, now=self._now(), success=True)
                     effective_ttl = max(float(entry.get("cache_ttl") or 0), float(cache_ttl or 0))
-                    self._cache_put(name, digest, payload, body, effective_ttl, self._now(), stable_cache_key)
+                    await self._cache_put_async(name, digest, payload, body, effective_ttl, self._now(), stable_cache_key)
                     self._complete_future(future, result=body)
                     return
             except BaseException as exc:
@@ -611,8 +740,8 @@ class TushareRequestGateway:
         # the first caller that created the worker, cannot cancel the worker.
         return await asyncio.shield(future)
 
-    async def request_api(self, api_name: str, payload: dict, *, client=None, cache_ttl: float = 0, cache_key: str | None = None) -> dict:
-        return await self.request_json(client, payload, api_name=api_name, cache_ttl=cache_ttl, cache_key=cache_key)
+    async def request_api(self, api_name: str, payload: dict, *, client=None, cache_ttl: float = 0, cache_key: str | None = None, rate_retry_enabled: bool = True) -> dict:
+        return await self.request_json(client, payload, api_name=api_name, cache_ttl=cache_ttl, cache_key=cache_key, rate_retry_enabled=rate_retry_enabled)
 
     async def request(self, *args, **kwargs) -> dict:
         """Compatibility wrapper accepting either (client, payload) or
@@ -738,7 +867,7 @@ class HttpRuntime:
 class TushareBulkDailyProvider:
     """Bulk, validated and retry-bounded Tushare daily-data provider."""
 
-    def __init__(self, token: str, url: str = "https://api.tushare.pro", *, http_runtime: HttpRuntime | None = None, storage=None, gateway: TushareRequestGateway | None = None, page_size: int = 6000, retry_attempts: int = 3, bj_calendar_policy: str = "require_bse", dataset_key: str = "tushare_daily", min_snapshot_size: int = DEFAULT_TUSHARE_MIN_SNAPSHOT_SIZE, daily_snapshot_min_size: int | None = None, min_overall_coverage: float = 0.97, min_market_coverage: float = 0.95, min_market_median_ratio: float = 0.95, universe_version: str = "", universe_counts=None, universe_evidence=None, require_universe_evidence: bool = DEFAULT_TUSHARE_REQUIRE_UNIVERSE_EVIDENCE, raw_publish_enabled: bool = True, session_count: int = 120):
+    def __init__(self, token: str, url: str = "https://api.tushare.pro", *, http_runtime: HttpRuntime | None = None, storage=None, gateway: TushareRequestGateway | None = None, page_size: int = 6000, retry_attempts: int = 3, bj_calendar_policy: str = "require_bse", dataset_key: str = "tushare_daily", min_snapshot_size: int = DEFAULT_TUSHARE_MIN_SNAPSHOT_SIZE, daily_snapshot_min_size: int | None = None, min_overall_coverage: float = 0.97, min_market_coverage: float = 0.95, min_market_median_ratio: float = 0.95, universe_version: str = "", universe_counts=None, universe_evidence=None, require_universe_evidence: bool = DEFAULT_TUSHARE_REQUIRE_UNIVERSE_EVIDENCE, raw_publish_enabled: bool = True, session_count: int = 120, universe_statuses: str = "L,D,P"):
         self.token = str(token or "").strip()
         self.url = str(url or "").strip() or "https://api.tushare.pro"
         self.http = http_runtime or HttpRuntime(10, 8)
@@ -752,6 +881,13 @@ class TushareBulkDailyProvider:
         self.bj_calendar_policy = {"strict": "require_bse", "required": "require_bse", "fallback": "sse_fallback"}.get(policy, policy)
         if self.bj_calendar_policy not in {"require_bse", "sse_fallback", "exclude"}:
             self.bj_calendar_policy = "require_bse"
+        # The listed (L) universe is always required.  D/P may be dropped or
+        # tolerated so a low-points token can still build a usable universe.
+        configured_statuses = str(universe_statuses or "L,D,P").strip().upper()
+        status_parts = [part.strip() for part in configured_statuses.replace(";", ",").replace(" ", ",").split(",") if part.strip()]
+        self.universe_statuses = tuple(status for status in ("L", "D", "P") if status in status_parts)
+        if "L" not in self.universe_statuses:
+            self.universe_statuses = ("L",) + self.universe_statuses
         self.dataset_key = str(dataset_key or "tushare_daily").strip() or "tushare_daily"
         self.min_snapshot_size = max(1, int(daily_snapshot_min_size if daily_snapshot_min_size is not None else min_snapshot_size))
         self.min_overall_coverage = float(min_overall_coverage)
@@ -787,6 +923,7 @@ class TushareBulkDailyProvider:
         self._breaker_open_until: datetime | None = None
         self._allowed_bj_dates: set[str] = set()
         self._last_stock_basic_status_metadata: dict[str, dict] = {}
+
         self._last_completed_calendar_dates: list[str] = []
         # Calendar evidence is normalized to the single SSE session source;
         # require_bse remains a raw market-policy compatibility label but no
@@ -808,6 +945,10 @@ class TushareBulkDailyProvider:
             # transport can inject a gateway explicitly.
             enforce_rate_limits=bool(self.storage) and isinstance(self.http, HttpRuntime),
         )
+
+    async def _storage_call(self, method, /, *args, **kwargs):
+        """Run a synchronous SQLite operation away from the provider event loop."""
+        return await asyncio.to_thread(method, *args, **kwargs)
 
     @property
     def breaker_open_until(self) -> datetime | None:
@@ -929,11 +1070,18 @@ class TushareBulkDailyProvider:
             )
         return dates[:target_sessions]
 
-    async def _post_json(self, client, payload: dict) -> dict:
+    async def _post_json(self, client, payload: dict, *, api_name: str | None = None, cache_ttl: float = 0, cache_key: str | None = None) -> dict:
         operation = self._operation_for_payload(payload)
         self._check_breaker(operation)
+        request_api_name = str(api_name or {"calendar": "trade_cal", "universe": "stock_basic"}.get(operation, "daily")).strip().lower() or "daily"
         try:
-            body = await self.gateway.request_json(client, payload, api_name={"calendar": "trade_cal", "universe": "stock_basic"}.get(operation, "daily"))
+            body = await self.gateway.request_json(
+                client,
+                payload,
+                api_name=request_api_name,
+                cache_ttl=cache_ttl,
+                cache_key=cache_key,
+            )
         except TushareCircuitOpen:
             self._record_exhausted_failure(operation)
             raise
@@ -971,16 +1119,7 @@ class TushareBulkDailyProvider:
     @staticmethod
     def _completed_end_date(end_date: str) -> str:
         """Return the latest date that can represent a completed session."""
-        today = datetime.now(CHINA_TZ).date()
-        requested = datetime.strptime(end_date, "%Y-%m-%d").date()
-        if requested > today:
-            raise ValueError("Tushare end_date cannot be in the future")
-        # A same-day daily bar is provisional until the mainland close.  The
-        # scheduler normally runs after 15:00, while manual commands may run
-        # during the session and must use the prior completed session.
-        if requested == today and datetime.now(CHINA_TZ).time() < datetime_time(15, 0):
-            requested -= timedelta(days=1)
-        return requested.isoformat()
+        return completed_session_cutoff(end_date)
 
     async def _calendar_exchange(self, client, exchange: str, start_date: str, end_date: str) -> set[str]:
         limit = 1000
@@ -1096,6 +1235,176 @@ class TushareBulkDailyProvider:
             raise
 
     fetch_trade_dates = fetch_completed_trade_dates
+
+    @staticmethod
+    def _daily_calendar_digest(dates: list[str]) -> str:
+        return tushare_daily_calendar_digest(dates)
+
+    def _daily_calendar_window(self, end_date: str, session_count: int) -> tuple[str, str, int]:
+        end = self._date(end_date)
+        if not end:
+            raise ValueError("end_date must be YYYY-MM-DD")
+        cutoff = self._completed_end_date(end)
+        try:
+            count = max(1, min(int(session_count), 366))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("daily calendar session_count is invalid") from exc
+        cutoff_value = datetime.strptime(cutoff, "%Y-%m-%d").date()
+        natural_days = max(366, count * 3 + 30)
+        start = (cutoff_value - timedelta(days=natural_days)).isoformat()
+        return start, cutoff, count
+
+    def _parse_daily_calendar_rows(
+        self,
+        body: dict,
+        symbol: str,
+        *,
+        start_date: str,
+        cutoff_date: str,
+        required_sessions: int,
+    ) -> tuple[list[str], dict]:
+        if not isinstance(body, dict):
+            raise ValueError("Tushare daily calendar response is not an object")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("Tushare daily calendar data is invalid")
+        fields = data.get("fields")
+        items = data.get("items")
+        if not isinstance(fields, list) or not isinstance(items, list) or set(fields) != {"ts_code", "trade_date"} or len(fields) != 2:
+            raise ValueError("Tushare daily calendar fields are invalid")
+        positions = {str(name): index for index, name in enumerate(fields)}
+        dates: set[str] = set()
+        duplicate_count = 0
+        invalid_count = 0
+        for values in items:
+            if not isinstance(values, list) or len(values) != len(fields):
+                invalid_count += 1
+                continue
+            raw_symbol = str(values[positions["ts_code"]] or "").strip().upper()
+            raw_date = self._date(values[positions["trade_date"]])
+            if raw_symbol != symbol or not raw_date or raw_date < start_date or raw_date > cutoff_date:
+                invalid_count += 1
+                continue
+            if raw_date in dates:
+                duplicate_count += 1
+            dates.add(raw_date)
+        if invalid_count:
+            raise ValueError(f"Tushare daily calendar {symbol} contains invalid rows")
+        if duplicate_count:
+            raise ValueError(f"Tushare daily calendar {symbol} contains duplicate dates")
+        ordered = sorted(dates, reverse=True)
+        if len(ordered) < required_sessions:
+            raise TushareCalendarError(
+                f"Tushare daily calendar {symbol} returned only {len(ordered)} sessions; {required_sessions} required",
+                available_dates=ordered,
+                required_sessions=required_sessions,
+            )
+        latest = datetime.strptime(ordered[0], "%Y-%m-%d").date()
+        cutoff = datetime.strptime(cutoff_date, "%Y-%m-%d").date()
+        if (cutoff - latest).days > TUSHARE_DAILY_CALENDAR_MAX_LAG_DAYS:
+            raise TushareCalendarError(
+                f"Tushare daily calendar {symbol} is stale",
+                available_dates=ordered,
+                required_sessions=required_sessions,
+            )
+        selected = ordered[:required_sessions]
+        return selected, {
+            "ts_code": symbol,
+            "row_count": len(items),
+            "session_count": len(selected),
+            "dates": selected,
+            "min_date": selected[-1],
+            "max_date": selected[0],
+            "digest": self._daily_calendar_digest(selected),
+        }
+
+    async def fetch_daily_symbol_calendar_evidence(
+        self,
+        end_date: str,
+        *,
+        session_count: int | None = None,
+    ) -> dict:
+        """Build strict session evidence from three daily-symbol responses.
+
+        The requests deliberately use the shared ``daily`` gateway bucket and
+        a separate cache key.  Their rows remain calendar-only evidence.
+        """
+        if not self.token:
+            raise TusharePermissionError("Tushare token is required for daily calendar evidence")
+        target = self.session_count if session_count is None else session_count
+        start_date, cutoff_date, target = self._daily_calendar_window(end_date, target)
+        per_symbol: list[dict] = []
+        symbol_dates: dict[str, set[str]] = {}
+        async with self.http.slot() as client:
+            for symbol in TUSHARE_DAILY_CALENDAR_SYMBOLS:
+                payload = {
+                    "api_name": "daily",
+                    "token": self.token,
+                    "params": {
+                        "ts_code": symbol,
+                        "start_date": start_date.replace("-", ""),
+                        "end_date": cutoff_date.replace("-", ""),
+                    },
+                    "fields": "ts_code,trade_date",
+                }
+                cache_key = f"{TUSHARE_DAILY_CALENDAR_SOURCE}:refresh_v2:{symbol}:{start_date}:{cutoff_date}"
+                body = await self._post_json(
+                    client,
+                    payload,
+                    api_name="daily",
+                    cache_ttl=300,
+                    cache_key=cache_key,
+                )
+                dates, detail = self._parse_daily_calendar_rows(
+                    body,
+                    symbol,
+                    start_date=start_date,
+                    cutoff_date=cutoff_date,
+                    required_sessions=target,
+                )
+                symbol_dates[symbol] = set(dates)
+                per_symbol.append(detail)
+
+        counts: dict[str, int] = {}
+        for dates in symbol_dates.values():
+            for value in dates:
+                counts[value] = counts.get(value, 0) + 1
+        consensus = sorted((value for value, count in counts.items() if count >= 2), reverse=True)
+        if len(consensus) < target:
+            raise TushareCalendarError(
+                f"Tushare daily calendar consensus returned only {len(consensus)} sessions; {target} required",
+                available_dates=consensus,
+                required_sessions=target,
+            )
+        consensus = consensus[:target]
+        return {
+            "calendar_resolved": True,
+            "calendar_target_date": consensus[0],
+            "calendar_dates": consensus,
+            "calendar_session_count": len(consensus),
+            "calendar_source": TUSHARE_DAILY_CALENDAR_SOURCE,
+            "calendar_policy": TUSHARE_DAILY_CALENDAR_RULE,
+            "calendar_cutoff_date": cutoff_date,
+            "calendar_fallback_reason": None,
+            "source": TUSHARE_DAILY_CALENDAR_SOURCE,
+            "policy": TUSHARE_DAILY_CALENDAR_RULE,
+            "cutoff": cutoff_date,
+            "requested_date": self._date(end_date),
+            "target": consensus[0],
+            "dates": consensus,
+            "session_count": len(consensus),
+            "symbols": list(TUSHARE_DAILY_CALENDAR_SYMBOLS),
+            "per_symbol": per_symbol,
+            "consensus_rule": TUSHARE_DAILY_CALENDAR_RULE,
+            "consensus_count": len(consensus),
+            "window_start": start_date,
+            "window_end": cutoff_date,
+            "dates_digest": self._daily_calendar_digest(consensus),
+            "evidence_version": TUSHARE_DAILY_CALENDAR_EVIDENCE_VERSION,
+            "policy_version": TUSHARE_DAILY_CALENDAR_POLICY_VERSION,
+            "provider_policy_fingerprint": tushare_daily_calendar_policy_fingerprint(target),
+            "fallback_reason": None,
+        }
 
     @staticmethod
     def _number(value, field: str, *, positive: bool = False, nonnegative: bool = False) -> float:
@@ -1247,6 +1556,244 @@ class TushareBulkDailyProvider:
 
     _fetch_tushare_date = fetch_daily_date
 
+    async def fetch_market_comparison(self, trade_date: str, previous_date: str, benchmark_code: str, expected_codes, universe_ref: str, *, client=None) -> dict:
+        from . import market_comparison as comparison
+
+        identity = {"trade_date": trade_date, "previous_date": previous_date, "benchmark_code": benchmark_code, "universe_ref": universe_ref}
+        packet = {
+            **identity, "source": "tushare", "scope": "matched_raw_batch_universe",
+            "amount_unit": "CNY", "amount_source_unit": "thousand_CNY",
+        }
+        try:
+            if (self._date(trade_date) != trade_date or self._date(previous_date) != previous_date
+                    or previous_date >= trade_date or (datetime.strptime(trade_date, "%Y-%m-%d") - datetime.strptime(previous_date, "%Y-%m-%d")).days > 31
+                    or not re.fullmatch(r"\d{6}\.(SH|SZ|CSI)", benchmark_code) or not universe_ref):
+                raise ValueError("invalid comparison identity")
+            if completed_session_cutoff(trade_date) != trade_date:
+                raise ValueError("session not complete")
+            canonical = [canonical_tushare_code(code) for code in expected_codes]
+            if any(code is None for code in canonical):
+                raise ValueError("invalid universe code")
+            codes = sorted({code[1] for code in canonical})
+            if len(codes) != len(canonical) or len(codes) < self.min_snapshot_size:
+                raise ValueError("incomplete universe")
+            packet.update(expected_codes=codes, universe_digest=comparison.digest(codes))
+
+            async def table(api_name, params, fields):
+                body = await self.gateway.request_json(
+                    client, {"api_name": api_name, "token": self.token, "params": params, "fields": ",".join(fields)},
+                    api_name=api_name, cache_ttl=0,
+                )
+                data = body.get("data") or {}
+                names, items = data.get("fields"), data.get("items")
+                if (not isinstance(names, list) or len(set(names)) != len(names)
+                        or not set(fields).issubset(names) or not isinstance(items, list)):
+                    raise ValueError("endpoint fields missing")
+                if any(not isinstance(row, list) or len(row) != len(names) for row in items):
+                    raise ValueError("endpoint row malformed")
+                return [dict(zip(names, row)) for row in items]
+
+            packet["calendar"], packet["index_days"], packet["stock_days"], packet["factors"] = [], [], {}, {}
+            for day in (previous_date, trade_date):
+                calendar = await table("trade_cal", {"exchange": "SSE", "start_date": day.replace("-", ""), "end_date": day.replace("-", "")},
+                                       ["exchange", "cal_date", "is_open", "pretrade_date"])
+                if len(calendar) != 1:
+                    raise ValueError("calendar missing")
+                row = calendar[0]
+                row["cal_date"], row["pretrade_date"] = self._date(row["cal_date"]), self._date(row["pretrade_date"])
+                packet["calendar"].append(row)
+                index = await table("index_daily", {"ts_code": benchmark_code, "trade_date": day.replace("-", "")},
+                                    ["ts_code", "trade_date", "close", "pre_close"])
+                if len(index) != 1:
+                    raise ValueError("index missing or duplicate")
+                row = index[0]
+                packet["index_days"].append({
+                    "ts_code": row["ts_code"], "trade_date": self._date(row["trade_date"]),
+                    "close": row["close"], "pre_close": row["pre_close"],
+                    "source": "tushare:index_daily", "basis": "index_points",
+                })
+                packet["stock_days"][day] = await self.fetch_daily_date(day, client=client, max_pages=10)
+                packet["factors"][day] = await self.fetch_adj_factor_date(day, client=client, max_pages=10)
+            packet["available_at"] = comparison.utc_now()
+            checked = comparison.evaluate(packet, as_of=packet["available_at"])
+            packet.update(status=checked["status"], reason=checked["reason"])
+        except TusharePermissionError:
+            packet = {**identity, "status": "unknown", "reason": "permission_denied"}
+        except (TushareBulkError, httpx.HTTPError, asyncio.TimeoutError, OSError):
+            packet = {**identity, "status": "unknown", "reason": "provider_unavailable"}
+        except (ValueError, TypeError, KeyError, OverflowError):
+            packet = {**identity, "status": "unknown", "reason": "invalid_or_missing_evidence"}
+        packet["available_at"] = comparison.utc_now()
+        return packet
+
+    def _parse_adj_factor_rows(self, body: dict, trade_date: str) -> list[dict]:
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("Tushare adj_factor data is invalid")
+        fields, items = data.get("fields"), data.get("items")
+        required = {"ts_code", "trade_date", "adj_factor"}
+        if not isinstance(fields, list) or not isinstance(items, list) or not required.issubset(set(fields)):
+            raise ValueError("Tushare adj_factor fields are incomplete")
+        positions = {str(name): index for index, name in enumerate(fields)}
+        expected = self._date(trade_date)
+        result, seen = [], set()
+        for values in items:
+            if not isinstance(values, list) or len(values) != len(fields):
+                raise ValueError("Tushare adj_factor row is malformed")
+            code_info = canonical_tushare_code(values[positions["ts_code"]])
+            row_date = self._date(values[positions["trade_date"]])
+            factor = self._number(values[positions["adj_factor"]], "adj_factor", positive=True)
+            if not code_info or row_date != expected:
+                raise ValueError("Tushare adj_factor row has invalid identity or date")
+            code, ts_code = code_info
+            if code in seen:
+                raise ValueError("Tushare adj_factor page contains duplicate ts_code")
+            seen.add(code)
+            result.append({
+                "code": code,
+                "ts_code": ts_code,
+                "trade_date": row_date,
+                "adj_factor": factor,
+                "source": "tushare_adj_factor",
+                "evidence": f"tushare:adj_factor:{row_date}:{ts_code}",
+            })
+        return result
+
+    async def fetch_adj_factor_page(self, trade_date: str, *, offset: int = 0, page_size: int | None = None, client=None) -> list[dict]:
+        expected = self._date(trade_date)
+        if not expected:
+            raise ValueError("trade_date must be YYYY-MM-DD")
+        size = max(1, min(int(page_size or self.page_size), 6000))
+        payload = {
+            "api_name": "adj_factor",
+            "token": self.token,
+            "params": {"trade_date": expected.replace("-", ""), "limit": size, "offset": max(0, int(offset))},
+            "fields": "ts_code,trade_date,adj_factor",
+        }
+        body = await self.gateway.request_json(client, payload, api_name="adj_factor", cache_ttl=86400)
+        observed_at = datetime.now(timezone.utc).isoformat()
+        response_sha256 = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        rows = self._parse_adj_factor_rows(body, expected)
+        for row in rows:
+            row.update(observed_at=observed_at, response_sha256=response_sha256)
+        return rows
+
+    def _validated_adj_factor_row(self, row, expected_date: str | None = None) -> dict | None:
+        if not isinstance(row, dict):
+            return None
+        code_info = canonical_tushare_code(row.get("ts_code") or row.get("code"))
+        row_date = self._date(row.get("trade_date"))
+        if not code_info or not row_date:
+            return None
+        if expected_date and row_date != expected_date:
+            return None
+        code, ts_code = code_info
+        captured = factor_capture(row, code, row_date)
+        if captured is None:
+            return None
+        return {
+            "code": code,
+            "ts_code": ts_code,
+            "trade_date": row_date,
+            "adj_factor": captured["factor"],
+            "source": "tushare_adj_factor",
+            "evidence": captured["evidence"],
+            "observed_at": captured["observed_at"],
+            "response_sha256": captured["response_sha256"],
+        }
+
+    async def fetch_adj_factor_date(self, trade_date: str, *, client=None, max_pages: int = 10) -> list[dict]:
+        rows, seen = [], set()
+        expected = self._date(trade_date)
+        size = self.page_size
+        async def load_page(offset, page_size):
+            return await self.fetch_adj_factor_page(trade_date, offset=offset, page_size=page_size, client=client)
+        async for _page_no, page in self._iter_pages(load_page, limit=size, max_pages=max_pages):
+            for row in page:
+                valid = self._validated_adj_factor_row(row, expected)
+                if valid is None:
+                    continue
+                if valid["code"] in seen:
+                    raise ValueError("Tushare adj_factor result contains duplicate ts_code")
+                seen.add(valid["code"])
+                rows.append(valid)
+        return rows
+
+    async def _apply_corporate_action_factors(self, all_rows: dict[str, list[dict]], dates, diagnostics: dict, *, allow_network: bool = True) -> None:
+        target_dates = [self._date(value) for value in dates]
+        target_dates = [value for value in target_dates if value and value in all_rows]
+        if not target_dates:
+            diagnostics["corporate_action_evidence"] = "unavailable"
+            return
+        factor_map: dict[str, dict] = {}
+        reader = getattr(self.storage, "corporate_action_factors", None) if self.storage is not None else None
+        if callable(reader):
+            codes = {row["code"] for date in target_dates for row in all_rows.get(date, [])}
+            try:
+                cached = await self._storage_call(reader, codes, target_dates)
+                for row in (cached or {}).values():
+                    valid = self._validated_adj_factor_row(row)
+                    if valid is not None and valid["trade_date"] in target_dates:
+                        factor_map[f"{valid['code']}:{valid['trade_date']}"] = valid
+            except (RuntimeError, ValueError, TypeError, KeyError):
+                pass
+        fetched_rows = []
+        missing_dates = [
+            date for date in target_dates
+            if any(f"{row['code']}:{date}" not in factor_map for row in all_rows.get(date, []))
+        ]
+        if missing_dates and allow_network:
+            try:
+                async with self.http.slot() as client:
+                    for date in missing_dates:
+                        rows = await self.fetch_adj_factor_date(date, client=client)
+                        fetched_rows.extend(rows)
+                        factor_map.update({f"{row['code']}:{row['trade_date']}": row for row in rows})
+            except asyncio.CancelledError:
+                raise
+            except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareBulkError, ValueError, TypeError, KeyError, AttributeError):
+                diagnostics["corporate_action_fetch_failed"] = True
+        writer = getattr(self.storage, "save_corporate_action_factors", None) if self.storage is not None else None
+        if fetched_rows and callable(writer):
+            try:
+                await self._storage_call(writer, fetched_rows, "tushare_adj_factor")
+                if callable(reader):
+                    refreshed = await self._storage_call(reader, {row["code"] for row in fetched_rows}, target_dates)
+                    for row in fetched_rows:
+                        factor_map.pop(f"{row['code']}:{row['trade_date']}", None)
+                    for value in (refreshed or {}).values():
+                        key = f"{value.get('code')}:{value.get('trade_date')}"
+                        valid = self._validated_adj_factor_row(value)
+                        if valid is None:
+                            factor_map.pop(key, None)
+                        else:
+                            factor_map[key] = valid
+            except (RuntimeError, ValueError, TypeError, KeyError):
+                diagnostics["corporate_action_persist_failed"] = True
+                for row in fetched_rows:
+                    factor_map.pop(f"{row['code']}:{row['trade_date']}", None)
+        attached = 0
+        total = sum(len(all_rows.get(date, [])) for date in target_dates)
+        for date in target_dates:
+            for row in all_rows.get(date, []):
+                factor = factor_map.get(f"{row['code']}:{date}")
+                if not factor:
+                    continue
+                valid = self._validated_adj_factor_row(factor, date)
+                if valid is None:
+                    continue
+                row["corporate_action_factor"] = valid["adj_factor"]
+                row["corporate_action_evidence"] = valid["evidence"]
+                row["corporate_action_observed_at"] = valid["observed_at"]
+                row["corporate_action_response_sha256"] = valid["response_sha256"]
+                attached += 1
+        diagnostics.update({
+            "corporate_action_evidence": "complete" if total and attached == total else ("partial" if attached else "unavailable"),
+            "corporate_action_rows": attached,
+            "corporate_action_expected_rows": total,
+            "corporate_action_dates": target_dates,
+        })
+
     async def _iter_pages(self, fetch_page, *, limit: int, max_pages: int = 1000, start_page: int = 0):
         """Yield pages using the unfiltered server length as the stop signal."""
         size = max(1, min(int(limit), 6000))
@@ -1331,6 +1878,18 @@ class TushareBulkDailyProvider:
         except TypeError:
             pages = loader(batch_id, trade_date)
         pages = list(pages or [])
+        if not pages:
+            # True-incremental reuse: a new daily window reuses the overlapping
+            # sessions already staged by a prior generation instead of fetching
+            # the full 120-day window from Tushare again.
+            reuse = getattr(self.storage, "reuse_partition_for_batch", None)
+            if callable(reuse):
+                try:
+                    reused = reuse(batch_id, trade_date, partition_no=0)
+                except (RuntimeError, ValueError, KeyError, TypeError):
+                    reused = None
+                if isinstance(reused, dict) and reused.get("rows"):
+                    pages = [reused]
         pages.sort(key=lambda item: int(item.get("partition_no", 0)))
         expected_policy = str(filter_policy or "include_all").strip().lower()
         rows: list[dict] = []
@@ -1393,6 +1952,24 @@ class TushareBulkDailyProvider:
         from .storage import StockStore
 
         return StockStore._normalize_universe_status_rows(status, rows)
+
+    def _retag_universe_evidence(self, evidence: dict, effective: str) -> dict:
+        """Re-date a reused universe list to the requested session.
+
+        The membership set is unchanged; only the date metadata and the
+        canonical digest move forward so the daily snapshot consumes the list
+        as if it were fetched for ``effective``.
+        """
+        from .storage import StockStore
+
+        evidence = dict(evidence)
+        evidence["effective_date"] = effective
+        evidence["target_session"] = effective
+        evidence["valid_from"] = effective
+        evidence["valid_to"] = ""
+        evidence["universe_version"] = self._configured_universe_version or f"tushare-stock-basic-v2:{effective}"
+        evidence["digest"] = StockStore._universe_evidence_digest(evidence)
+        return self._validate_evidence(evidence, effective)
 
     def _validate_evidence(self, evidence: dict, trade_date: str) -> dict:
         from .storage import StockStore
@@ -1515,7 +2092,8 @@ class TushareBulkDailyProvider:
         if self.storage is not None:
             active_loader = getattr(self.storage, "active_universe_evidence", None) or getattr(self.storage, "get_active_universe_evidence", None)
             if callable(active_loader):
-                active = active_loader(
+                active = await self._storage_call(
+                    active_loader,
                     effective,
                     provider="tushare",
                     bj_calendar_policy=self.bj_calendar_policy,
@@ -1523,6 +2101,24 @@ class TushareBulkDailyProvider:
                 )
                 if isinstance(active, dict) and isinstance(active.get("evidence"), dict):
                     evidence = self._validate_evidence(dict(active["evidence"]), effective)
+                    self._universe_evidence_cache[effective] = dict(evidence)
+                    self.universe_version = str(evidence.get("universe_version") or self.universe_version)
+                    self.universe_counts = evidence
+                    return evidence
+            recent_loader = getattr(self.storage, "recent_universe_evidence", None)
+            if callable(recent_loader):
+                recent = await self._storage_call(
+                    recent_loader,
+                    effective,
+                    provider="tushare",
+                    bj_calendar_policy=self.bj_calendar_policy,
+                    universe_version=self._configured_universe_version,
+                )
+                if isinstance(recent, dict) and isinstance(recent.get("evidence"), dict):
+                    # The eligible-universe list changes slowly; reuse the
+                    # latest valid list and re-tag it to today so a low-points
+                    # token does not need a fresh ``stock_basic`` call per day.
+                    evidence = self._retag_universe_evidence(dict(recent["evidence"]), effective)
                     self._universe_evidence_cache[effective] = dict(evidence)
                     self.universe_version = str(evidence.get("universe_version") or self.universe_version)
                     self.universe_counts = evidence
@@ -1551,22 +2147,25 @@ class TushareBulkDailyProvider:
             get_batch = getattr(self.storage, "get_or_create_universe_evidence_batch", None) or getattr(self.storage, "begin_universe_evidence_batch", None)
             if not callable(get_batch):
                 raise RuntimeError("universe evidence storage is unavailable")
-            batch = dict(get_batch(
+            batch = dict(await self._storage_call(
+                get_batch,
                 effective,
                 provider="tushare",
                 bj_calendar_policy=self.bj_calendar_policy,
                 universe_version=self._configured_universe_version,
+                universe_statuses=",".join(self.universe_statuses),
             ) or {})
             batch_id = str(batch.get("evidence_batch_id") or "") or None
 
+        status_records: dict[str, dict] = {}
+        completed_statuses: set[str] = set()
         try:
-            status_records: dict[str, dict] = {}
             if batch_id is not None:
                 loader = getattr(self.storage, "universe_evidence_status_records", None) or getattr(self.storage, "load_universe_evidence_status_records", None)
                 if callable(loader):
-                    status_records = dict(loader(batch_id) or {})
+                    status_records = dict(await self._storage_call(loader, batch_id) or {})
                 else:
-                    loaded = self.storage.universe_evidence_statuses(batch_id, with_metadata=True)
+                    loaded = await self._storage_call(self.storage.universe_evidence_statuses, batch_id, with_metadata=True)
                     status_records = dict(loaded or {})
 
             all_rows: dict[str, dict] = {}
@@ -1576,8 +2175,9 @@ class TushareBulkDailyProvider:
                     if previous is not None:
                         raise ValueError("Tushare stock_basic contains duplicate status rows")
                     all_rows[row["code"]] = dict(row)
+            completed_statuses.update(status_records)
 
-            missing_statuses = [status for status in ("L", "D", "P") if status not in status_records]
+            missing_statuses = [status for status in self.universe_statuses if status not in status_records]
 
             async def load_status(status: str, shared_client=None) -> None:
                 if isinstance(getattr(self, "_last_stock_basic_status_metadata", None), dict):
@@ -1597,6 +2197,7 @@ class TushareBulkDailyProvider:
                     if not isinstance(row, dict) or str(row.get("code") or "") in all_rows:
                         raise ValueError("Tushare stock_basic contains duplicate status rows")
                     all_rows[str(row["code"])] = dict(row)
+                completed_statuses.add(status)
                 if batch_id is not None:
                     metadata = getattr(self, "_last_stock_basic_status_metadata", {})
                     metadata = metadata.get(status, {}) if isinstance(metadata, dict) else {}
@@ -1609,13 +2210,13 @@ class TushareBulkDailyProvider:
                         "response_digest": str(metadata.get("response_digest") or ""),
                     }
                     try:
-                        stage(batch_id, status, values, **stage_kwargs)
+                        await self._storage_call(stage, batch_id, status, values, **stage_kwargs)
                     except TypeError as exc:
                         # Keep the adapter usable with a pre-v14 storage
                         # shim that has not added response_digest yet.
                         stage_kwargs.pop("response_digest", None)
                         try:
-                            stage(batch_id, status, values, **stage_kwargs)
+                            await self._storage_call(stage, batch_id, status, values, **stage_kwargs)
                         except TypeError:
                             raise exc
                     status_records[status] = {"rows": self._normalize_evidence_status_rows(status, values)}
@@ -1705,13 +2306,28 @@ class TushareBulkDailyProvider:
                 activate = getattr(self.storage, "activate_universe_evidence", None) or getattr(self.storage, "publish_universe_evidence", None)
                 if not callable(activate):
                     raise RuntimeError("universe evidence activation storage is unavailable")
-                activated = activate(batch_id, evidence)
+                activated = await self._storage_call(activate, batch_id, evidence)
                 if isinstance(activated, dict) and isinstance(activated.get("evidence"), dict):
                     evidence = self._validate_evidence(dict(activated["evidence"]), effective)
             self._universe_evidence_cache[effective] = dict(evidence)
             self.universe_version = evidence["universe_version"]
             self.universe_counts = evidence
             return evidence
+        except TushareRateLimitError as exc:
+            pending_statuses = tuple(
+                status for status in self.universe_statuses if status not in completed_statuses
+            )
+            # Keep this bounded and deterministic for the snapshot coordinator.
+            # The durable batch retains completed statuses, so a retry only
+            # needs to request the pending statuses from this same cycle.
+            exc.failure_stage = "universe"
+            exc.provider_api = "stock_basic"
+            exc.universe_missing_statuses = pending_statuses
+            if batch_id is not None:
+                fail = getattr(self.storage, "fail_universe_evidence_batch", None) or getattr(self.storage, "abort_universe_evidence_batch", None)
+                if callable(fail):
+                    fail(batch_id, "stock_basic rate limited")
+            raise
         except asyncio.CancelledError:
             if batch_id is not None:
                 fail = getattr(self.storage, "fail_universe_evidence_batch", None) or getattr(self.storage, "abort_universe_evidence_batch", None)
@@ -1845,8 +2461,27 @@ class TushareBulkDailyProvider:
             await self._run_lease_guard(lease_guard)
             universe_evidence = await self.fetch_universe_evidence(dates[0], max_pages=max_pages)
             await self._run_lease_guard(lease_guard)
-        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
-            diagnostics["network_failed"] = 1
+        except TushareRateLimitError as exc:
+            pending = getattr(exc, "universe_missing_statuses", ())
+            if not isinstance(pending, (list, tuple, set)):
+                pending = ()
+            diagnostics.update({
+                "network_failed": 0,
+                "rate_limited": 1,
+                "failure_kind": "rate_limit",
+                "failure_stage": "universe",
+                "provider_api": "stock_basic",
+                "universe_missing_statuses": [status for status in ("L", "D", "P") if status in pending],
+            })
+            self.last_diagnostics = diagnostics
+            return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
+        except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareNetworkError):
+            diagnostics.update({
+                "network_failed": 1,
+                "failure_kind": "network",
+                "failure_stage": "universe",
+                "provider_api": "stock_basic",
+            })
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
         except TushareCalendarError as exc:
@@ -1882,11 +2517,13 @@ class TushareBulkDailyProvider:
             # with no daily rows is an incomplete batch, never a usable
             # generation.  Storage errors are internal failures and must not
             # be reclassified as transient history problems.
-            batch_id, batch_record = self._begin_raw_batch(requested, dates, universe_evidence)
+            batch_id, batch_record = await self._storage_call(
+                self._begin_raw_batch, requested, dates, universe_evidence
+            )
 
         staging_cleanup_attempted = False
 
-        def fail_staging(error: str) -> None:
+        async def fail_staging(error: str) -> None:
             nonlocal staging_cleanup_attempted
             if staging_cleanup_attempted:
                 return
@@ -1896,7 +2533,7 @@ class TushareBulkDailyProvider:
             fail_batch = getattr(self.storage, "fail_raw_batch", None)
             if callable(fail_batch):
                 try:
-                    fail_batch(batch_id, error)
+                    await self._storage_call(fail_batch, batch_id, error)
                 except Exception as cleanup_exc:
                     # The original fetch/validation error is the useful
                     # diagnostic; cleanup failure must not mask it.
@@ -1914,7 +2551,16 @@ class TushareBulkDailyProvider:
                         stored_page_size = self.page_size
                     filter_policy = self._page_filter_policy(date)
                     try:
-                        rows, start_page, staged_complete = self._staged_pages(batch_id, date, page_size=stored_page_size, filter_policy=filter_policy) if batch_id else ([], 0, False)
+                        rows, start_page, staged_complete = (
+                            await self._storage_call(
+                                self._staged_pages,
+                                batch_id,
+                                date,
+                                page_size=stored_page_size,
+                                filter_policy=filter_policy,
+                            )
+                            if batch_id else ([], 0, False)
+                        )
                     except TushareBulkError as exc:
                         if "filter policy mismatch" not in str(exc).lower() or not batch_id:
                             raise
@@ -1925,7 +2571,7 @@ class TushareBulkDailyProvider:
                         reset = getattr(self.storage, "reset_raw_batch_pages", None)
                         if not callable(reset):
                             raise
-                        reset(batch_id, date, from_page=0)
+                        await self._storage_call(reset, batch_id, date, from_page=0)
                         rows, start_page, staged_complete = [], 0, False
                     if staged_complete:
                         all_rows[date] = rows
@@ -1944,7 +2590,8 @@ class TushareBulkDailyProvider:
                         if page:
                             rows.extend(page)
                             if batch_id is not None:
-                                self.storage.stage_raw_partition(
+                                await self._storage_call(
+                                    self.storage.stage_raw_partition,
                                     batch_id, date, page, partition_no=page_no,
                                     source="tushare", basis="unadjusted",
                                     server_rows=raw_page,
@@ -1956,7 +2603,8 @@ class TushareBulkDailyProvider:
                             stage_page = getattr(self.storage, "stage_raw_page_metadata", None)
                             if not callable(stage_page):
                                 raise RuntimeError("raw page metadata storage is unavailable")
-                            stage_page(
+                            await self._storage_call(
+                                stage_page,
                                 batch_id,
                                 date,
                                 partition_no=page_no,
@@ -1976,11 +2624,11 @@ class TushareBulkDailyProvider:
                         seen.add(row["code"])
                     all_rows[date] = rows
         except asyncio.CancelledError:
-            fail_staging("raw fetch cancelled")
+            await fail_staging("raw fetch cancelled")
             raise
         except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError, TushareNetworkError):
             diagnostics["network_failed"] = 1
-            fail_staging("network failure while fetching raw partitions")
+            await fail_staging("network failure while fetching raw partitions")
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
         except TushareNotPublishedError as exc:
@@ -1989,25 +2637,25 @@ class TushareBulkDailyProvider:
                 "failure_kind": "not_published",
                 "error": str(exc)[:240],
             })
-            fail_staging("raw endpoint has not published a completed session")
+            await fail_staging("raw endpoint has not published a completed session")
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
         except TushareHistoryError as exc:
             diagnostics["history_invalid"] = 1
             diagnostics.update({"failure_kind": "history_invalid", "error": str(exc)[:240]})
-            fail_staging("raw partition validation or pagination failed")
+            await fail_staging("raw partition validation or pagination failed")
             self.last_diagnostics = diagnostics
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
         except Exception:
             # Preserve the original programming/storage error while ensuring
             # a partially staged generation cannot remain publishable.
-            fail_staging("raw partition fetch failed unexpectedly")
+            await fail_staging("raw partition fetch failed unexpectedly")
             self.last_diagnostics = diagnostics
             raise
 
         try:
             if not all_rows:
-                fail_staging("raw endpoint returned no usable rows")
+                await fail_staging("raw endpoint returned no usable rows")
                 self.last_diagnostics = diagnostics
                 return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
             loaded_dates = sorted(all_rows, reverse=True)
@@ -2033,31 +2681,37 @@ class TushareBulkDailyProvider:
                     "coverage_failed": 1,
                     "failure_kind": "coverage",
                 })
-                fail_staging("raw batch coverage below configured floor")
+                await fail_staging("raw batch coverage below configured floor")
                 self.last_diagnostics = diagnostics
                 return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
         except asyncio.CancelledError:
-            fail_staging("raw post-partition validation cancelled")
+            await fail_staging("raw post-partition validation cancelled")
             raise
         except Exception:
             # Coverage and all post-partition checks share the same cleanup
             # boundary as partition fetches.  Keep the original exception
             # visible after best-effort staging failure.
-            fail_staging("raw post-partition validation failed unexpectedly")
+            await fail_staging("raw post-partition validation failed unexpectedly")
             self.last_diagnostics = diagnostics
             raise
         complete = False
         if self.storage is not None:
             try:
                 await self._run_lease_guard(lease_guard)
-                published = self.storage.publish_raw_batch(
+                # Publication re-validates and re-hashes every stored bar (a
+                # multi-minute event-loop block on large stores).  Run it in a
+                # worker thread so the bot stays responsive while the batch is
+                # committed.
+                lease_kwargs = self._snapshot_lease_kwargs(snapshot_lease)
+                published = await asyncio.to_thread(
+                    self.storage.publish_raw_batch,
                     batch_id,
                     expected_trade_dates=dates,
                     actual_trade_date=loaded_dates[0],
                     quality="good",
                     source="tushare",
                     shadow=not self.raw_publish_enabled,
-                    **self._snapshot_lease_kwargs(snapshot_lease),
+                    **lease_kwargs,
                 )
                 await self._run_lease_guard(lease_guard)
                 complete = isinstance(published, dict) and str(published.get("status") or "") == "published"
@@ -2084,7 +2738,7 @@ class TushareBulkDailyProvider:
                         "data_mode": "tushare_raw",
                     })
             except asyncio.CancelledError:
-                fail_staging("raw batch publication cancelled")
+                await fail_staging("raw batch publication cancelled")
                 raise
             except TusharePublishError as exc:
                 diagnostics.update({
@@ -2092,14 +2746,14 @@ class TushareBulkDailyProvider:
                     "failure_kind": "publish",
                     "error": str(exc)[:240],
                 })
-                fail_staging("raw batch publication failed")
+                await fail_staging("raw batch publication failed")
                 self.last_diagnostics = diagnostics
                 return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
             except Exception:
                 # Do not turn a storage/programming failure into a fallback
                 # result.  Cleanup is best effort, then the original error
                 # remains visible to the coordinator.
-                fail_staging("raw batch publication failed unexpectedly")
+                await fail_staging("raw batch publication failed unexpectedly")
                 self.last_diagnostics = diagnostics
                 raise
         elif not self.raw_publish_enabled:
@@ -2111,6 +2765,7 @@ class TushareBulkDailyProvider:
                 "fallback_allowed": False,
             })
         latest = loaded_dates[0]
+        await self._apply_corporate_action_factors(all_rows, [latest], diagnostics)
         bars: dict[str, list[dict]] = {}
         for date in sorted(loaded_dates):
             for row in all_rows[date]:
@@ -2118,7 +2773,7 @@ class TushareBulkDailyProvider:
         quotes = []
         now = datetime.now(CHINA_TZ)
         for row in all_rows[latest]:
-            quotes.append(Quote(row["code"], row.get("name") or row["code"], row["close"], row["pre_close"], row["amount"], row["pct_change"], row["volume"], source="tushare", provider_ts=now, fetched_at=now, indicator_last_date=latest, indicator_last_close=row["close"], indicator_price_basis="unadjusted", indicator_source="tushare"))
+            quotes.append(Quote(row["code"], row.get("name") or row["code"], row["close"], row["pre_close"], row["amount"], row["pct_change"], row["volume"], source="tushare", provider_ts=now, fetched_at=now, indicator_last_date=latest, indicator_last_close=row["close"], indicator_price_basis="unadjusted", indicator_source="tushare", corporate_action_factor=row.get("corporate_action_factor"), corporate_action_evidence=str(row.get("corporate_action_evidence") or ""), corporate_action_observed_at=str(row.get("corporate_action_observed_at") or ""), corporate_action_response_sha256=str(row.get("corporate_action_response_sha256") or "")))
         # A daily success is recorded only after every partition and the full
         # coverage/manifest checks have passed.
         self._record_success("daily")
@@ -2193,18 +2848,28 @@ class TushareBulkDailyProvider:
                 "bj_calendar_policy": evidence.get("bj_calendar_policy", self.bj_calendar_policy),
             })
 
-        def cached_result() -> BulkDailyResult:
+        async def cached_result() -> BulkDailyResult:
             if self.storage is None:
                 return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
             try:
-                active = self.storage.active_raw_batch(evaluation_key, as_of=completed_cutoff, max_stale_trading_days=366)
+                active = await self._storage_call(
+                    self.storage.active_raw_batch,
+                    evaluation_key,
+                    as_of=completed_cutoff,
+                    max_stale_trading_days=366,
+                )
                 if not active:
                     return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
                 try:
                     add_universe_diagnostics(self._normalize_evidence(active.get("universe_counts_json") or {}))
                 except (TypeError, ValueError, OverflowError):
                     return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
-                loaded = self.storage.raw_batch_bars(active.get("active_batch_id") or active.get("batch_id"), codes, after=baseline)
+                loaded = await self._storage_call(
+                    self.storage.raw_batch_bars,
+                    active.get("active_batch_id") or active.get("batch_id"),
+                    codes,
+                    after=baseline,
+                )
                 # A cached evaluation generation is usable only for completed
                 # rows strictly after this baseline and no later than the
                 # completed endpoint used for this request.  Never let a
@@ -2218,6 +2883,7 @@ class TushareBulkDailyProvider:
                             continue
                         valid_rows.setdefault(str(code), []).append(row)
                 loaded = valid_rows
+                await self._apply_corporate_action_factors(loaded, {str(row.get("trade_date")) for rows in loaded.values() for row in rows}, diagnostics, allow_network=False)
                 dates = sorted({str(row.get("trade_date")) for rows in loaded.values() for row in rows if row.get("trade_date")}, reverse=True)
                 if len(dates) < horizon:
                     return BulkDailyResult([], {}, None, None, quality="partial", complete=False, diagnostics=diagnostics)
@@ -2234,42 +2900,55 @@ class TushareBulkDailyProvider:
             dates = dates[: max(horizon, min(horizon * 3, 60))]
             if len(dates) < horizon:
                 diagnostics["history_invalid"] = 1
-                return cached_result()
+                return await cached_result()
         except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen, TushareRateLimitError):
             diagnostics["network_failed"] = 1
-            return cached_result()
+            return await cached_result()
         except (ValueError, TypeError, KeyError, TushareBulkError):
             diagnostics["history_invalid"] = 1
-            return cached_result()
+            return await cached_result()
 
         try:
             universe_evidence = await self.fetch_universe_evidence(dates[0], max_pages=max_pages)
         except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen):
             diagnostics["network_failed"] = 1
-            return cached_result()
+            return await cached_result()
         except (ValueError, TypeError, KeyError, TushareBulkError):
             diagnostics["history_invalid"] = 1
-            return cached_result()
+            return await cached_result()
         add_universe_diagnostics(universe_evidence)
 
         batch_id = None
         batch_record: dict = {}
         if self.storage is not None:
             try:
-                batch_id, batch_record = self._begin_raw_batch(dates[0], dates, universe_evidence, dataset_key=evaluation_key)
+                batch_id, batch_record = await self._storage_call(
+                    self._begin_raw_batch,
+                    dates[0],
+                    dates,
+                    universe_evidence,
+                    dataset_key=evaluation_key,
+                )
             except (ValueError, TypeError, KeyError, RuntimeError):
                 diagnostics["history_invalid"] = 1
                 return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics=diagnostics)
 
-        def fail_staging(error: str) -> None:
+        staging_cleanup_attempted = False
+
+        async def fail_staging(error: str) -> None:
+            nonlocal staging_cleanup_attempted
+            if staging_cleanup_attempted:
+                return
+            staging_cleanup_attempted = True
             if batch_id is None:
                 return
             fail_batch = getattr(self.storage, "fail_raw_batch", None)
             if callable(fail_batch):
                 try:
-                    fail_batch(batch_id, error)
-                except Exception:
-                    pass
+                    await self._storage_call(fail_batch, batch_id, error)
+                except Exception as cleanup_exc:
+                    diagnostics["staging_cleanup_failed"] = True
+                    diagnostics["staging_cleanup_error_type"] = type(cleanup_exc).__name__
 
         all_rows: dict[str, list[dict]] = {}
         try:
@@ -2282,14 +2961,20 @@ class TushareBulkDailyProvider:
                         stored_page_size = self.page_size
                     filter_policy = self._page_filter_policy(trade_date)
                     try:
-                        rows, start_page, staged_complete = self._staged_pages(batch_id, trade_date, page_size=stored_page_size, filter_policy=filter_policy) if batch_id else ([], 0, False)
+                        rows, start_page, staged_complete = await self._storage_call(
+                            self._staged_pages,
+                            batch_id,
+                            trade_date,
+                            page_size=stored_page_size,
+                            filter_policy=filter_policy,
+                        ) if batch_id else ([], 0, False)
                     except TushareBulkError as exc:
                         if "filter policy mismatch" not in str(exc).lower() or not batch_id:
                             raise
                         reset = getattr(self.storage, "reset_raw_batch_pages", None)
                         if not callable(reset):
                             raise
-                        reset(batch_id, trade_date, from_page=0)
+                        await self._storage_call(reset, batch_id, trade_date, from_page=0)
                         rows, start_page, staged_complete = [], 0, False
                     if staged_complete:
                         all_rows[trade_date] = rows
@@ -2304,7 +2989,8 @@ class TushareBulkDailyProvider:
                         page = raw_page if filter_policy != "exclude_bj" else [row for row in raw_page if not str(row.get("ts_code") or "").endswith(".BJ")]
                         rows.extend(page)
                         if page and batch_id is not None:
-                            self.storage.stage_raw_partition(
+                            await self._storage_call(
+                                self.storage.stage_raw_partition,
                                 batch_id,
                                 trade_date,
                                 page,
@@ -2320,7 +3006,8 @@ class TushareBulkDailyProvider:
                             stage_page = getattr(self.storage, "stage_raw_page_metadata", None)
                             if not callable(stage_page):
                                 raise RuntimeError("raw page metadata storage is unavailable")
-                            stage_page(
+                            await self._storage_call(
+                                stage_page,
                                 batch_id,
                                 trade_date,
                                 partition_no=page_no,
@@ -2337,16 +3024,16 @@ class TushareBulkDailyProvider:
                         raise ValueError("Tushare evaluation daily contains duplicate codes")
                     all_rows[trade_date] = rows
         except asyncio.CancelledError:
-            fail_staging("evaluation raw fetch cancelled")
+            await fail_staging("evaluation raw fetch cancelled")
             raise
         except (httpx.HTTPError, asyncio.TimeoutError, OSError, TushareCircuitOpen):
             diagnostics["network_failed"] = 1
-            fail_staging("network failure while fetching evaluation partitions")
-            return cached_result()
+            await fail_staging("network failure while fetching evaluation partitions")
+            return await cached_result()
         except (ValueError, TypeError, KeyError, TushareBulkError):
             diagnostics["history_invalid"] = 1
-            fail_staging("evaluation partition validation failed")
-            return cached_result()
+            await fail_staging("evaluation partition validation failed")
+            return await cached_result()
 
         coverage = self._coverage_metrics(all_rows, requested_date=dates[0], actual_trade_date=dates[0])
         diagnostics.update({
@@ -2362,12 +3049,13 @@ class TushareBulkDailyProvider:
         })
         if not coverage.get("coverage_ok"):
             diagnostics["history_invalid"] = 1
-            fail_staging("evaluation raw coverage below configured floor")
-            return cached_result()
+            await fail_staging("evaluation raw coverage below configured floor")
+            return await cached_result()
         published = None
         if self.storage is not None:
             try:
-                published = self.storage.publish_raw_batch(
+                published = await self._storage_call(
+                    self.storage.publish_raw_batch,
                     batch_id,
                     expected_trade_dates=dates,
                     actual_trade_date=dates[0],
@@ -2379,8 +3067,9 @@ class TushareBulkDailyProvider:
                     raise RuntimeError("evaluation raw batch publication did not return published status")
             except Exception:
                 diagnostics["history_invalid"] = 1
-                fail_staging("evaluation raw batch publication failed")
-                return cached_result()
+                await fail_staging("evaluation raw batch publication failed")
+                return await cached_result()
+        await self._apply_corporate_action_factors(all_rows, dates, diagnostics)
         selected = {str(code).split(".", 1)[0] for code in (codes or [])}
         bars: dict[str, list[dict]] = {}
         for trade_date in sorted(all_rows):
@@ -2400,7 +3089,7 @@ class TushareBulkDailyProvider:
 class SinaQuoteProvider:
     """Prototype provider; replace it with a licensed/stable source for production."""
 
-    def __init__(self, timeout: float = 10, tushare_url: str = "", tushare_token: str = "", max_concurrency: int = 8, http_runtime: HttpRuntime | None = None, symbol_store=None, *, gateway: TushareRequestGateway | None = None, bulk_page_size: int = 6000, bulk_retry_attempts: int = 3, bj_calendar_policy: str = "require_bse", raw_dataset_key: str = "tushare_daily", min_snapshot_size: int = DEFAULT_TUSHARE_MIN_SNAPSHOT_SIZE, daily_snapshot_min_size: int | None = None, min_overall_coverage: float = 0.97, min_market_coverage: float = 0.95, min_market_median_ratio: float = 0.95, universe_version: str = "", universe_counts=None, universe_evidence=None, require_universe_evidence: bool = DEFAULT_TUSHARE_REQUIRE_UNIVERSE_EVIDENCE, raw_publish_enabled: bool = True, session_count: int = 120):
+    def __init__(self, timeout: float = 10, tushare_url: str = "", tushare_token: str = "", max_concurrency: int = 8, http_runtime: HttpRuntime | None = None, symbol_store=None, *, gateway: TushareRequestGateway | None = None, bulk_page_size: int = 6000, bulk_retry_attempts: int = 3, bj_calendar_policy: str = "require_bse", raw_dataset_key: str = "tushare_daily", min_snapshot_size: int = DEFAULT_TUSHARE_MIN_SNAPSHOT_SIZE, daily_snapshot_min_size: int | None = None, min_overall_coverage: float = 0.97, min_market_coverage: float = 0.95, min_market_median_ratio: float = 0.95, universe_version: str = "", universe_counts=None, universe_evidence=None, require_universe_evidence: bool = DEFAULT_TUSHARE_REQUIRE_UNIVERSE_EVIDENCE, raw_publish_enabled: bool = True, session_count: int = 120, universe_statuses: str = "L,D,P", realtime_backup_mode: str = "disabled", realtime_backup_min_interval_seconds: float = 60.0):
         self.timeout = timeout
         self.tushare_url = str(tushare_url or "").strip() or "https://api.tushare.pro"
         self.tushare_token = str(tushare_token or "").strip()
@@ -2411,6 +3100,26 @@ class SinaQuoteProvider:
         self._last_tushare_date: str | None = None
         self._tushare_names: dict[str, str] = {}
         self.symbol_store = symbol_store
+        configured_realtime_mode = str(realtime_backup_mode or "disabled").strip().lower()
+        self.realtime_backup_mode = configured_realtime_mode if configured_realtime_mode in {"disabled", "shadow", "fallback"} else "disabled"
+        try:
+            interval = float(realtime_backup_min_interval_seconds)
+        except (TypeError, ValueError, OverflowError):
+            interval = 60.0
+        self.realtime_backup_min_interval_seconds = max(5.0, min(interval if math.isfinite(interval) else 60.0, 3600.0))
+        self._realtime_backup_last_attempt_at: datetime | None = None
+        self._realtime_backup_blocked_until: datetime | None = None
+        self._realtime_backup_permission_denied = False
+        self.last_realtime_backup_diagnostics: dict[str, object] = {
+            "mode": self.realtime_backup_mode,
+            "selected_source": "sina",
+            "attempts": 0,
+            "successes": 0,
+            "failures": 0,
+            "skipped": 0,
+            "last_status": "disabled" if self.realtime_backup_mode == "disabled" else "not_attempted",
+            "last_error": "",
+        }
         self.gateway = gateway or TushareRequestGateway(
             self.tushare_token,
             self.tushare_url,
@@ -2440,6 +3149,7 @@ class SinaQuoteProvider:
             gateway=self.gateway,
             raw_publish_enabled=raw_publish_enabled,
             session_count=session_count,
+            universe_statuses=universe_statuses,
         )
         self.evaluation_provider = TushareBulkDailyProvider(
             self.tushare_token,
@@ -2462,6 +3172,7 @@ class SinaQuoteProvider:
             gateway=self.gateway,
             raw_publish_enabled=raw_publish_enabled,
             session_count=session_count,
+            universe_statuses=universe_statuses,
         )
         # Current industry labels are display annotations, not historical
         # factor snapshots.  Cache both successful lookups and short-lived
@@ -2472,15 +3183,31 @@ class SinaQuoteProvider:
         # loops and AstrBot's long-lived event loop.
         self._industry_inflight: dict[str, asyncio.Future] = {}
 
-    def _remember_symbol(self, code: str, name: str, source: str) -> None:
+    def _remember_symbols_sync(self, symbols: Iterable[tuple[str, str, str]]) -> None:
         if not self.symbol_store:
             return
-        try:
-            self.symbol_store.upsert_stock_symbol(code, name, source)
-        except Exception:
-            # A lookup cache must never turn an otherwise usable quote into a
-            # failed provider response.
-            pass
+        for code, name, source in symbols:
+            try:
+                self.symbol_store.upsert_stock_symbol(code, name, source)
+            except Exception:
+                # A lookup cache must never turn an otherwise usable quote
+                # into a failed provider response.
+                continue
+
+    async def _remember_symbols(self, symbols: Iterable[tuple[str, str, str]]) -> None:
+        if not self.symbol_store:
+            return
+        unique: dict[str, tuple[str, str, str]] = {}
+        for code, name, source in symbols:
+            code_value = str(code or "").strip()
+            name_value = str(name or "").strip()
+            if code_value and name_value:
+                unique[code_value] = (code_value, name_value, str(source or ""))
+        if unique:
+            await asyncio.to_thread(self._remember_symbols_sync, tuple(unique.values()))
+
+    async def _remember_symbol(self, code: str, name: str, source: str) -> None:
+        await self._remember_symbols(((code, name, source),))
 
     @staticmethod
     def _clear_indicator_state(quote: Quote) -> None:
@@ -2505,6 +3232,11 @@ class SinaQuoteProvider:
         if not self.tushare_token:
             return BulkDailyResult([], {}, None, None, quality="unknown", complete=False, diagnostics={"network_failed": 0})
         result = await self.bulk_provider.fetch_bulk_daily_result(trade_date, **kwargs)
+        # Tushare daily bars deliberately do not infer a live trading-state
+        # tuple.  Reconcile it from the existing explicit Eastmoney companion
+        # fields before the daily coordinator can persist or screen the rows.
+        if isinstance(result, BulkDailyResult):
+            await self.enrich_daily_risk_fields(result.quotes)
         self.last_diagnostics = dict(result.diagnostics or {}) if isinstance(result, BulkDailyResult) else {}
         return result
 
@@ -2521,6 +3253,20 @@ class SinaQuoteProvider:
         return await self.bulk_provider.fetch_completed_trade_dates(
             end_date,
             lookback_days=lookback_days,
+            session_count=session_count,
+        )
+
+    async def fetch_daily_symbol_calendar_evidence(
+        self,
+        end_date: str,
+        *,
+        session_count: int | None = None,
+    ) -> dict:
+        """Expose strict daily-symbol calendar evidence to the coordinator."""
+        if not self.tushare_token:
+            raise TusharePermissionError("Tushare token is required for daily calendar evidence")
+        return await self.bulk_provider.fetch_daily_symbol_calendar_evidence(
+            end_date,
             session_count=session_count,
         )
 
@@ -2570,6 +3316,131 @@ class SinaQuoteProvider:
         except (TypeError, ValueError, OverflowError):
             return None
         return parsed.isoformat()
+
+    async def fetch_eastmoney_completed_trade_dates(
+        self,
+        end_date: str = "",
+        lookback_days: int | None = None,
+        *,
+        session_count: int | None = None,
+        client=None,
+    ) -> list[str]:
+        """Return an exact, date-validated SSE index session window.
+
+        Eastmoney's kline response is used only as calendar evidence.  The
+        response order may be ascending or descending, but it must be
+        monotonic; callers always receive newest-first dates.
+        """
+        requested = self._canonical_eastmoney_date(
+            end_date or datetime.now(CHINA_TZ).date().isoformat()
+        )
+        if not requested:
+            raise ValueError("Eastmoney calendar end_date is invalid")
+        if lookback_days is not None and session_count is not None:
+            raise ValueError("provide only one of session_count and lookback_days")
+        configured = getattr(self.bulk_provider, "session_count", 120)
+        raw_count = session_count if session_count is not None else lookback_days
+        if raw_count is None:
+            raw_count = configured
+        try:
+            target_sessions = int(raw_count)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Eastmoney calendar session_count is invalid") from exc
+        if target_sessions < 1 or target_sessions > 1000:
+            raise ValueError("Eastmoney calendar session_count must be between 1 and 1000")
+
+        cutoff = completed_session_cutoff(requested)
+        params = {
+            "secid": "1.000001",
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "fqt": "0",
+            "beg": "0",
+            "end": cutoff.replace("-", ""),
+            "lmt": str(min(target_sessions, 1000)),
+        }
+
+        async def request(shared_client):
+            for attempt in range(1, 3):
+                try:
+                    response = await shared_client.get(EASTMONEY_INDEX_KLINE_URL, params=params)
+                    response.raise_for_status()
+                    return response.json()
+                except asyncio.CancelledError:
+                    raise
+                except (httpx.TransportError, httpx.TimeoutException, asyncio.TimeoutError, OSError) as exc:
+                    if attempt >= 2:
+                        raise TushareCalendarEndpointError(
+                            "Eastmoney SSE index calendar endpoint unavailable after 2 attempts",
+                            category="network",
+                            attempts=attempt,
+                            required_sessions=target_sessions,
+                        ) from exc
+                    await asyncio.sleep(0.25)
+
+        if client is None:
+            async with self.http.slot() as shared_client:
+                payload = await request(shared_client)
+        else:
+            payload = await request(client)
+        if not isinstance(payload, dict):
+            raise ValueError("Eastmoney calendar response is not an object")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("Eastmoney calendar data is not an object")
+        rows = data.get("klines")
+        if not isinstance(rows, list) or not rows:
+            raise TushareCalendarError("Eastmoney SSE index calendar returned no sessions", required_sessions=target_sessions)
+
+        dates: list[str] = []
+        seen: set[str] = set()
+        for raw in rows:
+            if not isinstance(raw, str):
+                raise ValueError("Eastmoney calendar kline row is invalid")
+            fields = raw.split(",")
+            if len(fields) != 11 or any(not str(value).strip() for value in fields):
+                raise ValueError("Eastmoney calendar kline row is malformed")
+            try:
+                numeric_fields = [float(value) for value in fields[1:11]]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Eastmoney calendar kline values are malformed") from exc
+            if not all(math.isfinite(value) for value in numeric_fields):
+                raise ValueError("Eastmoney calendar kline values are malformed")
+            value = self._canonical_eastmoney_date(fields[0])
+            if not value:
+                raise ValueError("Eastmoney calendar contains an invalid date")
+            if value > cutoff or value > requested:
+                raise ValueError("Eastmoney calendar contains a date beyond the completed cutoff")
+            if value in seen:
+                raise ValueError("Eastmoney calendar contains duplicate dates")
+            seen.add(value)
+            dates.append(value)
+
+        ascending = sorted(dates)
+        descending = list(reversed(ascending))
+        if dates != ascending and dates != descending:
+            raise ValueError("Eastmoney calendar dates are unordered")
+        newest_first = dates if dates == descending else list(reversed(dates))
+        if len(newest_first) < target_sessions:
+            raise TushareCalendarError(
+                f"Eastmoney SSE index calendar returned only {len(newest_first)} sessions; {target_sessions} required",
+                available_dates=newest_first,
+                required_sessions=target_sessions,
+            )
+        latest = datetime.strptime(newest_first[0], "%Y-%m-%d").date()
+        cutoff_date = datetime.strptime(cutoff, "%Y-%m-%d").date()
+        if (cutoff_date - latest).days > EASTMONEY_CALENDAR_MAX_LAG_DAYS:
+            raise TushareCalendarError(
+                "Eastmoney SSE index calendar is stale",
+                available_dates=newest_first,
+                required_sessions=target_sessions,
+            )
+        return newest_first[:target_sessions]
+
+    fetch_eastmoney_trade_dates = fetch_eastmoney_completed_trade_dates
+    fetch_eastmoney_completed_sessions = fetch_eastmoney_completed_trade_dates
 
     async def fetch_eastmoney_fallback_result(
         self,
@@ -2663,7 +3534,7 @@ class SinaQuoteProvider:
         if self.tushare_token:
             try:
                 if self.bulk_provider.storage is not None:
-                    bulk = await self.bulk_provider.fetch_bulk_daily_result(
+                    bulk = await self.fetch_bulk_daily_result(
                         trade_date,
                         session_count=self.bulk_provider.session_count,
                     )
@@ -2697,6 +3568,7 @@ class SinaQuoteProvider:
             quotes = await self._fetch_tushare_daily(client, requested)
             if quotes:
                 await self._apply_tushare_names(client, quotes)
+                await self.enrich_daily_risk_fields(quotes)
                 self.bulk_provider._record_success("daily")
                 return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(requested), "tushare", "good")
 
@@ -2712,6 +3584,7 @@ class SinaQuoteProvider:
                 quotes = await self._fetch_tushare_daily(client, date_value)
                 if quotes:
                     await self._apply_tushare_names(client, quotes)
+                    await self.enrich_daily_risk_fields(quotes)
                     self.bulk_provider._record_success("daily")
                     return MarketSnapshotResult(quotes, self._last_tushare_date or self._normalize_trade_date(date_value), "tushare", "good")
         return MarketSnapshotResult([], None, "tushare", "unknown")
@@ -2787,13 +3660,15 @@ class SinaQuoteProvider:
                 except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, TushareBulkError):
                     continue
         updated = 0
+        remembered: list[tuple[str, str, str]] = []
         for quote in quotes:
             name = self._tushare_names.get(quote.code)
             if name:
                 if quote.name != name:
                     quote.name = name
                     updated += 1
-                self._remember_symbol(quote.code, name, "tushare")
+                remembered.append((quote.code, name, "tushare"))
+        await self._remember_symbols(remembered)
         return updated
 
     async def enrich_names(self, quotes: list[Quote]) -> int:
@@ -2849,9 +3724,12 @@ class SinaQuoteProvider:
         url = str(daily_market_url or "").strip() or "https://push2.eastmoney.com/api/qt/clist/get"
         fields = "f2,f3,f4,f5,f6,f12,f14"
         result: list[Quote] = []
+        seen_codes: set[str] = set()
         page = 1
-        # Eastmoney may silently cap oversized pages; 200 keeps pagination predictable.
-        page_size = 200
+        # Eastmoney clist caps page size at 100 rows even when a larger pz is
+        # requested.  Request exactly the cap so the page*page_size >= total
+        # stop condition cannot undercount the full market.
+        page_size = 100
         async with self.http.slot() as client:
             while True:
                 params = {
@@ -2895,20 +3773,25 @@ class SinaQuoteProvider:
                 diff = list(diff)
                 for row in diff:
                     quote = self._snapshot_row(row)
-                    if quote:
+                    # Pagination can repeat boundary rows.  Retain exactly
+                    # one row per raw validated security rather than inflate
+                    # coverage or risk enrichment with duplicates.
+                    if quote and quote.code not in seen_codes:
+                        seen_codes.add(quote.code)
                         result.append(quote)
                 total = data.get("total")
                 if not diff or (total is not None and page * page_size >= int(total)) or (total is None and len(diff) < page_size):
                     break
                 page += 1
+        await self.enrich_daily_risk_fields(result)
         return result
 
     @staticmethod
     def _snapshot_row(row: dict) -> Quote | None:
         if not isinstance(row, dict):
             return None
-        code = str(row.get("f12") or "").zfill(6)
-        if not code.isdigit() or len(code) != 6:
+        code = _raw_six_digit_code(row.get("f12"), allow_exchange_prefix=False)
+        if not code:
             return None
         try:
             price = float(row.get("f2") or 0)
@@ -2918,10 +3801,227 @@ class SinaQuoteProvider:
             amount = float(row.get("f6") or 0)
         except (TypeError, ValueError):
             return None
-        return Quote(code, str(row.get("f14") or code), price, prev_close, amount, pct_change, volume, source="eastmoney", provider_ts=datetime.now(CHINA_TZ), fetched_at=datetime.now(CHINA_TZ))
+        # This clist response has no exchange quote timestamp.  Collection
+        # time is recorded separately and must never be promoted to provider
+        # time for freshness logic.
+        return Quote(code, str(row.get("f14") or code), price, prev_close, amount, pct_change, volume,
+                     source="eastmoney", provider_ts=None, fetched_at=datetime.now(CHINA_TZ))
 
-    async def fetch_quotes(self, codes: Iterable[str]) -> list[Quote]:
-        values = list(dict.fromkeys(normalize_code(code) for code in codes if normalize_code(code)))[:500]
+    @staticmethod
+    def _explicit_quote_flag(value) -> bool | None:
+        """Decode an explicit provider flag without treating missing data as false."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"0", "false", "no", "normal", "active"}:
+                return False
+            if normalized in {"1", "true", "yes", "suspended", "halted", "st"}:
+                return True
+        return None
+
+    @classmethod
+    def _apply_authoritative_risk_fields(cls, quotes: list[Quote], rows) -> None:
+        """Populate risk flags solely from explicit authoritative quote fields.
+
+        Missing, malformed, or conflicting values deliberately remain None;
+        downstream intraday signalling treats that as a blocking unknown.
+        """
+        by_code = {
+            _raw_six_digit_code(getattr(quote, "code", "")): quote
+            for quote in quotes
+            if _raw_six_digit_code(getattr(quote, "code", ""))
+        }
+        evidence = {
+            code: {"suspended": [], "limit_up": [], "limit_down": [], "st": [], "uncertain": set(), "row_count": 0}
+            for code in by_code
+        }
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            code = _raw_six_digit_code(row.get("f12") or row.get("code"), allow_exchange_prefix=False)
+            quote = by_code.get(code)
+            if quote is None:
+                continue
+            values = evidence[code]
+            # The companion endpoint is expected to yield one authoritative
+            # row per requested code.  More than one matching row leaves the
+            # source identity indeterminate, even when their visible fields
+            # agree, so the complete risk tuple must fail closed.
+            values["row_count"] += 1
+            if values["row_count"] > 1:
+                values["uncertain"].update(("suspended", "limit_up", "limit_down", "st"))
+                continue
+            suspended_values = [
+                cls._explicit_quote_flag(row[key])
+                for key in ("suspended", "trade_status")
+                if key in row
+            ]
+            suspended_values = [value for value in suspended_values if value is not None]
+            if len(set(suspended_values)) == 1 and suspended_values:
+                values["suspended"].append(suspended_values[0])
+            else:
+                values["uncertain"].add("suspended")
+            st_values = [
+                cls._explicit_quote_flag(row[key])
+                for key in ("st", "st_flag", "is_st")
+                if key in row
+            ]
+            st_values = [value for value in st_values if value is not None]
+            if len(set(st_values)) == 1 and st_values:
+                values["st"].append(st_values[0])
+            else:
+                values["uncertain"].add("st")
+            try:
+                last = float(row["f43"])
+                upper = float(row["f51"])
+                lower = float(row["f52"])
+                valid_limits = (
+                    all(math.isfinite(value) and value > 0 for value in (last, upper, lower))
+                    and lower < upper and lower <= last <= upper
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                valid_limits = False
+            if valid_limits:
+                values["limit_up"].append(last == upper)
+                values["limit_down"].append(last == lower)
+            else:
+                values["uncertain"].update(("limit_up", "limit_down"))
+
+        for code, quote in by_code.items():
+            values = evidence[code]
+            for field in ("suspended", "limit_up", "limit_down", "st"):
+                explicit = values[field]
+                value = (explicit[0]
+                         if values["row_count"] == 1 and field not in values["uncertain"]
+                         and explicit and len(set(explicit)) == 1 else None)
+                setattr(quote, field, formal_source_policy.formal_value(
+                    value, source="eastmoney:companion", scenario_version="", field=field))
+            quote.risk_source = "eastmoney:companion"
+            quote.risk_scenario_version = ""
+
+    async def _enrich_risk_fields(
+        self,
+        quotes: list[Quote],
+        *,
+        batch_size: int = DAILY_RISK_ENRICH_BATCH_SIZE,
+        collect_observations: bool = False,
+    ) -> dict[str, object]:
+        """Read bounded companion rows; every failed batch remains unknown.
+
+        This intentionally accepts only the companion endpoint's explicit
+        suspension/trade-status and f43/f51/f52 values.  It never derives a
+        limit state from price, board, or a limit formula.
+        """
+        unique: list[Quote] = []
+        seen: set[str] = set()
+        for quote in quotes or []:
+            code = _raw_six_digit_code(getattr(quote, "code", ""))
+            if code and code not in seen:
+                seen.add(code)
+                unique.append(quote)
+        if not unique:
+            result = {"requested": 0, "batches": 0, "transport_failed": 0, "invalid_response": 0, "matched_rows": 0, "complete": 0}
+            if collect_observations:
+                result["observations"] = []
+            return result
+        summary = {"requested": len(unique), "batches": 0, "transport_failed": 0, "invalid_response": 0, "matched_rows": 0, "complete": 0}
+        if collect_observations:
+            summary["observations"] = []
+        size = max(1, min(int(batch_size), DAILY_RISK_ENRICH_BATCH_SIZE))
+        for start in range(0, len(unique), size):
+            batch = unique[start:start + size]
+            summary["batches"] += 1
+            try:
+                async with self.http.slot() as client:
+                    response = await client.get(
+                        "https://push2.eastmoney.com/api/qt/ulist.np/get",
+                        params={
+                            "secids": ",".join(self._eastmoney_secid(quote.code) for quote in batch),
+                            "fields": "f12,f43,f51,f52,f86,suspended,trade_status",
+                        },
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                rows = data.get("diff") if isinstance(data, dict) else None
+                if not isinstance(rows, (dict, list)):
+                    summary["invalid_response"] += 1
+                    continue
+                rows = list(rows.values()) if isinstance(rows, dict) else rows
+                codes = {quote.code for quote in batch}
+                summary["matched_rows"] += sum(
+                    isinstance(row, dict) and _raw_six_digit_code(row.get("f12") or row.get("code"), allow_exchange_prefix=False) in codes
+                    for row in rows
+                )
+                self._apply_authoritative_risk_fields(batch, rows)
+                if collect_observations:
+                    by_code = {}
+                    for row in rows:
+                        if isinstance(row, dict):
+                            by_code.setdefault(_raw_six_digit_code(row.get("f12") or row.get("code"), allow_exchange_prefix=False), []).append(row)
+                    observed = datetime.now(timezone.utc)
+                    for quote in batch:
+                        matched = by_code.get(str(quote.code), [])
+                        fields = {field: getattr(quote, field) for field in ("suspended", "limit_up", "limit_down", "st")
+                                  if isinstance(getattr(quote, field, None), bool)}
+                        if len(matched) != 1 or not fields:
+                            continue
+                        try:
+                            row = matched[0]
+                            source_price = float(row["f43"]) / 100
+                            stamp = int(row["f86"])
+                            source_time = datetime.fromtimestamp(stamp, timezone.utc)
+                            valid = (math.isfinite(source_price) and abs(source_price - float(quote.price)) <= 0.005
+                                     and source_time <= observed)
+                        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                            valid = False
+                        if valid:
+                            summary["observations"].append({
+                                "code": str(quote.code), "reference_close": float(quote.price),
+                                "first_observed_at": observed.isoformat(),
+                                "source_timestamp": source_time.isoformat(),
+                                "fields": fields,
+                            })
+            except httpx.HTTPError:
+                summary["transport_failed"] += 1
+                continue
+            except (ValueError, TypeError, AttributeError):
+                summary["invalid_response"] += 1
+                # Do not synthesize a safe state after a failed batch.
+                continue
+        summary["complete"] = sum(
+            all(getattr(quote, field, None) is not None for field in ("suspended", "limit_up", "limit_down", "st"))
+            for quote in unique
+        )
+        return summary
+
+    async def enrich_daily_risk_fields(
+        self,
+        quotes: list[Quote],
+        *,
+        batch_size: int = DAILY_RISK_ENRICH_BATCH_SIZE,
+        collect_observations: bool = False,
+    ) -> dict[str, object]:
+        """Enrich only incomplete daily risk tuples, preserving cached facts."""
+        rows = [formal_source_policy.mask_quote_negatives(quote) for quote in (quotes or [])]
+        targets = [
+            quote for quote in rows
+            if any(getattr(quote, field, None) is None
+                   for field in ("suspended", "limit_up", "limit_down", "st"))
+        ]
+        return await self._enrich_risk_fields(targets, batch_size=batch_size,
+                                              collect_observations=collect_observations)
+
+    async def fetch_quotes(
+        self,
+        codes: Iterable[str],
+        *,
+        remember_symbols: bool = True,
+    ) -> list[Quote]:
+        values = list(dict.fromkeys(_raw_six_digit_code(code) for code in codes if _raw_six_digit_code(code)))[:500]
         if not values:
             return []
         url = "https://hq.sinajs.cn/list=" + ",".join(_sina_symbol(code) for code in values)
@@ -2929,7 +4029,9 @@ class SinaQuoteProvider:
             response = await client.get(url, headers={"Referer": "https://finance.sina.com.cn/"})
             response.raise_for_status()
             payload = response.text
+        collected_at = datetime.now(CHINA_TZ)
         result: list[Quote] = []
+        remembered: list[tuple[str, str, str]] = []
         for symbol, raw in re.findall(r'hq_str_([a-z0-9]+)="(.*?)";', payload, flags=re.I):
             fields = raw.split(",")
             if len(fields) < 32:
@@ -2944,12 +4046,284 @@ class SinaQuoteProvider:
                 quote_time = datetime.fromisoformat(f"{fields[30].strip()}T{fields[31].strip()}").replace(tzinfo=CHINA_TZ)
             except (TypeError, ValueError):
                 continue
-            code = normalize_code(symbol[2:])
+            code = _raw_six_digit_code(symbol[2:], allow_exchange_prefix=False)
+            if not code:
+                continue
             name = fields[0].strip() or code
-            result.append(Quote(code, name, price, prev_close, amount, pct, volume, source="sina", provider_ts=quote_time, fetched_at=quote_time))
+            result.append(Quote(code, name, price, prev_close, amount, pct, volume, source="sina", provider_ts=quote_time, fetched_at=collected_at))
             if name and name != code:
-                self._remember_symbol(code, name, "sina")
+                remembered.append((code, name, "sina"))
+        # Risk fields are enriched from a separate authoritative quote row.
+        # A failed/missing companion response intentionally leaves them None.
+        await self._enrich_risk_fields(result)
+        if remember_symbols:
+            await self._remember_symbols(remembered)
         return result
+
+    @staticmethod
+    def _tushare_rt_k_timestamp(value, *, fetched_at: datetime) -> datetime:
+        text = str(value or "").strip()
+        if not text:
+            raise TushareRealtimeQuoteError("Tushare rt_k trade_time is missing")
+        parsed = None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            for layout in ("%Y-%m-%d %H:%M:%S", "%Y%m%d %H:%M:%S", "%Y%m%d%H%M%S"):
+                try:
+                    parsed = datetime.strptime(text, layout)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            raise TushareRealtimeQuoteError("Tushare rt_k trade_time is malformed")
+        provider_ts = parsed.astimezone(CHINA_TZ) if parsed.tzinfo else parsed.replace(tzinfo=CHINA_TZ)
+        evaluation_day = fetched_at.astimezone(CHINA_TZ).date()
+        if provider_ts.date() != evaluation_day:
+            raise TushareRealtimeQuoteError("Tushare rt_k trade_time is not on the current date")
+        return provider_ts
+
+    @classmethod
+    def _parse_tushare_rt_k_response(
+        cls,
+        body,
+        requested_codes: Iterable[str],
+        *,
+        fetched_at: datetime,
+    ) -> list[Quote]:
+        """Normalize one complete Tushare ``rt_k`` response or reject it.
+
+        The target router never merges a partial backup batch with Sina.  A
+        missing, duplicate, malformed, or unrequested row therefore rejects
+        the response as a whole instead of making ambiguous rows look fresh.
+        """
+        requested: dict[str, tuple[str, str]] = {}
+        for value in requested_codes:
+            canonical = canonical_tushare_code(value)
+            if canonical is None:
+                raise TushareRealtimeQuoteError("Tushare rt_k request code is invalid")
+            code, ts_code = canonical
+            requested[code] = (code, ts_code)
+        data = body.get("data") if isinstance(body, dict) else None
+        fields = data.get("fields") if isinstance(data, dict) else None
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(fields, list) or not isinstance(items, list) or len(fields) != len(set(fields)):
+            raise TushareRealtimeQuoteError("Tushare rt_k response shape is invalid")
+        required = {"ts_code", "name", "pre_close", "close", "vol", "amount", "trade_time"}
+        if not required.issubset(set(fields)):
+            raise TushareRealtimeQuoteError("Tushare rt_k response fields are incomplete")
+        parsed: dict[str, Quote] = {}
+        for item in items:
+            if not isinstance(item, (list, tuple)) or len(item) != len(fields):
+                raise TushareRealtimeQuoteError("Tushare rt_k row is malformed")
+            row = dict(zip(fields, item))
+            canonical = canonical_tushare_code(row.get("ts_code"))
+            if canonical is None:
+                raise TushareRealtimeQuoteError("Tushare rt_k ts_code is malformed")
+            code, ts_code = canonical
+            expected = requested.get(code)
+            if expected is None or expected[1] != ts_code:
+                raise TushareRealtimeQuoteError("Tushare rt_k returned an unrequested code")
+            if code in parsed:
+                raise TushareRealtimeQuoteError("Tushare rt_k returned duplicate code")
+            numeric = []
+            for field in ("pre_close", "close", "vol", "amount"):
+                raw = row.get(field)
+                if isinstance(raw, bool):
+                    raise TushareRealtimeQuoteError(f"Tushare rt_k {field} is malformed")
+                try:
+                    number = float(raw)
+                except (TypeError, ValueError, OverflowError):
+                    raise TushareRealtimeQuoteError(f"Tushare rt_k {field} is malformed") from None
+                if not math.isfinite(number):
+                    raise TushareRealtimeQuoteError(f"Tushare rt_k {field} is malformed")
+                numeric.append(number)
+            prev_close, price, volume, amount = numeric
+            if prev_close <= 0 or price <= 0 or volume < 0 or amount < 0:
+                raise TushareRealtimeQuoteError("Tushare rt_k values are out of range")
+            provider_ts = cls._tushare_rt_k_timestamp(row.get("trade_time"), fetched_at=fetched_at)
+            name = str(row.get("name") or "").strip() or code
+            parsed[code] = Quote(
+                code, name, price, prev_close, amount,
+                (price - prev_close) / prev_close * 100,
+                volume, source="tushare_rt_k", provider_ts=provider_ts,
+                fetched_at=fetched_at,
+            )
+        if set(parsed) != set(requested):
+            raise TushareRealtimeQuoteError("Tushare rt_k response coverage is incomplete")
+        return [parsed[code] for code in requested]
+
+    def _realtime_backup_now(self) -> datetime:
+        return datetime.now(CHINA_TZ)
+
+    def _set_realtime_backup_diagnostic(self, *, status: str, selected_source: str = "sina", error: str = "", **values) -> None:
+        diagnostic = self.last_realtime_backup_diagnostics
+        diagnostic.update({
+            "mode": self.realtime_backup_mode,
+            "selected_source": selected_source,
+            "last_status": str(status),
+            "last_error": str(error)[:96],
+            **values,
+        })
+
+    def _realtime_backup_may_attempt(self, now: datetime) -> bool:
+        if self.realtime_backup_mode == "disabled":
+            self._set_realtime_backup_diagnostic(status="disabled")
+            return False
+        if not self.tushare_token:
+            self.last_realtime_backup_diagnostics["skipped"] = int(self.last_realtime_backup_diagnostics.get("skipped", 0)) + 1
+            self._set_realtime_backup_diagnostic(status="token_missing")
+            return False
+        if self._realtime_backup_permission_denied:
+            self.last_realtime_backup_diagnostics["skipped"] = int(self.last_realtime_backup_diagnostics.get("skipped", 0)) + 1
+            self._set_realtime_backup_diagnostic(status="permission_denied")
+            return False
+        if self._realtime_backup_blocked_until and now < self._realtime_backup_blocked_until:
+            self.last_realtime_backup_diagnostics["skipped"] = int(self.last_realtime_backup_diagnostics.get("skipped", 0)) + 1
+            self._set_realtime_backup_diagnostic(status="rate_or_circuit_blocked")
+            return False
+        if self._realtime_backup_last_attempt_at and (now - self._realtime_backup_last_attempt_at).total_seconds() < self.realtime_backup_min_interval_seconds:
+            self.last_realtime_backup_diagnostics["skipped"] = int(self.last_realtime_backup_diagnostics.get("skipped", 0)) + 1
+            self._set_realtime_backup_diagnostic(status="interval_limited")
+            return False
+        return True
+
+    async def fetch_tushare_rt_k_quotes(self, codes: Iterable[str], *, remember_symbols: bool = True) -> list[Quote]:
+        """Fetch a complete, normalized target batch from Tushare ``rt_k``."""
+        values = list(dict.fromkeys(_raw_six_digit_code(code) for code in codes if _raw_six_digit_code(code)))[:500]
+        if not values:
+            return []
+        ts_codes = []
+        for code in values:
+            canonical = canonical_tushare_code(code)
+            if canonical is None:
+                raise TushareRealtimeQuoteError("Tushare rt_k request code is invalid")
+            ts_codes.append(canonical[1])
+        payload = {
+            "api_name": "rt_k",
+            "token": self.tushare_token,
+            "params": {"ts_code": ",".join(ts_codes)},
+            "fields": "ts_code,name,pre_close,close,vol,amount,trade_time",
+        }
+        body = await self.gateway.request_api("rt_k", payload, cache_ttl=0, rate_retry_enabled=False)
+        fetched_at = self._realtime_backup_now()
+        quotes = self._parse_tushare_rt_k_response(body, values, fetched_at=fetched_at)
+        # rt_k does not establish suspension or price-limit states.  Reuse
+        # the existing explicit companion source; a failed lookup preserves
+        # None and downstream signal guards remain fail-closed.
+        await self._enrich_risk_fields(quotes)
+        if remember_symbols:
+            await self._remember_symbols((quote.code, quote.name, "tushare_rt_k") for quote in quotes if quote.name != quote.code)
+        return quotes
+
+    async def _attempt_realtime_backup(self, values: list[str], *, primary_quotes: list[Quote] | None = None) -> list[Quote]:
+        now = self._realtime_backup_now()
+        if not self._realtime_backup_may_attempt(now):
+            return []
+        self._realtime_backup_last_attempt_at = now
+        diagnostic = self.last_realtime_backup_diagnostics
+        diagnostic["attempts"] = int(diagnostic.get("attempts", 0)) + 1
+        diagnostic["last_attempt_at"] = now.isoformat()
+        try:
+            quotes = await self.fetch_tushare_rt_k_quotes(values)
+        except TusharePermissionError:
+            self._realtime_backup_permission_denied = True
+            diagnostic["failures"] = int(diagnostic.get("failures", 0)) + 1
+            self._set_realtime_backup_diagnostic(status="permission_denied", error="permission_denied")
+            return []
+        except (TushareRateLimitError, TushareCircuitOpen):
+            self._realtime_backup_blocked_until = now + timedelta(seconds=max(5.0, float(getattr(self.gateway, "rate_limit_block_seconds", 65.0))))
+            diagnostic["failures"] = int(diagnostic.get("failures", 0)) + 1
+            self._set_realtime_backup_diagnostic(status="rate_or_circuit_blocked", error="rate_or_circuit_blocked")
+            return []
+        except (TushareBulkError, httpx.HTTPError, ValueError, TypeError):
+            diagnostic["failures"] = int(diagnostic.get("failures", 0)) + 1
+            self._set_realtime_backup_diagnostic(status="failed", error="invalid_or_transport_error")
+            return []
+        diagnostic["successes"] = int(diagnostic.get("successes", 0)) + 1
+        if primary_quotes is None:
+            self._set_realtime_backup_diagnostic(status="fallback_selected", selected_source="tushare_rt_k", quote_count=len(quotes))
+            return quotes
+        primary_by_code = {quote.code: quote for quote in primary_quotes}
+        mismatches = sum(
+            1 for quote in quotes
+            if quote.code in primary_by_code and not math.isclose(quote.price, primary_by_code[quote.code].price, rel_tol=0.0, abs_tol=0.000001)
+        )
+        self._set_realtime_backup_diagnostic(
+            status="shadow_compared", quote_count=len(quotes), primary_quote_count=len(primary_quotes),
+            overlapping_codes=len(set(primary_by_code).intersection(quote.code for quote in quotes)), price_mismatches=mismatches,
+        )
+        return quotes
+
+    async def fetch_target_quotes(self, codes: Iterable[str], *, remember_symbols: bool = True) -> list[Quote]:
+        """Route only bounded target polling; full-market collection stays Sina."""
+        values = list(dict.fromkeys(_raw_six_digit_code(code) for code in codes if _raw_six_digit_code(code)))[:500]
+        if not values:
+            return []
+        if self.realtime_backup_mode == "disabled":
+            self._set_realtime_backup_diagnostic(status="disabled")
+            return await self.fetch_quotes(values, remember_symbols=remember_symbols)
+        if self.realtime_backup_mode == "shadow":
+            primary = await self.fetch_quotes(values, remember_symbols=remember_symbols)
+            await self._attempt_realtime_backup(values, primary_quotes=primary)
+            return primary
+        try:
+            primary = await self.fetch_quotes(values, remember_symbols=remember_symbols)
+        except Exception:
+            backup = await self._attempt_realtime_backup(values)
+            if backup:
+                return backup
+            raise
+        if primary:
+            self._set_realtime_backup_diagnostic(status="primary_selected", quote_count=len(primary))
+            return primary
+        return await self._attempt_realtime_backup(values)
+
+    async def fetch_intraday_market_snapshot(
+        self,
+        codes: Iterable[str],
+        *,
+        batch_size: int = 500,
+    ) -> IntradayMarketSnapshotResult:
+        """Read a current full-universe cross-section through Sina quotes.
+
+        Sina is already the plugin's live quote transport and supplies an
+        exchange quote date/time per row.  This deliberately does not reuse
+        the Eastmoney clist preview because that response has no per-security
+        exchange timestamp suitable for intraday freshness checks.
+        """
+        expected = tuple(dict.fromkeys(
+            _raw_six_digit_code(code) for code in codes if _raw_six_digit_code(code)
+        ))
+        size = max(1, min(int(batch_size), 500))
+        chunks = [expected[start:start + size] for start in range(0, len(expected), size)]
+        batches = len(chunks)
+        concurrency = max(1, min(4, int(getattr(self.http, "max_concurrency", 4) or 4), batches or 1))
+        gate = asyncio.Semaphore(concurrency)
+
+        async def fetch_batch(chunk: tuple[str, ...]) -> tuple[list[Quote], bool]:
+            async with gate:
+                try:
+                    # A full-market refresh already carries the display name in
+                    # each quote. Rewriting thousands of unchanged symbol rows
+                    # every cycle only delays the coherent cross-section.
+                    return await self.fetch_quotes(chunk, remember_symbols=False), False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return [], True
+
+        results = await asyncio.gather(*(fetch_batch(chunk) for chunk in chunks))
+        rows = [quote for batch_rows, _failed in results for quote in batch_rows]
+        failed = sum(1 for _batch_rows, batch_failed in results if batch_failed)
+        return IntradayMarketSnapshotResult(
+            rows,
+            expected,
+            "sina",
+            batches,
+            failed,
+            datetime.now(CHINA_TZ),
+        )
 
     async def fetch_custom_factors(self, url: str, codes: Iterable[str], as_of: str = "") -> dict[str, dict]:
         """Optional JSON factor source: {data:[{code,industry_score,fundamental_score,...}]}.
@@ -2957,16 +4331,17 @@ class SinaQuoteProvider:
         """
         if not str(url or "").strip():
             return {}
+        values = tuple(dict.fromkeys(_raw_six_digit_code(code) for code in codes if _raw_six_digit_code(code)))
         async with self.http.slot() as client:
-            response = await client.get(url, params={"codes": ",".join(codes), "as_of": as_of}, follow_redirects=True)
+            response = await client.get(url, params={"codes": ",".join(values), "as_of": as_of}, follow_redirects=True)
             response.raise_for_status()
             payload = response.json()
         rows = payload.get("data", payload) if isinstance(payload, dict) else payload
         result = {}
         for row in rows if isinstance(rows, list) else []:
-            if not isinstance(row, dict) or not row.get("code"):
+            if not isinstance(row, dict) or row.get("code") not in values:
                 continue
-            result[str(row["code"])[-6:]] = row
+            result[row["code"]] = row
         return result
 
     @staticmethod
@@ -3120,7 +4495,7 @@ class SinaQuoteProvider:
     async def fetch_eastmoney_factors(self, codes: Iterable[str]) -> dict[str, dict]:
         """Best-effort public fields: industry, PE, PB and ROE."""
         result = {}
-        values = list(dict.fromkeys(normalize_code(code) for code in codes if normalize_code(code)))[:300]
+        values = list(dict.fromkeys(_raw_six_digit_code(code) for code in codes if _raw_six_digit_code(code)))[:300]
         queue: asyncio.Queue[str] = asyncio.Queue()
         for code in values:
             queue.put_nowait(code)
@@ -3151,7 +4526,15 @@ class SinaQuoteProvider:
                 industry = self._clean_industry_text(data.get("f127"))
                 if industry:
                     self._cache_industry(str(code), industry, True)
-                result[str(code)] = {"name": str(data.get("f58") or ""), "industry": industry, "pe": pe / 100 if pe is not None else None, "pb": pb / 100 if pb is not None else None, "roe": finite("f173"), "source": "eastmoney", "quality": "partial"}
+                # Eastmoney's f173 label/unit is not part of this endpoint's
+                # contract.  Preserve the available PE/PB fields but leave
+                # ROE unknown instead of guessing whether a magnitude is a
+                # ratio, percentage, or scaled value.
+                result[str(code)] = {"name": str(data.get("f58") or ""), "industry": industry,
+                                     "pe": pe / 100 if pe is not None else None,
+                                     "pb": pb / 100 if pb is not None else None,
+                                     "roe": None, "roe_reason": "unit_unverified",
+                                     "source": "eastmoney", "quality": "partial"}
             except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
                 return
 
@@ -3173,57 +4556,86 @@ class SinaQuoteProvider:
         """Optional point-in-time daily and financial factors; permission failures degrade safely."""
         if not self.tushare_token:
             return {}
-        values = list(dict.fromkeys(normalize_code(c) for c in codes if normalize_code(c)))[:50]
+        values = list(dict.fromkeys(_raw_six_digit_code(c) for c in codes if _raw_six_digit_code(c)))[:500]
         as_of = str(trade_date or datetime.now(CHINA_TZ).date().isoformat()).replace("-", "")
+        if not evidence_day(as_of) or evidence_day(as_of) > datetime.now(CHINA_TZ).date().isoformat():
+            return {}
+        def ts_code_for(code):
+            suffix = "SH" if code.startswith(("6", "9")) and not code.startswith("92") else ("BJ" if code.startswith(("4", "8", "92")) else "SZ")
+            return f"{code}.{suffix}"
         async def call(client, api_name: str, params: dict, fields: str) -> list[dict]:
             payload = {"api_name": api_name, "token": self.tushare_token, "params": params, "fields": fields}
-            async with self.http.slot():
-                response = await client.post(self.tushare_url, json=payload)
-            response.raise_for_status()
-            body = response.json()
+            body = await self.gateway.request_json(client, payload, api_name=api_name, cache_ttl=3600)
             if not isinstance(body, dict) or int(body.get("code") or 0) != 0:
-                return []
+                raise TushareProviderUnknownError("factor_response_unavailable")
             data = body.get("data") or {}
+            if not isinstance(data, dict) or not isinstance(data.get("fields"), list) or not isinstance(data.get("items"), list):
+                raise TushareProviderUnknownError("factor_schema_unavailable")
             names = list(data.get("fields") or [])
-            return [dict(zip(names, item)) for item in (data.get("items") or []) if isinstance(item, list)]
+            if not names or any(not isinstance(name, str) for name in names) or len(set(names)) != len(names):
+                raise TushareProviderUnknownError("factor_fields_invalid")
+            return [dict(zip(names, item)) for item in data["items"] if isinstance(item, list) and len(item) == len(names)]
         client = await self.http.client()
-        rows = await call(client, "daily_basic", {"trade_date": as_of}, "ts_code,trade_date,pe,pb,turnover_rate,total_mv")
+        try:
+            rows = await call(client, "daily_basic", {"trade_date": as_of}, "ts_code,trade_date,pe,pb,turnover_rate,total_mv")
+        except (httpx.HTTPError, ValueError, TypeError, TushareBulkError):
+            rows = []
         result = {}
         for row in rows:
             code = str(row.get("ts_code") or "").split(".")[0]
-            if code in values:
-                result[code] = {"pe": row.get("pe"), "pb": row.get("pb"), "source": "tushare", "quality": "partial", "as_of": self._normalize_trade_date(as_of)}
+            if code in values and row.get("ts_code") == ts_code_for(code) and evidence_day(row.get("trade_date")) == evidence_day(as_of):
+                target = result.setdefault(code, {"source": "tushare", "quality": "partial",
+                                                 "as_of": evidence_day(as_of), "evidence_records": []})
+                for kind in ("pe", "pb"):
+                    try:
+                        value = float(row.get(kind))
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value):
+                        target[kind] = value
+                        target["evidence_records"].append(evidence_envelope(
+                            code, as_of, kind, value, source="tushare:daily_basic",
+                            evidence=f"tushare:daily_basic:{evidence_day(as_of)}:{ts_code_for(code)}:{kind}",
+                            collected_at=datetime.now(timezone.utc).isoformat()))
 
         async def financial(code: str):
-            suffix = "SH" if code.startswith(("6", "9")) else ("BJ" if code.startswith(("4", "8")) else "SZ")
-            ts_code = f"{code}.{suffix}"
+            ts_code = ts_code_for(code)
             try:
-                indicator, income, cashflow = await asyncio.gather(
-                    call(client, "fina_indicator", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,roe,debt_to_assets,ocf_to_or"),
-                    call(client, "income", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,revenue_yoy,operate_profit"),
-                    call(client, "cashflow", {"ts_code": ts_code, "limit": 8}, "ts_code,ann_date,end_date,n_cashflow_act"),
-                )
-            except (httpx.HTTPError, ValueError, TypeError):
+                indicator = await call(client, "fina_indicator", {"ts_code": ts_code, "limit": 20},
+                                       "ts_code,ann_date,end_date,roe,netprofit_yoy,ocf_to_or")
+            except (httpx.HTTPError, ValueError, TypeError, TushareBulkError):
                 return
-            def latest_visible(rows: list[dict]) -> dict | None:
-                valid = []
-                for row in rows:
-                    ann_date = str(row.get("ann_date") or "").replace("-", "")
-                    if re.fullmatch(r"\d{8}", ann_date) and ann_date <= as_of:
-                        valid.append(row)
-                return max(valid, key=lambda row: str(row.get("ann_date")).replace("-", "")) if valid else None
-            indicator_row = latest_visible(indicator)
-            income_row = latest_visible(income)
-            cashflow_row = latest_visible(cashflow)
-            if not any((indicator_row, income_row, cashflow_row)):
+            valid = [row for row in indicator if row.get("ts_code") == ts_code
+                     and evidence_day(row.get("ann_date")) and evidence_day(row.get("end_date"))
+                     and evidence_day(row["end_date"]) <= evidence_day(row["ann_date"]) <= evidence_day(as_of)]
+            if not valid:
                 return
-            target = result.setdefault(code, {"source": "tushare_financial", "quality": "partial", "as_of": self._normalize_trade_date(as_of)})
-            if indicator_row:
-                target.update({"roe": indicator_row.get("roe"), "roe_ann_date": indicator_row.get("ann_date"), "roe_report_period": indicator_row.get("end_date")})
-            if income_row:
-                target.update({"profit_growth": income_row.get("revenue_yoy"), "profit_ann_date": income_row.get("ann_date"), "profit_report_period": income_row.get("end_date")})
-            if cashflow_row:
-                target.update({"cash_quality": cashflow_row.get("n_cashflow_act"), "cash_ann_date": cashflow_row.get("ann_date"), "cash_report_period": cashflow_row.get("end_date")})
+            latest = max((evidence_day(row["end_date"]), evidence_day(row["ann_date"])) for row in valid)
+            selected = [row for row in valid if (evidence_day(row["end_date"]), evidence_day(row["ann_date"])) == latest]
+            target = result.setdefault(code, {"source": "tushare_financial", "quality": "partial",
+                                              "as_of": evidence_day(as_of), "evidence_records": []})
+            for row in selected:
+                for field, kind, prefix in (("roe", "roe", "roe"), ("netprofit_yoy", "profit_growth", "profit"),
+                                            ("ocf_to_or", "cash_quality", "cash")):
+                    try:
+                        value = float(row.get(field))
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(value):
+                        continue
+                    target.update({kind: value, prefix + "_ann_date": row["ann_date"],
+                                   prefix + "_report_period": row["end_date"]})
+                    record = evidence_envelope(
+                        code, row["end_date"], kind, value, source="tushare:fina_indicator",
+                        evidence=f"tushare:fina_indicator:{ts_code}:{row['ann_date']}:{row['end_date']}:{field}",
+                        announcement_date=row["ann_date"], collected_at=datetime.now(timezone.utc).isoformat())
+                    if kind == "cash_quality":
+                        # The endpoint describes a ratio but does not declare
+                        # its normalization in the field contract. Do not feed
+                        # that ratio into the legacy absolute-CNY scoring scale.
+                        record.update(quality="unknown", reason="cash_ratio_unit_unverified", source_field="ocf_to_or")
+                        target[kind] = None
+                    target["evidence_records"].append(record)
             target["source"] = "tushare+financial"
             target["quality"] = "partial"
 
@@ -3314,8 +4726,8 @@ class SinaQuoteProvider:
         the transient fallback therefore cannot accidentally gain a second
         parser or a Tushare/legacy history path.
         """
-        normalized = normalize_code(code)
-        if not re.fullmatch(r"\d{6}", normalized):
+        normalized = _raw_six_digit_code(code)
+        if not normalized:
             raise ValueError("Eastmoney history code is invalid")
         cutoff = self._canonical_eastmoney_date(
             as_of or datetime.now(CHINA_TZ).date().isoformat()
@@ -3460,6 +4872,7 @@ class OpenAICompatibleClient:
         self.base_url, self.api_key, self.model, self.timeout = base_url.rstrip("/"), api_key, model, timeout
         self.min_interval, self.daily_limit = max(0, min_interval), max(1, daily_limit)
         self._annotation_times: list[datetime] = []
+        self._shadow_review_times: list[datetime] = []
         self.http = http_runtime or HttpRuntime(timeout, 2)
 
     async def close(self) -> None:
@@ -3560,6 +4973,158 @@ class OpenAICompatibleClient:
             return result
         except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return {}
+
+    @staticmethod
+    def shadow_review_input(candidates: list[Candidate]) -> dict:
+        items = []
+        for candidate in candidates[:30]:
+            quote = candidate.quote
+            overlay = candidate.factor_overlay
+            items.append({
+                "code": quote.code,
+                "name": quote.name[:64],
+                "score": candidate.score,
+                "base_score": candidate.base_score,
+                "risk_level": candidate.risk_level,
+                "risk_flags": list(candidate.risk_flags[:8]),
+                "reasons": list(candidate.reasons[:8]),
+                "indicator_last_date": quote.indicator_last_date,
+                "rsi6": quote.rsi6,
+                "ma5": quote.ma5,
+                "ma10": quote.ma10,
+                "ma20": quote.ma20,
+                "momentum5": quote.momentum5,
+                "momentum20": quote.momentum20,
+                "volume_ratio": quote.volume_ratio,
+                "history_days": quote.history_days,
+                "factor_overlay": ({
+                    "industry_score": overlay.industry_score,
+                    "fundamental_score": overlay.fundamental_score,
+                    "market_regime": overlay.market_regime,
+                    "market_adjustment": overlay.market_adjustment,
+                    "source": overlay.source,
+                    "as_of": overlay.as_of,
+                    "quality": overlay.quality,
+                    "fundamental_coverage": overlay.fundamental_coverage,
+                    "risk_factor_coverage": overlay.risk_factor_coverage,
+                } if overlay else None),
+            })
+        return {
+            "schema_version": "1",
+            "mode": "research_shadow_review",
+            "outcomes_available_to_model": False,
+            "items": items,
+        }
+
+    async def review_candidates(
+        self,
+        candidates: list[Candidate],
+        *,
+        max_tokens: int = 8192,
+        prompt_version: str = "shadow-risk-v1",
+    ) -> dict:
+        if not candidates or not self.api_key:
+            return {"status": "skipped", "error": "candidates_or_api_key_missing", "decisions": []}
+        now = datetime.now(timezone.utc)
+        self._shadow_review_times = [value for value in self._shadow_review_times if (now - value).total_seconds() < 86400]
+        if len(self._shadow_review_times) >= self.daily_limit:
+            return {"status": "skipped", "error": "daily_request_limit", "decisions": []}
+        if self._shadow_review_times and (now - self._shadow_review_times[-1]).total_seconds() < self.min_interval:
+            return {"status": "skipped", "error": "minimum_interval", "decisions": []}
+        self._shadow_review_times.append(now)
+        review_input = self.shadow_review_input(candidates)
+        allowed = {str(item["code"]) for item in review_input["items"]}
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": max(400, min(int(max_tokens), 8192)),
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是A股候选的只读风险审阅助手。只能依据输入JSON，不得使用未来收盘结果，不得补造行情、新闻或财务数据。"
+                        "只输出JSON对象，根字段只能是items。每项字段必须且只能是code、decision、score_adjustment、risk_tags、reason。"
+                        "decision只能是keep、watch或veto；score_adjustment必须是-5到0的整数。必须覆盖全部输入代码且不得新增代码。"
+                        "证据不足时使用watch，并明确缺失证据。不得给出概率、目标价、仓位或买卖指令。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"prompt_version": prompt_version, **review_input}, ensure_ascii=False, separators=(",", ":")),
+                },
+            ],
+        }
+        try:
+            async with self.http.slot() as client:
+                response = await client.post(
+                    self.base_url + "/chat/completions",
+                    json=payload,
+                    headers={"Authorization": "Bearer " + self.api_key},
+                )
+                response.raise_for_status()
+                body = response.json()
+            message = body["choices"][0]["message"]
+            content = str(message.get("content") or "").strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S).strip()
+            if not content:
+                return {
+                    "status": "failed",
+                    "error": "empty_final_content",
+                    "model_returned": str(body.get("model") or ""),
+                    "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+                    "decisions": [],
+                }
+            data = json.loads(content)
+            raw_items = data.get("items") if isinstance(data, dict) and set(data) == {"items"} else None
+            if not isinstance(raw_items, list) or len(raw_items) != len(allowed):
+                raise ValueError("AI review must cover every candidate")
+            decisions = []
+            seen = set()
+            for item in raw_items:
+                if not isinstance(item, dict) or set(item) != {"code", "decision", "score_adjustment", "risk_tags", "reason"}:
+                    raise ValueError("AI review item schema is invalid")
+                code = str(item["code"] or "").strip()
+                decision = str(item["decision"] or "").strip().lower()
+                adjustment = item["score_adjustment"]
+                tags = item["risk_tags"]
+                reason = re.sub(r"[\x00-\x1f\x7f]", " ", str(item["reason"] or "")).strip()
+                if code not in allowed or code in seen or decision not in {"keep", "watch", "veto"}:
+                    raise ValueError("AI review item identity is invalid")
+                if isinstance(adjustment, bool) or not isinstance(adjustment, int) or not -5 <= adjustment <= 0:
+                    raise ValueError("AI review score adjustment is invalid")
+                if not isinstance(tags, list) or len(tags) > 8 or not reason or len(reason) > 400:
+                    raise ValueError("AI review item payload is invalid")
+                clean_tags = []
+                for tag in tags:
+                    clean = re.sub(r"[\x00-\x1f\x7f]", " ", str(tag or "")).strip()
+                    if not clean or len(clean) > 80:
+                        raise ValueError("AI review risk tag is invalid")
+                    clean_tags.append(clean)
+                seen.add(code)
+                decisions.append({
+                    "code": code,
+                    "decision": decision,
+                    "score_adjustment": adjustment,
+                    "risk_tags": clean_tags,
+                    "reason": reason,
+                })
+            if seen != allowed:
+                raise ValueError("AI review omitted candidates")
+            return {
+                "status": "complete",
+                "error": "",
+                "model_returned": str(body.get("model") or ""),
+                "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+                "decisions": decisions,
+            }
+        except httpx.TimeoutException as exc:
+            return {"status": "unknown", "error": f"timeout:{type(exc).__name__}", "decisions": []}
+        except httpx.HTTPStatusError as exc:
+            return {"status": "failed", "error": f"http_status:{exc.response.status_code}", "decisions": []}
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            return {"status": "failed", "error": f"{type(exc).__name__}:{str(exc)[:240]}", "decisions": []}
 
 
 def news_fingerprint(item: NewsItem) -> str:
