@@ -30,6 +30,7 @@
   "tushare_raw_universe_version": {"type": "string", "description": "raw 批次独立 universe 证据的版本标识；留空时由 stock_basic 观测生成", "default": ""},
   "tushare_raw_universe_counts": {"type": "string", "description": "独立 universe 证据 JSON；必须包含版本、日期、市场计数、BJ 策略、暂停处理方法和 canonical digest，例如 stock_basic 生成的证据对象", "default": ""},
   "tushare_raw_require_universe_evidence": {"type": "bool", "description": "raw 批次必须提供并通过独立 universe 证据校验；false 也不会关闭 fail-closed 保护", "default": true},
+  "tushare_universe_statuses": {"type": "string", "description": "stock_basic 需要拉取的 list_status，逗号分隔；L 始终必需，D/P 可省略或作为尽力而为。低积分可设为 L", "default": "L,D,P"},
   "tushare_snapshot_lease_ttl_seconds": {"type": "int", "description": "跨进程 Tushare 日快照租约有效期秒数；过期后才允许其他进程接管", "default": 1800},
   "tushare_snapshot_lease_wait_seconds": {"type": "int", "description": "快照租约被其他进程持有时的最长等待秒数；超时只读本地 raw 缓存", "default": 30},
   "tushare_snapshot_lease_poll_seconds": {"type": "float", "description": "等待快照租约接管时的状态轮询间隔秒数", "default": 0.25},
