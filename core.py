@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import json
 import math
 import re
+import statistics
 import unicodedata
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -162,6 +163,9 @@ class MarketContext:
     declining: int
     total_amount: float
     evidence: list[str] = field(default_factory=list)
+    flat: int = 0
+    sample_size: int = 0
+    median_return: float | None = None
 
 
 def assess_market_context(quotes: Iterable[Quote]) -> MarketContext:
@@ -185,8 +189,25 @@ def assess_market_context(quotes: Iterable[Quote]) -> MarketContext:
         regime = "risk_off"
     else:
         regime = "neutral"
-    evidence = [f"上涨{advancing}只、下跌{declining}只、样本{len(rows)}只", f"上涨占比{breadth:.1%}"]
-    return MarketContext(regime, breadth, advancing, declining, sum(max(0.0, q.amount) for q in rows), evidence)
+    flat = max(0, len(rows) - advancing - declining)
+    median_return = statistics.median(float(q.pct_change) for q in rows) if rows else None
+    evidence = [
+        f"上涨{advancing}只、下跌{declining}只、平盘{flat}只、样本{len(rows)}只",
+        f"上涨占比{breadth:.1%}",
+    ]
+    if median_return is not None:
+        evidence.append(f"涨跌幅中位数{median_return:+.2f}%")
+    return MarketContext(
+        regime,
+        breadth,
+        advancing,
+        declining,
+        sum(max(0.0, q.amount) for q in rows),
+        evidence,
+        flat,
+        len(rows),
+        median_return,
+    )
 
 
 @dataclass(slots=True)
