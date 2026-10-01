@@ -8,3 +8,5 @@ logs/
 data/
 .local_records/
 /tests/
+dist/
+账密.txt
