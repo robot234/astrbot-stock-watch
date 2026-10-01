@@ -60,7 +60,7 @@
 - `daily_market_url`：自定义全市场快照接口。留空使用东方财富；自定义接口需要返回兼容格式的 JSON，并支持 `pn`、`pz`、`fs`、`fields` 分页参数。
 - `tushare_url`：Tushare Pro 接口地址，通常留空即可，默认使用 `https://api.tushare.pro`。
 - `tushare_token`：Tushare Pro Token。填写后每日快照优先调用 Tushare `daily` 接口；留空则不调用 Tushare，使用东方财富。
-- `tushare_bulk_page_size` / `tushare_retry_attempts`：Tushare `daily` 分页大小和网络/限流重试次数，默认 6000/3。
+- `tushare_bulk_page_size` / `tushare_retry_attempts`：Tushare `daily` 分页大小和网络/限流重试次数，默认 6000/3。所有 `daily` 请求共享持久化的 50 次/分钟配额；全市场 raw 的默认 120 日是约 120 次逐交易日请求，每次单日请求最多 6000 行，不是一次请求取 120 日。
 - `tushare_bj_calendar_policy`：raw universe 的北交所市场策略。`require_bse` 要求独立 universe 同时包含 `SH`、`SZ`、`BJ`；`sse_fallback` 也保留三市场 universe，但交易日证据统一使用公共 SSE 日历；`exclude` 只允许 `SH`、`SZ` 并过滤 BJ 行。交易日历请求本身使用 SSE 作为公共会话证据，不会因为 `require_bse` 额外探测 BSE。
 - `tushare_raw_dataset_key`：raw 日线数据集标识，默认 `tushare_daily`。
 - `tushare_raw_session_count`：每个 raw 批次保留的目标交易日数量，默认 120；日历查询会按周末和节假日扩展自然日包络。`tushare_raw_lookback_days` 已弃用，仅作为旧配置的交易日数量别名，不再表示自然日范围。`tushare_raw_max_stale_trading_days`：网络失败时允许读取活动 raw 缓存的最大交易日年龄，默认 2 天。
@@ -140,8 +140,9 @@
 ## 数据源说明
 
 - 每日全市场快照默认使用东方财富公开接口，也可以通过 `daily_market_url` 替换。
-- 配置 `tushare_token` 后，每日全市场快照和技术历史只使用 Tushare raw 批次；请求前优先读取新鲜 active generation，请求失败或发生并发竞态后再次读取；仅在明确分类的 Tushare 瞬时、提供商或历史失败且没有可用 active raw 时才退回东方财富，不会退回 Tencent 或 legacy `daily_bars`。
-- 若 Tushare 无法提供可用 raw（网络、限流、熔断、尚未发布、交易日历/发布/覆盖校验或历史数据校验失败），`/全市场选股` 会在实际交易日经东方财富指数日期验证后提供临时降级预览。该预览只使用同批东方财富快照和未复权东方财富日线，来源标为 `eastmoney_fallback`、质量为 `degraded`，不写入任何候选池或历史存储，也不产生可回放价位；快照或历史覆盖不足时明确提示“降级数据不可用”，不能解读为 0 候选。
+- 配置 `tushare_token` 后，每日全市场快照和技术历史只使用 Tushare raw 批次；默认 120 个已完成交易日约对应 120 次逐日 `daily` 请求，每次单日最多 6000 行。请求前优先读取新鲜 active generation，请求失败或发生并发竞态后再次读取；不会退回 Tencent 或 legacy `daily_bars`。
+- Tushare `trade_cal` 在日历阶段发生限流、熔断、网络/超时或权限等可降级失败时，插件先用 `600519.SH`、`000858.SZ`、`000001.SZ` 的 `daily` 日期响应生成至少 2/3 共识；三次请求与全市场行情共享持久化的 `daily` 50 次/分钟配额，但使用独立日历 cache key。共识严格校验代码、字段、日期、重复、未来、过期、长度和多数规则，并将完整证据记录为 `tushare_daily_symbol_consensus`；这些行只作 calendar evidence，不进入 raw 或价格。只有该共识阶段发生明确的提供商、网络、限流、权限或熔断失败时，才使用东方财富上证指数日 K（`secid=1.000001`）；验证不一致、格式错误、过期或过短均 fail-closed。东方财富只提供 calendar evidence，随后仍逐日调用 Tushare `daily`，raw 的覆盖、manifest、发布和 promotion 校验不放宽。
+- 若后续 Tushare raw 的明确瞬时失败且没有可用 active raw，`/全市场选股` 才会在经指数日期验证后提供临时降级预览。该预览只使用同批东方财富快照和未复权东方财富日线，来源标为 `eastmoney_fallback`、质量为 `degraded`，不写入任何候选池或历史存储，也不产生可回放价位；快照或历史覆盖不足时明确提示“降级数据不可用”，不能解读为 0 候选。
 - 盘中自选股默认使用新浪批量行情接口，适合少量自选股轮询。
 - 未配置 `tushare_token` 时，历史日线仍按兼容旧版路径使用东方财富接口；配置 token 后，历史指标只从活动 Tushare raw generation 计算。
 - 东方财富因子字段仅用于当前研究报告，包含行业标签和部分估值/ROE，质量会标为 `partial`；它不作为历史回放的完整基本面真值。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -115,6 +116,7 @@ class StockStore:
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}" if len(digits) == 8 else str(value or "")
     def __init__(self, path: Path):
         self.path = path
+        self._raw_batch_validation_cache: dict[str, dict] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(5):
             try:
@@ -282,6 +284,13 @@ class StockStore:
             self._ensure_column(db, "daily_quotes", "source", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(db, "daily_quotes", "provider_ts", "TEXT NULL")
             self._ensure_column(db, "screen_candidates", "factor_payload", "TEXT NOT NULL DEFAULT '{}'")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS intraday_market_regime_state("
+                "scope TEXT PRIMARY KEY,regime TEXT NOT NULL DEFAULT 'unknown',source TEXT NOT NULL DEFAULT '',"
+                "source_timestamp TEXT NOT NULL DEFAULT '',sample_size INTEGER NOT NULL DEFAULT 0,"
+                "expected_size INTEGER NOT NULL DEFAULT 0,coverage REAL NOT NULL DEFAULT 0,quality TEXT NOT NULL DEFAULT 'unknown',"
+                "reason TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL)"
+            )
             self._set_schema_version(db, max(current, 7))
 
             migrations = (
@@ -959,6 +968,20 @@ class StockStore:
         row = db.execute("SELECT * FROM provider_api_state WHERE api_name=?", (name,)).fetchone()
         if not row:
             raise RuntimeError("provider api state could not be created")
+        try:
+            current_limit = int(row["bucket_limit"] or 0)
+            current_window = int(row["window_seconds"] or 0)
+        except (TypeError, ValueError, OverflowError):
+            current_limit, current_window = 0, 0
+        if current_limit != limit or current_window != window:
+            state = dict(row)
+            state.update({"bucket_limit": limit, "window_seconds": window})
+            state["state_digest"] = cls._provider_state_digest(state)
+            db.execute(
+                "UPDATE provider_api_state SET bucket_limit=?,window_seconds=?,state_digest=?,updated_at=? WHERE api_name=?",
+                (limit, window, state["state_digest"], now_text, name),
+            )
+            row = db.execute("SELECT * FROM provider_api_state WHERE api_name=?", (name,)).fetchone()
         return row
 
     def provider_api_state(self, api_name: str, *, bucket_limit: int = 1, window_seconds: int = 60) -> dict:
@@ -1214,6 +1237,7 @@ class StockStore:
         provider: str = "tushare",
         bj_calendar_policy: str = "sse_fallback",
         universe_version: str = "",
+        universe_statuses: str = "L,D,P",
         batch_id: str | None = None,
     ) -> dict:
         """Return a durable evidence cycle, creating a repair cycle if needed."""
@@ -1223,6 +1247,10 @@ class StockStore:
         provider_value = str(provider or "tushare").strip().lower()[:80]
         policy_value = str(bj_calendar_policy or "sse_fallback").strip().lower()[:32]
         version_value = str(universe_version or "").strip()[:160]
+        status_parts = [part.strip().upper() for part in str(universe_statuses or "L,D,P").replace(";", ",").replace(" ", ",").split(",") if part.strip()]
+        expected_statuses = [status for status in ("L", "D", "P") if status in status_parts]
+        if "L" not in expected_statuses:
+            expected_statuses.insert(0, "L")
         if not provider_value or policy_value not in {"require_bse", "sse_fallback", "exclude"}:
             raise ValueError("invalid universe evidence batch identity")
         evidence_key = self._universe_evidence_key(provider_value, effective, policy_value, version_value)
@@ -1260,7 +1288,12 @@ class StockStore:
                     records = self._universe_evidence_status_records_in_tx(db, str(candidate["evidence_batch_id"]))
                 except (TypeError, ValueError, KeyError, OverflowError):
                     return False
-                if set(records) != {"L", "D", "P"} or not self._universe_status_records_match_evidence(records, evidence):
+                try:
+                    expected = json.loads(str(candidate["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses or not self._universe_status_records_match_evidence(records, evidence):
                     return False
                 pointer = db.execute(
                     "SELECT evidence_key,evidence_batch_id,evidence_digest FROM active_universe_evidence WHERE evidence_key=?",
@@ -1278,12 +1311,10 @@ class StockStore:
             # cycle is created below.
             for row in rows:
                 status = str(row["status"] or "")
-                if status == "staging":
-                    return dict(row)
-                if status == "failed":
+                if status in {"staging", "failed"}:
                     db.execute(
-                        "UPDATE universe_evidence_batches SET status='staging',error=NULL,updated_at=? WHERE evidence_batch_id=?",
-                        (now, row["evidence_batch_id"]),
+                        "UPDATE universe_evidence_batches SET status='staging',error=NULL,expected_statuses_json=?,updated_at=? WHERE evidence_batch_id=?",
+                        (json.dumps(expected_statuses), now, row["evidence_batch_id"]),
                     )
                     refreshed = db.execute("SELECT * FROM universe_evidence_batches WHERE evidence_batch_id=?", (row["evidence_batch_id"],)).fetchone()
                     return dict(refreshed)
@@ -1300,7 +1331,7 @@ class StockStore:
             cycle_digest = self._universe_evidence_cycle_digest(cycle_key, identifier)
             db.execute(
                 "INSERT INTO universe_evidence_batches(evidence_batch_id,evidence_key,cycle_digest,provider,effective_date,bj_calendar_policy,universe_version,status,expected_statuses_json,evidence_json,evidence_digest,recovery_of,created_at,updated_at,error) VALUES(?,?,?,?,?,?,?, 'staging',?,?,?,?,?,?,NULL)",
-                (identifier, cycle_key, cycle_digest, provider_value, effective, policy_value, version_value, '["D","L","P"]', "{}", "", str(source["evidence_batch_id"]) if source else None, now, now),
+                (identifier, cycle_key, cycle_digest, provider_value, effective, policy_value, version_value, json.dumps(expected_statuses), "{}", "", str(source["evidence_batch_id"]) if source else None, now, now),
             )
             if source:
                 # Preserve individually valid L/D/P responses in a new cycle;
@@ -1631,7 +1662,12 @@ class StockStore:
 
             def validated_status_records() -> dict[str, dict]:
                 records = self._universe_evidence_status_records_in_tx(db, str(batch_id))
-                if set(records) != {"L", "D", "P"}:
+                try:
+                    expected = json.loads(str(batch["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses:
                     raise RuntimeError("universe evidence batch is incomplete")
                 if not self._universe_status_records_match_evidence(records, normalized):
                     raise ValueError("universe evidence statuses do not match manifest")
@@ -1695,12 +1731,12 @@ class StockStore:
                     # Recovery cycles intentionally use a suffixed evidence
                     # key, so a configured version must be looked up by its
                     # natural identity rather than only by the original key.
-                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND a.universe_version=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
+                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key,b.expected_statuses_json FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND a.universe_version=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
                     (provider_value, effective, policy_value, version_value),
                 ).fetchone()
             else:
                 row = db.execute(
-                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
+                    "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key,b.expected_statuses_json FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id WHERE a.provider=? AND a.effective_date=? AND a.bj_calendar_policy=? AND b.status='published' ORDER BY a.updated_at DESC LIMIT 1",
                     (provider_value, effective, policy_value),
                 ).fetchone()
             if not row:
@@ -1726,13 +1762,94 @@ class StockStore:
                 ):
                     return None
                 records = self.universe_evidence_status_records(str(row["evidence_batch_id"]))
-                if set(records) != {"L", "D", "P"} or not self._universe_status_records_match_evidence(records, evidence):
+                try:
+                    expected = json.loads(str(row["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses or not self._universe_status_records_match_evidence(records, evidence):
                     return None
             except (TypeError, ValueError, KeyError, OverflowError):
                 return None
             return {**dict(row), "evidence": evidence, "status_records": records, "statuses": {key: value["rows"] for key, value in records.items()}}
 
     get_active_universe_evidence = active_universe_evidence
+
+    def recent_universe_evidence(
+        self,
+        effective_date: str,
+        *,
+        provider: str = "tushare",
+        bj_calendar_policy: str = "sse_fallback",
+        universe_version: str = "",
+        max_age_days: int = 30,
+    ) -> dict | None:
+        """Return the most recent still-valid universe evidence for reuse.
+
+        The eligible-universe stock list changes slowly, so a daily snapshot
+        does not need a fresh ``stock_basic`` fetch every trading day.  When
+        the exact-date evidence is missing (e.g. ``stock_basic`` is rate
+        limited), reuse the latest published evidence whose validity window
+        covers the requested date and which is no older than ``max_age_days``.
+        """
+        effective = self._canonical_raw_date(effective_date)
+        if not effective:
+            return None
+        provider_value = str(provider or "tushare").strip().lower()
+        policy_value = str(bj_calendar_policy or "sse_fallback").strip().lower()
+        try:
+            cutoff = (datetime.strptime(effective, "%Y-%m-%d").date() - timedelta(days=max(0, int(max_age_days)))).isoformat()
+        except (TypeError, ValueError, OverflowError):
+            cutoff = ""
+        with self._connect() as db:
+            sql = (
+                "SELECT a.*,b.status,b.evidence_json,b.evidence_digest AS batch_evidence_digest,b.evidence_key AS batch_evidence_key,b.expected_statuses_json "
+                "FROM active_universe_evidence a JOIN universe_evidence_batches b ON b.evidence_batch_id=a.evidence_batch_id "
+                "WHERE a.provider=? AND a.effective_date<=? AND a.bj_calendar_policy=? AND b.status='published'"
+            )
+            args: list[object] = [provider_value, effective, policy_value]
+            if cutoff:
+                sql += " AND a.effective_date>=?"
+                args.append(cutoff)
+            sql += " ORDER BY a.effective_date DESC LIMIT 1"
+            row = db.execute(sql, args).fetchone()
+            if not row:
+                return None
+            try:
+                expected_cycle = self._universe_evidence_cycle_digest(str(row["batch_evidence_key"] or ""), str(row["evidence_batch_id"] or ""))
+                batch = db.execute("SELECT cycle_digest FROM universe_evidence_batches WHERE evidence_batch_id=?", (str(row["evidence_batch_id"]),)).fetchone()
+                if not batch or str(batch["cycle_digest"] or "").strip().lower() != expected_cycle:
+                    return None
+                evidence = self._normalize_universe_counts(json.loads(str(row["evidence_json"] or "{}")))
+                # Reuse deliberately relaxes the version and exact-date checks
+                # (a date-stamped universe_version differs per day), but still
+                # enforces digest integrity, status-record completeness and the
+                # valid_from/valid_to window against the requested date.
+                if self._validate_universe_evidence(
+                    evidence,
+                    requested_date=effective,
+                    actual_trade_date="",
+                    bj_calendar_policy=policy_value,
+                    universe_version="",
+                ):
+                    return None
+                if (
+                    str(evidence.get("digest") or "") != str(row["evidence_digest"] or "")
+                    or str(row["batch_evidence_digest"] or "") != str(row["evidence_digest"] or "")
+                    or self._universe_evidence_digest(evidence) != str(row["evidence_digest"] or "")
+                ):
+                    return None
+                records = self.universe_evidence_status_records(str(row["evidence_batch_id"]))
+                try:
+                    expected = json.loads(str(row["expected_statuses_json"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    expected = ["L", "D", "P"]
+                expected_statuses = {str(status).strip().upper() for status in expected if str(status).strip()}
+                if not expected_statuses or set(records) != expected_statuses or not self._universe_status_records_match_evidence(records, evidence):
+                    return None
+            except (TypeError, ValueError, KeyError, OverflowError):
+                return None
+            return {**dict(row), "evidence": evidence, "status_records": records, "statuses": {key: value["rows"] for key, value in records.items()}}
 
     @staticmethod
     def _set_schema_version(db, version: int) -> None:
@@ -3515,14 +3632,30 @@ class StockStore:
                     "SELECT trade_date,code,ts_code,name,open,high,low,close,pre_close,pct_change,volume,amount,source,basis FROM partition_bars WHERE partition_id=? ORDER BY code,ts_code",
                     (partition_id,),
                 )] if partition_id else []
-                normalized_rows = [self._normalize_raw_bar(row, str(key[0]), source=str(batch["provider"]), basis="unadjusted") for row in rows]
+                # Staging reuse must not re-normalise/re-hash every stored bar on
+                # every resume attempt (the same ~660k-bar cost that previously
+                # blocked the read path).  Bars were already canonicalised and
+                # digested when staged, so trust the append-only partition
+                # metadata and only verify it is well-formed.
                 if mapping:
-                    digest, count, market_counts = self._raw_partition_db_digest(db, partition_id)
-                    if digest != str(mapping["content_hash"] or "") or count != int(mapping["row_count"] or 0) or count != int(mapping["batch_row_count"] or 0) or not self._strict_market_counts_json(mapping["market_counts_json"], market_counts):
+                    count = self._strict_db_int(mapping["row_count"], minimum=0)
+                    content_hash = str(mapping["content_hash"] or "")
+                    if count is None or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
                         raise RuntimeError("staged raw partition integrity check failed")
+                    try:
+                        market_counts = json.loads(str(mapping["market_counts_json"] or "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError("staged raw partition market counts are invalid") from exc
+                    if not isinstance(market_counts, dict) or any(
+                        key not in {"SH", "SZ", "BJ"} or isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                        for key, value in market_counts.items()
+                    ):
+                        raise RuntimeError("staged raw partition market counts mismatch")
                 else:
-                    digest, count, market_counts = self._raw_digest_for_rows(normalized_rows), len(normalized_rows), {}
-                    for row in normalized_rows:
+                    count = len(rows)
+                    content_hash = self._raw_digest_for_rows(rows) if rows else ""
+                    market_counts = {}
+                    for row in rows:
                         market = self._raw_market(row.get("ts_code") or row.get("code"))
                         market_counts[market] = market_counts.get(market, 0) + 1
                 if metadata is None:
@@ -3534,31 +3667,125 @@ class StockStore:
                         batch,
                         str(key[0]),
                         int(key[1]),
-                        normalized_rows,
+                        rows,
                         source=str(batch["provider"]),
                     )
                     metadata = dict(metadata)
-                page = self._validate_raw_page_metadata_in_tx(db, batch, metadata, normalized_rows)
+                server_row_count = self._strict_db_int(metadata["server_row_count"], minimum=0)
+                server_terminal = self._strict_db_int(metadata["server_terminal"], minimum=0, maximum=1)
+                if server_row_count is None or server_terminal is None:
+                    raise RuntimeError("staged raw page metadata is invalid")
+                page = {
+                    "server_row_count": server_row_count,
+                    "server_terminal": bool(server_terminal),
+                    "server_page_digest": str(metadata["server_page_digest"] or "").strip().lower(),
+                    "filter_policy": str(metadata["filter_policy"] or ""),
+                }
                 item = {
                     "trade_date": str(key[0]),
                     "partition_no": int(key[1]),
                     "partition_id": partition_id or None,
                     "row_count": count,
-                    "content_hash": digest if mapping else (self._raw_digest_for_rows(normalized_rows) if normalized_rows else ""),
+                    "content_hash": content_hash,
                     "market_counts": market_counts,
-                    "server_row_count": page["server_row_count"],
-                    "server_terminal": page["server_terminal"],
-                    "server_page_digest": page["server_page_digest"],
-                    "filter_policy": page["filter_policy"],
+                    "server_row_count": int(page["server_row_count"]),
+                    "server_terminal": bool(page["server_terminal"]),
+                    "server_page_digest": str(page["server_page_digest"]),
+                    "filter_policy": str(page["filter_policy"]),
                 }
                 if include_rows:
-                    item["rows"] = normalized_rows
+                    item["rows"] = rows
                 result.append(item)
             return result
 
     staged_raw_partitions = raw_batch_partitions
     raw_staging_partitions = raw_batch_partitions
     list_raw_partitions = raw_batch_partitions
+
+    def reuse_partition_for_batch(self, batch_id: str, trade_date: str, *, partition_no: int = 0) -> dict | None:
+        """Reuse an already-staged partition from a prior generation.
+
+        The true-incremental path: a new daily window reuses the overlapping
+        sessions already on disk and only fetches the one new session.  Returns
+        the same item shape as ``raw_batch_partitions`` entries, or ``None`` when
+        no reusable partition exists for this dataset + trade date.
+        """
+        normalized_date = self._canonical_raw_date(trade_date)
+        if not normalized_date:
+            raise ValueError("raw partition trade_date must be canonical")
+        partition_no = self._strict_db_int(partition_no, minimum=0)
+        if partition_no is None:
+            raise ValueError("raw partition_no must be a non-negative integer")
+        with self._connect() as db:
+            batch = db.execute(
+                "SELECT b.*,d.dataset_key,d.provider,d.frequency,d.universe FROM batches b JOIN datasets d ON d.dataset_id=b.dataset_id WHERE b.batch_id=?",
+                (str(batch_id),),
+            ).fetchone()
+            if not batch:
+                raise KeyError(f"unknown raw batch {batch_id}")
+            if str(batch["status"]) != "staging":
+                raise RuntimeError("raw batch is no longer staging")
+            existing = db.execute(
+                "SELECT dp.partition_id,dp.content_hash,dp.row_count,dp.market_counts_json,dp.basis,dp.source "
+                "FROM day_partitions dp "
+                "WHERE dp.dataset_id=? AND dp.trade_date=? AND dp.partition_no=? AND dp.validation_status='validated' "
+                "  AND NOT EXISTS (SELECT 1 FROM batch_days bd WHERE bd.batch_id=? AND bd.partition_id=dp.partition_id) "
+                "ORDER BY dp.created_at DESC LIMIT 1",
+                (batch["dataset_id"], normalized_date, partition_no, str(batch_id)),
+            ).fetchone()
+            if not existing:
+                return None
+            if str(existing["basis"] or "").lower() != "unadjusted" or str(existing["source"] or "").strip().casefold() != str(batch["provider"] or "").strip().casefold():
+                return None
+            partition_id = str(existing["partition_id"])
+            source_meta = db.execute(
+                "SELECT rpm.server_row_count,rpm.server_terminal,rpm.server_page_digest,rpm.filter_policy,rpm.server_rows_json "
+                "FROM raw_page_metadata rpm JOIN batch_days bd ON bd.batch_id=rpm.batch_id AND bd.partition_id=? "
+                "WHERE rpm.trade_date=? AND rpm.partition_no=? ORDER BY rpm.created_at DESC LIMIT 1",
+                (partition_id, normalized_date, partition_no),
+            ).fetchone()
+            if not source_meta:
+                return None
+            rows = [dict(row) for row in db.execute(
+                "SELECT trade_date,code,ts_code,name,open,high,low,close,pre_close,pct_change,volume,amount,source,basis FROM partition_bars WHERE partition_id=? ORDER BY code,ts_code",
+                (partition_id,),
+            )]
+            if not rows:
+                return None
+            try:
+                market_counts = json.loads(str(existing["market_counts_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(market_counts, dict):
+                return None
+            db.execute(
+                "INSERT OR IGNORE INTO batch_days(batch_id,trade_date,partition_id,row_count) VALUES(?,?,?,?)",
+                (str(batch_id), normalized_date, partition_id, int(existing["row_count"] or len(rows))),
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO raw_page_metadata(batch_id,trade_date,partition_no,server_row_count,server_terminal,server_page_digest,filter_policy,server_rows_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    str(batch_id), normalized_date, partition_no,
+                    int(source_meta["server_row_count"] or 0), int(source_meta["server_terminal"] or 0),
+                    str(source_meta["server_page_digest"] or ""), str(source_meta["filter_policy"] or "include_all"),
+                    str(source_meta["server_rows_json"] or "[]"), datetime.utcnow().isoformat(),
+                ),
+            )
+            totals = db.execute("SELECT COALESCE(SUM(row_count),0) FROM batch_days WHERE batch_id=?", (str(batch_id),)).fetchone()
+            db.execute("UPDATE batches SET row_count=? WHERE batch_id=?", (int(totals[0]), str(batch_id)))
+            return {
+                "trade_date": normalized_date,
+                "partition_no": partition_no,
+                "partition_id": partition_id,
+                "row_count": int(existing["row_count"] or len(rows)),
+                "content_hash": str(existing["content_hash"] or ""),
+                "market_counts": market_counts,
+                "server_row_count": int(source_meta["server_row_count"] or 0),
+                "server_terminal": bool(int(source_meta["server_terminal"] or 0)),
+                "server_page_digest": str(source_meta["server_page_digest"] or ""),
+                "filter_policy": str(source_meta["filter_policy"] or "include_all"),
+                "rows": rows,
+            }
 
     def raw_batch_staged_rows(self, batch_id: str, trade_date: str | None = None) -> dict[str, list[dict]]:
         result: dict[str, list[dict]] = {}
@@ -3713,8 +3940,15 @@ class StockStore:
     stage_or_reuse_partition = stage_raw_partition
     stage_partition = stage_raw_partition
 
-    def _validate_raw_partitions_in_tx(self, db, batch) -> dict:
-        """Re-read every staged row and build the only trusted batch summary."""
+    def _validate_raw_partitions_in_tx(self, db, batch, fast: bool = False) -> dict:
+        """Re-read every staged row and build the only trusted batch summary.
+
+        ``fast=True`` skips the per-bar re-normalisation and page-metadata
+        recomputation, trusting the publish-time validation of an immutable
+        batch and verifying only the append-only partition digest/row-count/
+        market-count contract.  This turns a multi-minute event-loop block
+        (hundreds of thousands of float conversions) into a short digest pass.
+        """
         mappings = db.execute(
             "SELECT bd.trade_date AS batch_trade_date,bd.partition_id AS batch_partition_id,bd.row_count AS batch_row_count,"
             "dp.partition_id,dp.dataset_id,dp.trade_date,dp.partition_no,dp.content_hash,dp.source,dp.basis,dp.row_count,"
@@ -3765,43 +3999,96 @@ class StockStore:
             partition_source = str(mapping["source"] or "").strip().casefold()
             if not batch_source or partition_source != batch_source:
                 raise RuntimeError("raw batch contains a mixed source")
-            rows = [
-                dict(row) for row in db.execute(
-                    "SELECT trade_date,code,ts_code,name,open,high,low,close,pre_close,pct_change,volume,amount,source,basis "
-                    "FROM partition_bars WHERE partition_id=? ORDER BY code,ts_code",
-                    (str(mapping["partition_id"]),),
-                )
-            ]
-            if not rows:
-                raise RuntimeError("raw batch contains an empty partition")
-            normalized_rows: list[dict] = []
-            for row in rows:
+            if fast:
+                # A published batch is immutable and was already re-hashed and
+                # re-normalised bar-by-bar at publish time.  Re-hashing ~665k
+                # bars on every process start (the read path runs before the
+                # in-memory cache is warm) blocks the event loop for ~90s, so
+                # trust the append-only partition metadata instead and only
+                # verify that it is well-formed and self-consistent.
+                content_hash = str(mapping["content_hash"] or "")
+                if not re.fullmatch(r"[0-9a-f]{64}", content_hash):
+                    raise RuntimeError("raw partition content hash is invalid")
+                if partition_row_count != batch_row_count:
+                    raise RuntimeError("raw partition row count mismatch")
                 try:
-                    normalized = self._normalize_raw_bar(row, partition_date, source=str(mapping["source"]), basis="unadjusted")
-                    if self._raw_bar_payload(normalized) != self._raw_bar_payload(row):
-                        raise ValueError("raw partition row is not canonical")
-                except (TypeError, ValueError, OverflowError, KeyError) as exc:
-                    raise RuntimeError("raw batch contains an invalid partition row") from exc
-                key = (partition_date, str(normalized["code"]))
-                if key in seen_codes:
-                    raise RuntimeError("raw batch contains duplicate codes for a date")
-                seen_codes.add(key)
-                normalized_rows.append(normalized)
-            metadata = page_metadata.get(partition_key)
-            if metadata is None:
-                metadata = dict(self._raw_page_metadata_values(
-                    batch,
-                    partition_date,
-                    partition_no,
-                    normalized_rows,
-                    source=str(batch["provider"]),
-                ))
-            page = self._validate_raw_page_metadata_in_tx(db, batch, metadata, normalized_rows)
+                    market_counts = json.loads(str(mapping["market_counts_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("raw partition market counts are invalid") from exc
+                if (
+                    not isinstance(market_counts, dict)
+                    or any(key not in {"SH", "SZ", "BJ"} for key in market_counts)
+                    or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in market_counts.values())
+                ):
+                    raise RuntimeError("raw partition market counts mismatch")
+                page_meta = page_metadata.get(partition_key)
+                if page_meta is None:
+                    raise RuntimeError("raw page metadata is missing")
+                server_row_count = self._strict_db_int(page_meta["server_row_count"], minimum=0)
+                server_terminal = self._strict_db_int(page_meta["server_terminal"], minimum=0, maximum=1)
+                if server_row_count is None or server_terminal is None:
+                    raise RuntimeError("raw server page metadata is invalid")
+                server_page_digest = str(page_meta["server_page_digest"] or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", server_page_digest):
+                    raise RuntimeError("raw server page digest is invalid")
+                page = {
+                    "trade_date": partition_date,
+                    "partition_no": partition_no,
+                    "server_row_count": server_row_count,
+                    "server_terminal": bool(server_terminal),
+                    "server_page_digest": server_page_digest,
+                    "filter_policy": self._raw_page_filter_policy(str(page_meta["filter_policy"] or "")),
+                }
+                date_counts = daily_counts.setdefault(partition_date, {"total": 0})
+                date_counts["total"] += partition_row_count
+                for market, value in market_counts.items():
+                    date_counts[market] = date_counts.get(market, 0) + value
+                trusted.append({
+                    "trade_date": partition_date,
+                    "partition_no": partition_no,
+                    "partition_id": str(mapping["partition_id"]),
+                    "content_hash": content_hash,
+                    "row_count": partition_row_count,
+                    "market_counts": market_counts,
+                })
+                trusted_pages.append({
+                    "trade_date": partition_date,
+                    "partition_no": partition_no,
+                    "server_row_count": int(page["server_row_count"]),
+                    "server_terminal": bool(page["server_terminal"]),
+                    "server_page_digest": str(page["server_page_digest"]),
+                    "filter_policy": str(page["filter_policy"]),
+                })
+                total_rows += partition_row_count
+                continue
+            # Publication re-validation verifies the append-only digest (tamper
+            # detection) without re-normalising every bar or re-parsing the
+            # server-page metadata.  Both were already validated when the
+            # partition was staged, so re-doing them here only re-serialises
+            # ~665k bars and blocks the event loop for minutes.
             digest, count, market_counts = self._raw_partition_db_digest(db, str(mapping["partition_id"]))
             if digest != str(mapping["content_hash"] or "") or count != partition_row_count or count != batch_row_count:
                 raise RuntimeError("raw partition digest or row count mismatch")
             if not self._strict_market_counts_json(mapping["market_counts_json"], market_counts):
                 raise RuntimeError("raw partition market counts mismatch")
+            metadata = page_metadata.get(partition_key)
+            if metadata is None:
+                raise RuntimeError("raw page metadata is missing")
+            server_row_count = self._strict_db_int(metadata["server_row_count"], minimum=0)
+            server_terminal = self._strict_db_int(metadata["server_terminal"], minimum=0, maximum=1)
+            if server_row_count is None or server_terminal is None:
+                raise RuntimeError("raw server page metadata is invalid")
+            server_page_digest = str(metadata["server_page_digest"] or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", server_page_digest):
+                raise RuntimeError("raw server page digest is invalid")
+            page = {
+                "trade_date": partition_date,
+                "partition_no": partition_no,
+                "server_row_count": server_row_count,
+                "server_terminal": bool(server_terminal),
+                "server_page_digest": server_page_digest,
+                "filter_policy": self._raw_page_filter_policy(str(metadata["filter_policy"] or "")),
+            }
             date_counts = daily_counts.setdefault(partition_date, {"total": 0})
             date_counts["total"] += count
             for market, value in market_counts.items():
@@ -3955,7 +4242,24 @@ class StockStore:
         if batch["end_date"] is not None and str(batch["end_date"]) != end_date:
             raise RuntimeError("raw batch end date mismatch")
 
-    def _validate_published_raw_batch_in_tx(self, db, batch) -> dict:
+    def _validate_published_raw_batch_cached(self, db, batch) -> dict:
+        """Validate a published raw batch once per process, then reuse.
+
+        The first read re-hashes the stored bars so out-of-band SQLite changes
+        remain detectable.  Callers keep this work off the event loop, and the
+        result is cached by (batch_id, generation) for subsequent reads.
+        """
+        batch_id = str(batch["batch_id"] or "")
+        generation = str(batch["generation"] or "")
+        key = batch_id + ":" + generation
+        cached = self._raw_batch_validation_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._validate_published_raw_batch_in_tx(db, batch)
+        self._raw_batch_validation_cache[key] = result
+        return result
+
+    def _validate_published_raw_batch_in_tx(self, db, batch, fast: bool = False) -> dict:
         if str(batch["status"] or "") != "published":
             raise RuntimeError("raw batch is not published")
         if str(batch["basis"] or "").lower() != "unadjusted" or str(batch["dataset_basis"] or "").lower() != "unadjusted":
@@ -3963,7 +4267,7 @@ class StockStore:
         if str(batch["source"] or "").strip().casefold() != str(batch["provider"] or "").strip().casefold():
             raise RuntimeError("raw batch source does not match provider")
         try:
-            detail = self._validate_raw_partitions_in_tx(db, batch)
+            detail = self._validate_raw_partitions_in_tx(db, batch, fast=fast)
             actual_text = str(batch["actual_trade_date"] or "")
             actual = self._canonical_raw_date(actual_text)
             if not actual or actual != actual_text:
@@ -4172,6 +4476,9 @@ class StockStore:
                 raise KeyError(f"unknown raw batch {batch_id}")
             if str(batch["status"] or "") != "published" or int(batch["shadow"] or 0) != 1 or str(batch["publication_mode"] or "") != "shadow":
                 raise RuntimeError("raw batch is not a shadow publication")
+            # Promotion is a security-sensitive transition: re-validate the
+            # full batch (per-bar digest) rather than the fast cached read
+            # path, so tampered bars cannot be promoted into the active set.
             detail = self._validate_published_raw_batch_in_tx(db, batch)
             source_value = str(source or batch["source"] or batch["provider"]).strip()[:80]
             if source_value.casefold() != str(batch["source"] or batch["provider"]).strip().casefold():
@@ -4250,7 +4557,7 @@ class StockStore:
             if not row:
                 return None
             try:
-                self._validate_published_raw_batch_in_tx(db, row)
+                self._validate_published_raw_batch_cached(db, row)
                 if str(row["active_dataset_id"]) != str(row["batch_dataset_id"]) or int(row["active_generation"]) != int(row["batch_generation"]):
                     raise RuntimeError("active raw generation pointer mismatch")
             except (RuntimeError, ValueError, TypeError, KeyError, OverflowError):
@@ -4264,6 +4571,38 @@ class StockStore:
     def active_raw_generation(self, dataset_key: str = "tushare_daily", *, as_of: str = "", max_stale_trading_days: int = 2) -> dict | None:
         return self.active_raw_batch(dataset_key, as_of=as_of, max_stale_trading_days=max_stale_trading_days)
 
+    def active_raw_universe_codes(self, dataset_key: str = "tushare_daily", *, as_of: str = "", max_stale_trading_days: int = 2, limit: int = 10000) -> tuple[list[str], dict]:
+        active = self.active_raw_batch(dataset_key, as_of=as_of, max_stale_trading_days=max_stale_trading_days)
+        if not active or not active.get("fresh"):
+            return [], dict(active or {})
+        batch_id = str(active.get("batch_id") or active.get("active_batch_id") or "")
+        trade_date = str(active.get("actual_trade_date") or "")
+        if not batch_id or not trade_date:
+            return [], dict(active)
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT pb.code FROM batch_days bd JOIN partition_bars pb ON pb.partition_id=bd.partition_id "
+                "WHERE bd.batch_id=? AND bd.trade_date=? ORDER BY pb.code LIMIT ?",
+                (batch_id, trade_date, max(1, min(int(limit), 10000))),
+            ).fetchall()
+        return [str(row[0]) for row in rows if str(row[0] or "").strip()], dict(active)
+
+    def save_intraday_market_regime_state(self, state: dict, *, scope: str = "whole_market") -> dict:
+        value = dict(state or {})
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO intraday_market_regime_state(scope,regime,source,source_timestamp,sample_size,expected_size,coverage,quality,reason,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(scope) DO UPDATE SET regime=excluded.regime,source=excluded.source,source_timestamp=excluded.source_timestamp,sample_size=excluded.sample_size,expected_size=excluded.expected_size,coverage=excluded.coverage,quality=excluded.quality,reason=excluded.reason,updated_at=excluded.updated_at",
+                (str(scope), str(value.get("regime") or "unknown"), str(value.get("source") or ""), str(value.get("source_timestamp") or ""), int(value.get("sample_size") or 0), int(value.get("expected_size") or 0), float(value.get("coverage") or 0), str(value.get("quality") or "unknown"), str(value.get("reason") or "")[:500], str(value.get("updated_at") or datetime.utcnow().isoformat())),
+            )
+            row = db.execute("SELECT * FROM intraday_market_regime_state WHERE scope=?", (str(scope),)).fetchone()
+        return dict(row)
+
+    def intraday_market_regime_state(self, scope: str = "whole_market") -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM intraday_market_regime_state WHERE scope=?", (str(scope),)).fetchone()
+        return dict(row) if row else None
+
     def raw_batch_bars(self, batch_id: str, codes=None, *, before_or_equal: str = "", after: str = "") -> dict[str, list[dict]]:
         with self._connect() as db:
             row = db.execute(
@@ -4273,17 +4612,17 @@ class StockStore:
             if not row:
                 return {}
             try:
-                self._validate_published_raw_batch_in_tx(db, row)
+                self._validate_published_raw_batch_cached(db, row)
             except (RuntimeError, ValueError, TypeError, KeyError, OverflowError):
                 return {}
             reader = RawBatchRead(db, "direct", str(row["batch_id"]), str(row["dataset_id"]), 0, str(row["basis"]), str(row["source"]))
             return reader.bars(codes, before_or_equal, after)
 
-    def raw_history(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2) -> tuple[dict[str, list[dict]], dict]:
+    def raw_history(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2, after: str = "") -> tuple[dict[str, list[dict]], dict]:
         with self.pin_active_raw_batch(dataset_key, as_of=as_of, max_stale_trading_days=max_stale_trading_days, reader="history") as reader:
             if reader is None:
                 return {}, {}
-            return reader.bars(codes, before_or_equal=as_of), {
+            return reader.bars(codes, before_or_equal=as_of, after=after), {
                 "batch_id": reader.batch_id,
                 "dataset_id": reader.dataset_id,
                 "generation": reader.generation,
@@ -4291,8 +4630,8 @@ class StockStore:
                 "source": reader.source,
             }
 
-    def read_active_raw_bars(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2) -> dict[str, list[dict]]:
-        return self.raw_history(codes, as_of=as_of, dataset_key=dataset_key, max_stale_trading_days=max_stale_trading_days)[0]
+    def read_active_raw_bars(self, codes=None, *, as_of: str = "", dataset_key: str = "tushare_daily", max_stale_trading_days: int = 2, after: str = "") -> dict[str, list[dict]]:
+        return self.raw_history(codes, as_of=as_of, dataset_key=dataset_key, max_stale_trading_days=max_stale_trading_days, after=after)[0]
 
     load_raw_bars = read_active_raw_bars
 
@@ -4318,7 +4657,7 @@ class StockStore:
             ).fetchone()
             if row:
                 try:
-                    self._validate_published_raw_batch_in_tx(db, row)
+                    self._validate_published_raw_batch_cached(db, row)
                     if str(row["dataset_id"]) != str(row["batch_dataset_id"]) or int(row["active_generation"]) != int(row["batch_generation"]):
                         raise RuntimeError("active raw generation pointer mismatch")
                 except (RuntimeError, ValueError, TypeError, KeyError, OverflowError):
@@ -4850,7 +5189,60 @@ class StockStore:
                 terminal=terminal,
             )
 
-    def save_tushare_snapshot_owned(
+    @staticmethod
+    def _snapshot_diagnostic_failure_kind(diagnostics) -> str | None:
+        """Return only an explicitly classified, durable retry reason."""
+        if not isinstance(diagnostics, dict):
+            return None
+        for key in ("internal_error", "unexpected_error", "programming_error", "cancelled", "canceled", "invalid_date", "future_date"):
+            value = diagnostics.get(key)
+            if value is True or str(value or "").strip().lower() in {"1", "true", "yes", "on"}:
+                return None
+        value = str(diagnostics.get("failure_kind") or "").strip().lower()
+        aliases = {
+            "network_failed": "network",
+            "rate_limited": "rate_limit",
+            "breaker_open": "breaker",
+            "calendar_unavailable": "calendar",
+            "publish_failed": "publish",
+            "coverage_failed": "coverage",
+            "history": "history_invalid",
+        }
+        value = aliases.get(value, value)
+        return value if value in {"network", "timeout", "breaker", "rate_limit", "not_published", "calendar", "publish", "coverage", "history_invalid"} else None
+
+    @staticmethod
+    def _snapshot_exception_failure_kind(exception) -> str | None:
+        """Classify provider exceptions without importing the provider module."""
+        if exception is None:
+            return None
+        if isinstance(exception, asyncio.CancelledError) or type(exception).__name__ in {"CancelledError", "CancelledError"}:
+            raise exception
+        names = {
+            "TushareCircuitOpen": "breaker",
+            "TushareRateLimitError": "rate_limit",
+            "TushareNetworkError": "network",
+            "TushareNotPublishedError": "not_published",
+            "TusharePublishError": "publish",
+            "TushareCoverageError": "coverage",
+            "TushareHistoryError": "history_invalid",
+            "TushareCalendarError": "calendar",
+        }
+        return names.get(type(exception).__name__)
+
+    @staticmethod
+    def _snapshot_result_is_typed(result) -> bool:
+        if isinstance(result, dict):
+            return all(key in result for key in ("quotes", "trade_date", "complete"))
+        return all(hasattr(result, key) for key in ("quotes", "trade_date", "complete"))
+
+    @staticmethod
+    def _snapshot_result_value(result, key: str, default=None):
+        if isinstance(result, dict):
+            return result.get(key, default)
+        return getattr(result, key, default)
+
+    def finalize_snapshot_request_owned(
         self,
         request_id: str,
         requested_date: str,
@@ -4883,13 +5275,15 @@ class StockStore:
         persist_meta: bool = True,
         lease_ttl_seconds: float | None = None,
         now: float | None = None,
+        result=None,
+        exception=None,
+        diagnostics: dict | None = None,
     ) -> dict:
-        """Persist a Tushare snapshot and request outcome under one fence.
+        """CAS-finalize exactly one live ``fetching`` snapshot request.
 
-        The lease check, quote upsert, metadata update, and request update all
-        share one ``BEGIN IMMEDIATE`` transaction.  A stale owner therefore
-        either writes nothing or receives ``SnapshotLeaseLostError``; it can
-        never leave a new quote paired with an old request outcome.
+        Durable classified state wins over cleanup.  Invalid or untyped results,
+        unexpected exceptions, and cancellation intentionally leave the request
+        in ``fetching``; the latter is re-raised to preserve task cancellation.
         """
         request_key = str(request_id or "").strip()
         requested_value = self._date_norm(requested_date)
@@ -4902,11 +5296,26 @@ class StockStore:
             raise ValueError("snapshot lease identity is required")
         if len(owner_value) > 160:
             raise ValueError("snapshot lease owner is too long")
+        result_invalid = False
+        if result is not None:
+            if not self._snapshot_result_is_typed(result):
+                result_invalid = True
+            else:
+                if quotes is None:
+                    quotes = self._snapshot_result_value(result, "quotes", [])
+                if actual_trade_date is None:
+                    actual_trade_date = self._snapshot_result_value(result, "trade_date")
+                if diagnostics is None:
+                    diagnostics = self._snapshot_result_value(result, "diagnostics", {})
+                if state is None and bool(self._snapshot_result_value(result, "complete", False)):
+                    state = "complete"
         actual_value = self._date_norm(actual_trade_date) if actual_trade_date else None
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", requested_value):
             raise ValueError("snapshot requested date is invalid")
         if actual_value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", actual_value):
-            raise ValueError("snapshot actual trade date is invalid")
+            result_invalid = True
+        if actual_value and actual_value > requested_value:
+            result_invalid = True
         current = self._snapshot_lease_epoch(now)
         now_text = datetime.utcnow().isoformat()
         calendar_text = json.dumps(calendar_evidence or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -4921,10 +5330,57 @@ class StockStore:
         request_terminal_value = int(bool(request_terminal if request_terminal is not None else terminal))
         request_failure_value = str(request_failure_kind if request_failure_kind is not None else failure_kind or "")[:64]
         request_attempts = max(0, int(attempts or 0))
+        diagnostic_failure = self._snapshot_diagnostic_failure_kind(diagnostics)
+        explicit_state = str(request_state if request_state is not None else state or "").strip().lower()
 
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._assert_snapshot_lease_in_tx(db, request_key, owner_value, fence_value, now=current)
+            row = self._assert_snapshot_lease_owner_in_tx(db, request_key, owner_value, fence_value, now=current)
+            persisted_state = str(row["state"] or "").strip().lower()
+            if persisted_state != "fetching":
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = persisted_state
+                return preserved
+            if isinstance(exception, asyncio.CancelledError) or (exception is not None and type(exception).__name__ == "CancelledError"):
+                raise exception
+            exception_failure = self._snapshot_exception_failure_kind(exception)
+            if result_invalid:
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = "fetching"
+                preserved["finalizer_reason"] = "invalid_result"
+                return preserved
+            if diagnostic_failure:
+                request_state_value = "retry"
+                request_failure_value = diagnostic_failure
+                request_terminal_value = 0
+                if not request_error_value:
+                    request_error_value = "classified provider diagnostic"
+            elif exception_failure:
+                request_state_value = "retry"
+                request_failure_value = exception_failure
+                request_terminal_value = 0
+                if not request_error_value:
+                    request_error_value = f"typed provider exception: {exception_failure}"
+            elif exception is not None:
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = "fetching"
+                preserved["finalizer_reason"] = "internal_error"
+                return preserved
+            elif explicit_state not in {"retry", "partial", "complete", "terminal", "failed", "shadow"}:
+                preserved = self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
+                preserved["finalized"] = False
+                preserved["preserved_state"] = "fetching"
+                preserved["finalizer_reason"] = "unclassified"
+                return preserved
+            else:
+                request_state_value = explicit_state
+            if request_state_value in {"complete", "terminal"}:
+                request_terminal_value = 1
+            if request_state_value == "retry":
+                request_terminal_value = 0
             saved = 0
             if persist_meta and actual_value:
                 saved = self._save_daily_quotes_in_tx(
@@ -4939,15 +5395,15 @@ class StockStore:
                     actual_value,
                     source,
                     quality,
-                    complete,
+                    request_state_value in {"complete", "terminal"} or complete,
                     requested_value,
                     note,
                     snapshot_version=snapshot_version,
-                    state=state,
+                    state=request_state_value,
                     attempts=request_attempts,
-                    last_error=last_error,
-                    next_retry_at=next_retry_at,
-                    terminal=terminal,
+                    last_error=request_error_value,
+                    next_retry_at=request_retry_value,
+                    terminal=bool(request_terminal_value),
                     now_text=now_text,
                 )
             elif quotes and actual_value:
@@ -4990,21 +5446,32 @@ class StockStore:
                 values.extend((new_expiry, now_text))
             values.extend((request_key, owner_value, fence_value, current))
             cursor = db.execute(
-                f"UPDATE snapshot_requests SET {assignments} WHERE request_id=? AND lease_owner=? AND lease_fence=? AND lease_expires_at>? AND terminal=0",
+                f"UPDATE snapshot_requests SET {assignments} WHERE request_id=? AND lease_owner=? AND lease_fence=? AND lease_expires_at>? AND terminal=0 AND state='fetching'",
                 values,
             )
             if cursor.rowcount <= 0:
+                current_row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+                if current_row and str(current_row["lease_owner"] or "") == owner_value and int(current_row["lease_fence"] or 0) == fence_value and str(current_row["state"] or "").strip().lower() != "fetching":
+                    preserved = self._snapshot_lease_view(current_row, current, acquired=True, owner=owner_value, fence=fence_value)
+                    preserved["finalized"] = False
+                    preserved["preserved_state"] = str(current_row["state"] or "").strip().lower()
+                    return preserved
                 raise SnapshotLeaseLostError("snapshot lease update lost ownership")
             refreshed = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
             result = self._snapshot_lease_view(refreshed, current, acquired=True, owner=owner_value, fence=fence_value)
             result["saved_quotes"] = saved
+            result["finalized"] = True
             return result
+
+    def save_tushare_snapshot_owned(self, *args, **kwargs) -> dict:
+        """Compatibility wrapper for the fenced snapshot finalizer."""
+        return self.finalize_snapshot_request_owned(*args, **kwargs)
 
     # Compatibility spellings for integrations that describe the operation as
     # a generic snapshot-result persistence call.
-    persist_tushare_snapshot_owned = save_tushare_snapshot_owned
-    save_snapshot_result_owned = save_tushare_snapshot_owned
-    persist_snapshot_result_owned = save_tushare_snapshot_owned
+    persist_tushare_snapshot_owned = finalize_snapshot_request_owned
+    save_snapshot_result_owned = finalize_snapshot_request_owned
+    persist_snapshot_result_owned = finalize_snapshot_request_owned
 
     def snapshot_meta(self, trade_date: str) -> dict | None:
         with self._connect() as db:
@@ -5079,6 +5546,32 @@ class StockStore:
             or expiry <= current
         ):
             raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
+
+    @classmethod
+    def _assert_snapshot_lease_owner_in_tx(cls, db, request_id: str, owner: str, fence: int, *, now: float | None = None):
+        """Check owner/fence without treating an already-finalized row as lost."""
+        request_key = str(request_id or "").strip()
+        owner_value = str(owner or "").strip()
+        try:
+            fence_value = int(fence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SnapshotLeaseLostError("snapshot lease fence is invalid") from exc
+        if not request_key or not owner_value or fence_value < 1:
+            raise SnapshotLeaseLostError("snapshot lease identity is incomplete")
+        current = cls._snapshot_lease_epoch(now)
+        row = db.execute("SELECT * FROM snapshot_requests WHERE request_id=?", (request_key,)).fetchone()
+        try:
+            expiry = float(row["lease_expires_at"] or 0) if row else 0.0
+        except (TypeError, ValueError, OverflowError):
+            expiry = 0.0
+        if (
+            not row
+            or str(row["lease_owner"] or "") != owner_value
+            or int(row["lease_fence"] or 0) != fence_value
+            or expiry <= current
+        ):
+            raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
+        return row
 
     def snapshot_lease_state(self, request_id: str, *, now: float | None = None) -> dict | None:
         """Read request state and whether its durable lease is currently live."""
@@ -5281,6 +5774,11 @@ class StockStore:
                 expiry = 0.0
             if str(row["lease_owner"] or "") != owner_value or int(row["lease_fence"] or 0) != fence_value or expiry <= current:
                 raise SnapshotLeaseLostError("snapshot lease owner or fence no longer matches")
+            # This method is only the pre-fetch marker.  Classified retry or
+            # terminal outcomes must use the CAS finalizer below, otherwise a
+            # late cleanup could overwrite a durable result.
+            if str(state or "").strip().lower() != "fetching" or str(row["state"] or "").strip().lower() != "fetching":
+                return self._snapshot_lease_view(row, current, acquired=True, owner=owner_value, fence=fence_value)
             assignments = ",".join(f"{name}=?" for name in fields)
             values = list(fields.values())
             if lease_ttl_seconds is not None:
@@ -5322,6 +5820,20 @@ class StockStore:
                 "next_retry_at=excluded.next_retry_at,terminal=excluded.terminal,updated_at=excluded.updated_at",
                 (request_id, requested_date, actual_trade_date, state, max(0, int(attempts)), source or "", quality or "unknown", last_error, next_retry_at, int(bool(terminal)), now, now),
             )
+
+    def reopen_snapshot_request(self, request_id: str, *, expected_updated_at: str) -> bool:
+        """Reopen obsolete completion without replacing a live owner's lease."""
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE snapshot_requests SET state='pending',terminal=0,next_retry_at=NULL,"
+                "calendar_evidence_json='{}',updated_at=? "
+                "WHERE request_id=? AND updated_at=? AND "
+                "(terminal=1 OR state IN ('complete','terminal')) AND "
+                "(lease_owner='' OR lease_expires_at<=?)",
+                (datetime.utcnow().isoformat(), request_id, expected_updated_at,
+                 self._snapshot_lease_epoch(None)),
+            )
+            return cursor.rowcount == 1
 
     def snapshot_request(self, request_id: str) -> dict | None:
         with self._connect() as db:
