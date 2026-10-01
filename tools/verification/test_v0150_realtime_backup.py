@@ -13,6 +13,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 if str(REPOSITORY_ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT / "tests"))
+# Placeholder credential for fixtures; a constant keeps release secret scanning precise.
+FIXTURE_TOKEN = "fixture-token"
 
 from astrbot_stock_watch.core import CHINA_TZ, Quote
 from astrbot_stock_watch.providers import (
@@ -59,7 +61,7 @@ class _Gateway:
 def _provider(mode="disabled", response=None):
     gateway = _Gateway(response or _body(_row()))
     provider = SinaQuoteProvider(
-        tushare_token="fixture-token",
+        tushare_token=FIXTURE_TOKEN,
         gateway=gateway,
         realtime_backup_mode=mode,
         realtime_backup_min_interval_seconds=5,

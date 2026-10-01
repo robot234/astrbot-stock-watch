@@ -14,6 +14,8 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
+# Placeholder credential for fixtures; a constant keeps release secret scanning precise.
+CONFIGURED_TOKEN = "configured"
 
 
 def _install_astrbot_stubs() -> None:
@@ -126,7 +128,7 @@ def test_intraday_shared_overwrite_cannot_change_full_market_record_or_report():
     main._last_screen_diagnostics = {}
     main._raw_screen_provenance = {}
     main._last_screen_report_claimed = True
-    main.quotes = types.SimpleNamespace(tushare_token="configured")
+    main.quotes = types.SimpleNamespace(tushare_token=CONFIGURED_TOKEN)
     main.store = types.SimpleNamespace(
         active_raw_batch=lambda *_args, **_kwargs: {
             "batch_id": "full-batch",

@@ -16,6 +16,8 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
+# Placeholder credential for fixtures; a constant keeps release secret scanning precise.
+FIXTURE_TOKEN = "fixture-token"
 
 
 def _install_astrbot_stubs() -> None:
@@ -591,7 +593,7 @@ def _automatic_reconciliation_main(
         "screen_min_indicator_coverage": 0.8,
         "daily_snapshot_min_size": 1,
     }
-    main.quotes = types.SimpleNamespace(tushare_token="fixture-token")
+    main.quotes = types.SimpleNamespace(tushare_token=FIXTURE_TOKEN)
     main.raw_dataset_key = "tushare_daily"
     main._daily_retry_after = None
     main.last_daily_scan = None

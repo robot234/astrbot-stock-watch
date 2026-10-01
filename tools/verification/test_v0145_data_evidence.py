@@ -18,6 +18,9 @@ from astrbot_stock_watch.providers import SinaQuoteProvider, TusharePermissionEr
 
 DATE = "2026-09-11"
 KNOWN = "2026-09-12T12:00:00+00:00"
+# Placeholder credentials for fixtures; constants keep release secret scanning precise.
+FIXTURE_NOT_SECRET = "fixture-not-a-secret"
+FIXTURE_TOKEN = "fixture"
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +110,7 @@ def test_factor_100_symbols_and_field_semantics():
     async def run():
         codes = [f"{600000 + i:06d}" for i in range(100)]
         runtime, gateway = Runtime(), FactorGateway(codes)
-        provider = SinaQuoteProvider(tushare_token="fixture-not-a-secret", http_runtime=runtime, gateway=gateway)
+        provider = SinaQuoteProvider(tushare_token=FIXTURE_NOT_SECRET, http_runtime=runtime, gateway=gateway)
         try:
             rows = await provider.fetch_tushare_factors(codes, DATE)
             assert set(rows) == set(codes)
@@ -152,7 +155,7 @@ def test_quote_collection_is_not_backdated_to_exchange_timestamp():
 def test_factor_failed_binding_is_unknown(defect, field):
     async def run():
         runtime, gateway = Runtime(), FactorGateway(["600000"], defect)
-        provider = SinaQuoteProvider(tushare_token="fixture", http_runtime=runtime, gateway=gateway)
+        provider = SinaQuoteProvider(tushare_token=FIXTURE_TOKEN, http_runtime=runtime, gateway=gateway)
         try:
             rows = await provider.fetch_tushare_factors(["600000"], DATE)
             clean = ev.safe_factor_row(rows.get("600000", {}), "600000", DATE, KNOWN)
