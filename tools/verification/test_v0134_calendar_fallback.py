@@ -15,6 +15,9 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# Placeholder credentials for fixtures; constants keep release secret scanning precise.
+CONFIGURED_TOKEN = "configured"
+FIXTURE_TOKEN = "fixture-token"
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
@@ -303,7 +306,7 @@ class _CalendarFallbackProvider:
     last_diagnostics = {}
 
     def __init__(self, dates, eastmoney_error=None):
-        setattr(self, "tushare_token", "configured")
+        setattr(self, "tushare_token", CONFIGURED_TOKEN)
         self.dates = list(dates)
         self.eastmoney_error = eastmoney_error
         self.calendar_calls = 0
@@ -469,7 +472,7 @@ def test_invalid_calendar_without_cache_stays_fail_closed_and_retries(tmp_path):
 
     class Provider:
         last_diagnostics = {}
-        tushare_token = "configured"
+        tushare_token = CONFIGURED_TOKEN
 
         async def fetch_completed_trade_dates(self, *_args, **_kwargs):
             raise TushareCalendarError("completed-session calendar returned no dates")
@@ -512,7 +515,7 @@ def test_daily_permission_failure_is_fail_closed_without_em_price_call(tmp_path)
             raise AssertionError("daily permission failure must not call EM prices")
 
     provider = Provider()
-    setattr(provider, "tushare_token", "configured")
+    setattr(provider, "tushare_token", CONFIGURED_TOKEN)
     main.quotes = provider
     with pytest.raises(TusharePermissionError):
         asyncio.run(main._daily_snapshot("2026-08-28"))
@@ -1096,7 +1099,7 @@ def test_published_raw_cache_finalizes_stuck_snapshot_and_renders_complete_heade
         quality="unknown",
     )
     main = _main_harness(store, session_count=1)
-    main.quotes = types.SimpleNamespace(tushare_token="fixture-token")
+    main.quotes = types.SimpleNamespace(tushare_token=FIXTURE_TOKEN)
     quote = Quote("600000", "Test", 12.0, 11.9, 100000, 0.8, 1000, source="tushare")
     evidence = {
         "calendar_cutoff_date": requested_date,
@@ -1156,7 +1159,7 @@ def test_raw_cache_without_complete_matching_generation_stays_fail_closed(tmp_pa
     request_id = f"daily_snapshot:{requested_date}"
     store.save_snapshot_request(request_id, requested_date, state="fetching", attempts=64, source="tushare")
     main = _main_harness(store, session_count=1)
-    main.quotes = types.SimpleNamespace(tushare_token="fixture-token")
+    main.quotes = types.SimpleNamespace(tushare_token=FIXTURE_TOKEN)
     quote = Quote("600000", "Test", 12.0, 11.9, 100000, 0.8, 1000, source="tushare")
 
     async def resolve_calendar(_requested_date):
@@ -1196,7 +1199,7 @@ def test_raw_cache_without_complete_matching_generation_stays_fail_closed(tmp_pa
 def test_market_sync_invocation_emits_one_response_with_correlation_diagnostics(tmp_path):
     store = StockStore(tmp_path / "market-sync-yield.sqlite3")
     main = _main_harness(store, session_count=1)
-    main.quotes = types.SimpleNamespace(tushare_token="fixture-token")
+    main.quotes = types.SimpleNamespace(tushare_token=FIXTURE_TOKEN)
 
     async def empty_snapshot(_trade_date):
         main._last_screen_diagnostics = {"history_unavailable": True}

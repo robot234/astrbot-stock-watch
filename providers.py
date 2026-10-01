@@ -4023,31 +4023,55 @@ class SinaQuoteProvider:
     ) -> list[Quote]:
         values = list(dict.fromkeys(_raw_six_digit_code(code) for code in codes if _raw_six_digit_code(code)))[:500]
         if not values:
+            self.last_diagnostics = {"batch_status": "empty", "raw_count": 0, "accepted_count": 0, "rejected_count": 0, "rejection_reasons": {}}
             return []
-        url = "https://hq.sinajs.cn/list=" + ",".join(_sina_symbol(code) for code in values)
-        async with self.http.slot() as client:
-            response = await client.get(url, headers={"Referer": "https://finance.sina.com.cn/"})
-            response.raise_for_status()
-            payload = response.text
         collected_at = datetime.now(CHINA_TZ)
+        url = "https://hq.sinajs.cn/list=" + ",".join(_sina_symbol(code) for code in values)
+        try:
+            async with self.http.slot() as client:
+                response = await client.get(url, headers={"Referer": "https://finance.sina.com.cn/"})
+                response.raise_for_status()
+                payload = response.text
+        except Exception as exc:
+            self.last_diagnostics = {
+                "batch_status": "failure",
+                "raw_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "rejection_reasons": {"request_failure": 1},
+                "failure_type": type(exc).__name__,
+                "fetched_at": collected_at.isoformat(),
+            }
+            raise
         result: list[Quote] = []
         remembered: list[tuple[str, str, str]] = []
+        raw_count = 0
+        rejection_reasons: dict[str, int] = {}
+
+        def reject(reason: str) -> None:
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+
         for symbol, raw in re.findall(r'hq_str_([a-z0-9]+)="(.*?)";', payload, flags=re.I):
+            raw_count += 1
             fields = raw.split(",")
             if len(fields) < 32:
+                reject("malformed_fields")
                 continue
             try:
                 price, prev_close = float(fields[3] or 0), float(fields[2] or 0)
                 amount, volume = float(fields[9] or 0), float(fields[8] or 0)
             except (TypeError, ValueError):
+                reject("invalid_numeric")
                 continue
             pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
             try:
                 quote_time = datetime.fromisoformat(f"{fields[30].strip()}T{fields[31].strip()}").replace(tzinfo=CHINA_TZ)
             except (TypeError, ValueError):
+                reject("invalid_provider_ts")
                 continue
             code = _raw_six_digit_code(symbol[2:], allow_exchange_prefix=False)
             if not code:
+                reject("invalid_code")
                 continue
             name = fields[0].strip() or code
             result.append(Quote(code, name, price, prev_close, amount, pct, volume, source="sina", provider_ts=quote_time, fetched_at=collected_at))
@@ -4058,6 +4082,16 @@ class SinaQuoteProvider:
         await self._enrich_risk_fields(result)
         if remember_symbols:
             await self._remember_symbols(remembered)
+        self.last_diagnostics = {
+            "batch_status": "success",
+            "raw_count": raw_count,
+            "accepted_count": len(result),
+            "rejected_count": sum(rejection_reasons.values()),
+            "rejection_reasons": rejection_reasons,
+            "provider_ts_min": min(q.provider_ts for q in result).isoformat() if result else None,
+            "provider_ts_max": max(q.provider_ts for q in result).isoformat() if result else None,
+            "fetched_at": collected_at.isoformat(),
+        }
         return result
 
     @staticmethod

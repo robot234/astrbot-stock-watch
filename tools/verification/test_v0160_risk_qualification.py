@@ -191,7 +191,7 @@ def test_legitimate_empty_clears_old_active_candidate_pointer(tmp_path):
     store = StockStore(tmp_path / "screen.sqlite3")
     store.save_screen_bundle_atomic(_run_args("earlier"), [_candidate(core, "600000")],
                                     diagnostics={"indicator_coverage": 1.0}, coverage=1.0,
-                                    report_key="earlier", valid_until="2026-10-01T00:00:00+08:00")
+                                    report_key="earlier", valid_until="2099-12-31T00:00:00+08:00")
     assert store.latest_screen_candidates()
     empty = {"input": 5000, "risk_tuple_complete": 5000, "tradable": 0,
              "indicator_targets": 0, "candidate_count": 0, "valid_empty": True,

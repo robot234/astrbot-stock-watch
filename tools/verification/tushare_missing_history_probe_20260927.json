@@ -1,0 +1,41 @@
+{
+  "mode": "read_only_isolated_tushare_daily",
+  "observed_at": "2026-09-27T04:40:28.755614+00:00",
+  "status": "blocked",
+  "source": "tushare.daily",
+  "basis": "unadjusted",
+  "reason": "configured_tushare_access_not_available_in_safe_local_environment",
+  "credentials": {
+    "token_env": "TUSHARE_TOKEN",
+    "present": false,
+    "value_printed": false
+  },
+  "requested_window": {
+    "as_of": "2026-06-26",
+    "missing_sessions": 64,
+    "first": "2025-12-24",
+    "last": "2026-04-02"
+  },
+  "fetch_scope": {
+    "max_days": 1,
+    "selected_dates": ["2025-12-24"],
+    "network_requests": 0
+  },
+  "missing_day_tracking": {
+    "fetched": [],
+    "failed": [],
+    "unattempted_count": 64,
+    "unattempted_first": "2025-12-24",
+    "unattempted_last": "2026-04-02"
+  },
+  "checks": {
+    "token_value_not_emitted": true,
+    "pi_contacted": false,
+    "production_mutation": false,
+    "config_modified": false,
+    "row_count": null,
+    "row_digest": null,
+    "observed_bar_data": false,
+    "historical_universe_status": "unknown_without_bak_basic"
+  }
+}

@@ -249,6 +249,10 @@ def test_symbol_upsert_keeps_the_event_loop_moving():
         assert len(quotes) == 1
         assert quotes[0].code == "600000"
         assert quotes[0].name == "浦发银行"
+        diagnostics = provider.last_diagnostics
+        assert diagnostics["batch_status"] == "success"
+        assert (diagnostics["raw_count"], diagnostics["accepted_count"], diagnostics["rejected_count"]) == (1, 1, 0)
+        assert diagnostics["provider_ts_min"] == diagnostics["provider_ts_max"] == quotes[0].provider_ts.isoformat()
         assert quotes[0].price == 10.0
         stop.set()
         await heartbeat_task
