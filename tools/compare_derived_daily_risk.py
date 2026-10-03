@@ -138,7 +138,7 @@ def compare(bundle: dict, protocol: dict) -> dict:
                       "unknown_reasons": dict(reasons)})
     for field, counts in totals.items():
         compared = counts["compared"]
-        counts["agreement_ppm"] = round(counts["agree"] / compared * 1000000) if compared else 0
+        counts["agreement_ppm"] = round(counts["agree"] / compared * 1000000) if compared else None
         if not compared or counts["agree"] / compared < limits["minimum_field_agreement"]:
             blockers.append(f"{field}:agreement_unproven")
         if counts["reference_positive"] < limits["minimum_positive_reference_samples_per_field"]:
