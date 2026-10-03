@@ -1,0 +1,38 @@
+{
+  "protocol_version": "formal-risk-derived-acceptance/2026-10-03-v1",
+  "source": "derived:tushare-daily",
+  "scenario_version": "2026-10-v1",
+  "status": "frozen_before_comparison; unlicensed; awaiting_user_acceptance",
+  "dates": ["2026-09-02", "2026-09-03", "2026-09-04", "2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-28", "2026-09-29", "2026-09-30"],
+  "fields": ["suspended", "limit_up", "limit_down", "st"],
+  "thresholds": {
+    "minimum_sessions": 20,
+    "minimum_daily_universe": 2500,
+    "minimum_daily_complete_tuple_fraction": 0.8,
+    "minimum_daily_field_reference_fraction": 0.8,
+    "minimum_field_agreement": 0.999,
+    "minimum_positive_reference_samples_per_field": 10,
+    "maximum_unsafe_false": 0,
+    "maximum_unexplained_disagreements": 0
+  },
+  "scope": "Unadjusted completed Shanghai/Shenzhen ordinary main-board and ChiNext daily bars; no strategy change or trading authorization.",
+  "rules": [
+    "Decimal ROUND_HALF_UP to cents: main-board 10%, ChiNext 300/301 20%, only with dated evidence excluding special trading regimes.",
+    "ST=True blocks. ST limit regimes excluded from v1 pending verified exchange rule version; do not assume all ST limits are 5%.",
+    "Complete exchange calendar and listing date required. First five sessions and unknown/relisting/special regimes keep limit states None.",
+    "Suspend S records prove True. Complete same-date suspend_d response and positive volume/amount required for False. Missing bars, zero volume, failed/truncated responses do not prove suspension or safety.",
+    "ST uses dated namechange interval and announcement date no later than trade date; current names cannot prove historical non-ST.",
+    "Missing/conflicting evidence, invalid price, mismatched date/batch, unsupported board means None, never guessed False."
+  ],
+  "comparison": [
+    "Every supported row of each date, not only picks; report daily/field/board denominators, unknowns, positives, discrepancies.",
+    "Companion requires exact source trading date, close, scale and explicit field semantics. Current responses are not historical evidence; missing/undocumented suspension or ST fields are unknown.",
+    "AKShare dated closing pools prove positive membership only. Absence never proves False. Verify date and latest price; unavailable/incomplete pools block acceptance.",
+    "AKShare/companion are both Eastmoney-derived, not independent suppliers. BaoStock dated trading/ST evidence may supplement but cannot replace mandatory companion/AK checks.",
+    "Retrieval timestamps remain actual retrieval timestamps; retrospective comparison does not prove historical decision-time availability.",
+    "Predicted False versus reference True is unsafe. Count unknowns separately. Missing mandatory inputs means incomplete, not pass.",
+    "Require raw/evaluator hashes, provenance, persistence/consumption tests before licensing. Never change thresholds after results; amendments need a new protocol."
+  ],
+  "activation": "User confirms evidence before licensing, provider/persistence integration, tests, full verification/release check and main merge. Show diff/tests before plugin-only deployment.",
+  "post_holiday_first_session": "2026-10-08"
+}
