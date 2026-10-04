@@ -7,11 +7,64 @@ import hashlib
 import json
 import re
 
-from .derived_daily_risk import CHINA, FIELDS, _day, _dated, _number, normal_price_band
+from .derived_daily_risk import CHINA, FIELDS, MAIN_PREFIXES, _day, _dated, _number, normal_price_band
 
 
 SOURCE = "derived:baostock-v1-rules"
 SCENARIO_VERSION = "2026-10-v4"
+
+
+def supported_code(code: str) -> bool:
+    return bool(re.fullmatch(r"[0-9]{6}", code) and code.startswith(MAIN_PREFIXES + ("300", "301")))
+
+
+def ordinary_regime(evidence: dict, code: str, trade_date: str, observed: datetime) -> dict:
+    result = {"ordinary": None, "source": "derived:baostock-basic-daily-calendar",
+              "rule_version": "2026-10-v4-draft-r2", "reason": "basic_or_calendar_unverified"}
+    try:
+        basic = evidence["basic"]
+        raw = basic["raw"]
+        symbol = ("sh." if code.startswith("6") else "sz.") + code
+        raw_hash = hashlib.sha256(json.dumps(raw, sort_keys=True, separators=(",", ":"),
+                                            allow_nan=False).encode()).hexdigest()
+        captured = datetime.fromisoformat(basic["observed_at"])
+        if (not supported_code(code)
+                or not _dated(basic, trade_date, "baostock:query_stock_basic", observed)
+                or basic.get("batch_id") != evidence.get("batch_id")
+                or basic.get("complete") is not True or basic.get("evidence_hash") != raw_hash
+                or captured.astimezone(CHINA).date().isoformat() != trade_date
+                or raw.get("code") != symbol or raw.get("type") != "1"
+                or any(field not in raw for field in ("code_name", "ipoDate", "outDate", "status"))):
+            return result
+        name = raw.get("code_name")
+        if not isinstance(name, str) or not name.strip() or name.strip() in ("-", "--") or name.strip().isdigit():
+            return result
+        listed = _day(raw["ipoDate"])
+        listing = evidence["listing"]
+        sessions = listing["open_dates"]
+        calendar_valid = (_dated(listing, trade_date, "baostock:listing-calendar", observed)
+                          and listing.get("complete") is True and listing.get("code") == code
+                          and listing.get("list_date") == listed.isoformat()
+                          and bool(listing.get("evidence_hash")) and isinstance(sessions, list)
+                          and bool(sessions) and sessions == sorted(set(sessions))
+                          and sessions[-1] == trade_date
+                          and all(listed <= _day(value) <= _day(trade_date) for value in sessions))
+        if not calendar_valid:
+            return result
+        daily = evidence["baostock"]["raw"]
+        excluded = (len(sessions) <= 5 or raw.get("status") != "1"
+                    or raw.get("outDate") not in ("", None)
+                    or "退" in name or "ST" in name.upper()
+                    or name.upper().startswith(("N", "C"))
+                    or daily.get("isST") != "0" or daily.get("tradestatus") != "1"
+                    or evidence.get("known_special_regime") is True)
+        result.update(ordinary=not excluded, basic_hash=raw_hash,
+                      calendar_hash=listing["evidence_hash"], listing_date=listed.isoformat(),
+                      listed_sessions=len(sessions), security_name=name,
+                      reason="ordinary_by_basic_daily_calendar" if not excluded else "ipo_st_or_delisting_excluded")
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError):
+        pass
+    return result
 
 
 def derive_daily_risk(row: dict, evidence: dict, *, observed_at: str) -> dict:
@@ -92,23 +145,9 @@ def derive_daily_risk(row: dict, evidence: dict, *, observed_at: str) -> dict:
             reasons.append("tushare_price_crosscheck_invalid")
             return result
 
-    listing = evidence.get("listing")
-    regime = evidence.get("regime")
-    try:
-        sessions = listing["open_dates"]
-        listed = _day(listing["list_date"])
-        eligible = (_dated(listing, trade_date, "baostock:listing-calendar", observed)
-                    and listing.get("code") == code and listing.get("complete") is True
-                    and bool(listing.get("evidence_hash")) and isinstance(sessions, list)
-                    and len(sessions) > 5 and sessions == sorted(set(sessions))
-                    and sessions[-1] == trade_date
-                    and all(listed <= _day(value) <= day for value in sessions)
-                    and _dated(regime, trade_date, "exchange:trading-regime", observed)
-                    and regime.get("code") == code and regime.get("ordinary") is True
-                    and bool(regime.get("evidence_hash"))
-                    and fields["st"] is False and fields["suspended"] is False)
-    except (KeyError, TypeError, ValueError, AttributeError, IndexError):
-        eligible = False
+    regime = ordinary_regime(evidence, code, trade_date, observed)
+    result["regime_derivation"] = regime
+    eligible = regime["ordinary"] is True and fields["st"] is False and fields["suspended"] is False
     if not eligible:
         reasons.append("ipo_st_suspension_or_special_regime_unverified")
         return result

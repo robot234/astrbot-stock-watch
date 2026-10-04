@@ -17,6 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("derived_daily_risk", ROOT / "derived_daily_risk.py")
 DERIVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DERIVER)
+ARCHIVE_SPEC = importlib.util.spec_from_file_location("archive_reference", ROOT / "tools/archive_eastmoney_close.py")
+ARCHIVE_REFERENCE = importlib.util.module_from_spec(ARCHIVE_SPEC)
+ARCHIVE_SPEC.loader.exec_module(ARCHIVE_REFERENCE)
 
 
 def _deriver(protocol: dict):
@@ -43,7 +46,7 @@ def _reference_valid(reference: dict, row: dict, batch_id: str, observed_at: str
         source_fields["tushare:dated-risk"] = ("suspended", "st")
     if forward:
         source_fields["tushare:namechange"] = ("st",)
-        source_fields["eastmoney:companion"] = ("limit_up", "limit_down")
+        source_fields["eastmoney:companion"] = DERIVER.FIELDS
     try:
         source = reference.get("source")
         close = float(reference["reference_close"])
@@ -71,6 +74,22 @@ def _reference_valid(reference: dict, row: dict, batch_id: str, observed_at: str
                 previous = float(reference["reference_pre_close"])
                 if not math.isfinite(previous) or previous <= 0 or abs(previous - float(row["pre_close"])) > 0.005:
                     return False
+                raw = reference["raw_response"]
+                if hashlib.sha256(raw.encode()).hexdigest() != reference["evidence_hash"]:
+                    return False
+                candidate = ARCHIVE_REFERENCE.limit_reference(json.loads(raw), row["code"], row["trade_date"],
+                                                             reference["first_observed_at"])
+                if candidate["price_valid"] is not True:
+                    return False
+                if (abs(float(candidate["close"]) - close) > 0.005
+                        or abs(float(candidate["pre_close"]) - previous) > 0.005
+                        or datetime.fromisoformat(candidate["source_timestamp"]) != stamp):
+                    return False
+                for field, value in reference.get("fields", {}).items():
+                    if type(value) is not bool or candidate[field] is not value:
+                        return False
+                    if field in ("st", "suspended") and reference.get("status_mapping_confirmed") is not True:
+                        return False
         if source == "tushare:namechange":
             if (reference.get("complete") is not True
                     or reference.get("ann_date", "9999-12-31") > row["trade_date"]
@@ -93,9 +112,25 @@ def compare(bundle: dict, protocol: dict) -> dict:
     totals = {field: Counter() for field in fields}
     inputs = bundle.get("sessions", {})
     deriver = _deriver(protocol)
+    forward = deriver.SOURCE == "derived:baostock-v1-rules"
     for trade_date in dates:
         session = inputs.get(trade_date, {})
         rows = session.get("rows", [])
+        archived_total = len(rows)
+        denominator = None
+        if forward:
+            universe = session.get("universe_codes")
+            if (session.get("universe_complete") is not True or not isinstance(universe, list)
+                    or any(not isinstance(code, str) or len(code) != 6 or not code.isascii() or not code.isdigit()
+                           for code in universe)):
+                universe = []
+                blockers.append(f"{trade_date}:dated_universe_missing")
+            if len(universe) != len(set(universe)):
+                raise ValueError("duplicate_universe_code")
+            denominator = {code for code in universe if deriver.supported_code(code)}
+            rows = [row for row in rows if deriver.supported_code(str(row.get("code", "")))]
+            if any(row.get("code") not in denominator for row in rows):
+                raise ValueError("row_outside_dated_universe")
         evidence = session.get("evidence", {})
         references = session.get("references", {})
         counts = {field: Counter() for field in fields}
@@ -128,7 +163,7 @@ def compare(bundle: dict, protocol: dict) -> dict:
                     if not _reference_valid(reference, row, session.get("batch_id"), bundle["observed_at"],
                                             allow_tushare=deriver.SOURCE in (
                                                 "derived:baostock-first", "mixed:baostock-eastmoney"),
-                                            forward=deriver.SOURCE == "derived:baostock-v1-rules"):
+                                            forward=forward):
                         continue
                     if reference.get("source") in derived.get("field_sources", {}).get(field, []):
                         counts[field]["same_source_reference_ignored"] += 1
@@ -158,7 +193,14 @@ def compare(bundle: dict, protocol: dict) -> dict:
                     disagreements.append({"trade_date": trade_date, "code": code, "field": field,
                                           "predicted": predicted, "reference": expected,
                                           "input_hash": derived.get("input_hash")})
-        size = len(rows)
+        size = len(denominator) if forward else len(rows)
+        if forward:
+            missing = size - len(seen)
+            for field in fields:
+                counts[field]["rows"] += missing
+                counts[field]["unknown"] += missing
+                counts[field]["reference_missing"] += missing
+            reasons["missing_supported_primary_row"] += missing
         if size < limits["minimum_daily_universe"]:
             blockers.append(f"{trade_date}:universe_insufficient")
         if not size or complete / size < limits["minimum_daily_complete_tuple_fraction"]:
@@ -175,6 +217,9 @@ def compare(bundle: dict, protocol: dict) -> dict:
         daily.append({"trade_date": trade_date, "rows": size, "complete": complete,
                       "fields": {field: dict(counts[field]) for field in fields}, "boards": boards,
                       "unknown_reasons": dict(reasons)})
+        if forward:
+            daily[-1].update(archive_rows=archived_total, supported_returned_rows=len(rows),
+                             supported_universe=size, excluded_universe=len(universe) - size)
     for field, counts in totals.items():
         compared = counts["compared"]
         counts["agreement_ppm"] = round(counts["agree"] / compared * 1000000) if compared else None

@@ -22,7 +22,8 @@ CHINA = timezone(timedelta(hours=8))
 UNIVERSE_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 SNAPSHOT_URL = "https://push2.eastmoney.com/api/qt/stock/get"
 UNIVERSE_FILTER = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81"
-FIELDS = "f43,f51,f52,f57,f58,f59,f60,f86"
+FIELDS = "f43,f47,f48,f51,f52,f57,f58,f59,f60,f86"
+UNIVERSE_FIELDS = "f2,f5,f6,f12,f13,f14,f18,f51,f52,f124"
 
 
 class ArchiveStop(RuntimeError):
@@ -70,7 +71,8 @@ def validate_gate(protocol: dict, protocol_raw: bytes, approval: dict, now: date
 
 
 def limit_reference(payload: dict, code: str, trade_date: str, received_at: str) -> dict:
-    result = {"limit_up": None, "limit_down": None, "valid": False}
+    result = {"limit_up": None, "limit_down": None, "st": None, "suspended": None,
+              "valid": False, "price_valid": False}
     try:
         raw = payload["data"]
         received = datetime.fromisoformat(received_at)
@@ -83,7 +85,33 @@ def limit_reference(payload: dict, code: str, trade_date: str, received_at: str)
                 or stamp.astimezone(CHINA).hour < 15):
             return result
         prices = {}
-        for field in ("f43", "f60", "f51", "f52"):
+        for field in ("f43", "f60"):
+            if isinstance(raw[field], bool):
+                return result
+            value = Decimal(str(raw[field])) / 100
+            if not value.is_finite() or value <= 0 or value != value.quantize(Decimal("0.01")):
+                return result
+            prices[field] = value
+        result.update(price_valid=True, source_timestamp=stamp.isoformat(),
+                      close=str(prices["f43"]), pre_close=str(prices["f60"]))
+        name = raw.get("f58")
+        if isinstance(name, str) and name.strip() and name.strip() not in ("-", "--") and not name.isdigit():
+            result["security_name"] = name
+            if "ST" in name.upper():
+                result["st"] = True
+            elif "退" not in name:
+                result["st"] = False
+        try:
+            if isinstance(raw.get("f47"), bool) or isinstance(raw.get("f48"), bool):
+                raise ValueError("invalid_turnover")
+            volume = Decimal(str(raw["f47"]))
+            amount = Decimal(str(raw["f48"]))
+            if volume.is_finite() and amount.is_finite() and volume > 0 and amount > 0:
+                result["suspended"] = False
+                result.update(volume=str(volume), amount=str(amount))
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            pass
+        for field in ("f51", "f52"):
             if isinstance(raw[field], bool):
                 return result
             value = Decimal(str(raw[field])) / 100
@@ -193,7 +221,7 @@ class Collector:
         for page in range(1, self.settings["universe_max_pages"] + 1):
             payload = self.request(UNIVERSE_URL, {"pn": page, "pz": page_size, "po": 1,
                 "np": 1, "fltt": 1, "invt": 2, "fid": "f12", "fs": UNIVERSE_FILTER,
-                "fields": "f12,f13,f14"}, "universe", str(page))
+                "fields": UNIVERSE_FIELDS}, "universe", str(page))
             if payload is None:
                 raise ArchiveStop("universe_request_failed")
             data = payload["data"]

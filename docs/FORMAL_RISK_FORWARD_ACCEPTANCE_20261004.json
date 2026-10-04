@@ -2,6 +2,7 @@
   "protocol_version": "formal-risk-forward/2026-10-04-v4",
   "source": "derived:baostock-v1-rules",
   "scenario_version": "2026-10-v4",
+  "draft_revision": 2,
   "status": "draft_pending_user_confirmation",
   "licensed": false,
   "start_date": "2026-10-08",
@@ -13,6 +14,23 @@
     "revision_policy": "Actual exchange closure/calendar revision must be documented and confirmed; do not replace failed collection days with later successful days."
   },
   "fields": ["suspended", "limit_up", "limit_down", "st"],
+  "coverage_scope": {
+    "policy": "v1_supported_only",
+    "supported_main_prefixes": ["000", "001", "002", "003", "600", "601", "603", "605"],
+    "supported_chinext_prefixes": ["300", "301"],
+    "excluded_boards": ["STAR", "Beijing"],
+    "denominator": "All supported symbols in the complete dated full-market universe, including missing BaoStock rows, suspended, ST, IPO, unknown and failed calls. Never use only successfully returned bars.",
+    "archive_scope": "All A shares including excluded boards; report archived total, supported denominator and excluded board counts separately."
+  },
+  "ordinary_regime_evidence": {
+    "source": "derived:baostock-basic-daily-calendar",
+    "rule_version": "2026-10-v4-draft-r2",
+    "inputs": ["baostock:query_stock_basic", "baostock:trade_dates", "baostock:daily:unadjusted"],
+    "basic_fields": ["code", "code_name", "ipoDate", "outDate", "type", "status"],
+    "ordinary_predicate": "Same-session hashed complete query_stock_basic row: exact code, type=1, status=1, outDate empty, valid code_name without ST/退/N/C markers; complete listing calendar proves more than five listed open sessions through target day; daily isST=0, tradestatus=1 and volume>0. Missing/mismatched evidence remains None.",
+    "delisting_scope": "status=1 means listed, not proof of no delisting period. Non-delisting is an explicit inference from same-session BaoStock security name without 退 plus listed status and empty outDate; verify the name marker convention and a delisting positive during the approved probe. If that exclusion is not established, stop before enabling this regime derivation; do not silently treat status as ordinary=True.",
+    "special_policy": "IPO first five sessions, ST, delisting/name markers, known special regimes, unsupported boards and anomalies remain None for limits. This is a versioned inference rule, not a provider-supplied ordinary-regime Boolean."
+  },
   "thresholds": {
     "minimum_sessions": 20,
     "minimum_daily_universe": 2500,
@@ -27,12 +45,13 @@
     "Preserve v1/v2/v3 protocols, historical windows and all incomplete results. v4 has a new user-requested forward window, not modified acceptance thresholds.",
     "BaoStock is the sole primary price source: exact code/date/batch, frequency d, adjustflag 3, original raw hash and real receipt time. Never assemble a price tuple across suppliers.",
     "tradestatus=0 proves suspension even when volume/amount are empty. tradestatus=1 with finite strictly positive volume proves not suspended. Missing/zero/negative volume does not prove False; empty volume/amount are never replaced by zero. isST=0/1 alone supplies the dated ST fact.",
-    "Limits reuse v1 normal_price_band with BaoStock preclose and close: supported ordinary main board 10%, ChiNext 300/301 20%, Decimal ROUND_HALF_UP to cents. Require dated listing-calendar evidence proving more than five listed sessions and explicit ordinary trading-regime evidence. Missing regime proof, special regime, IPO, ST, suspension, unsupported STAR/BJ boards or price anomaly means limits None. Never fabricate ordinary=True.",
+    "Limits reuse v1 normal_price_band with BaoStock preclose and close: ordinary main board 10%, ChiNext 300/301 20%, Decimal ROUND_HALF_UP to cents. Derive ordinary regime from the explicitly defined same-session query_stock_basic + complete listing calendar + isST/tradestatus/positive volume inputs, not a blank exchange:trading-regime placeholder. Missing basic name/IPO/status/hash/date/calendar or excluded special states remain None.",
     "Tushare daily is a separate unadjusted close/pre_close cross-check within 0.005. Unavailable is reported; conflicting primary prices prevent negative limit conclusions. No stk_limit, suspend_d, stock_basic or trade_cal requests on this route.",
-    "Eastmoney stock/get is an independent limit reference only: rc=0, exact f57, f59=2, f43/f60/f51/f52 positive finite scaled prices, same-session after-close f86 no later than actual receipt; stock/get close/preclose must match primary prices within 0.005. Missing/stale/mismatched bounds or prices remain None.",
-    "Only complete paginated namechange can independently reference historical ST; keep actual receipt, active interval and announcement date. Permission/transport/incomplete-page failures are recorded and do not stop other fields. Missing ST reference still means ST acceptance incomplete, not a relaxed threshold.",
+    "Eastmoney stock/get independently references limits and ST and negative suspension only: rc=0, exact f57, f59=2, same-session after-close f86 <= receipt. f58 name containing ST proves ST True; a valid nonempty name without ST or delisting markers references ST False. Missing/invalid names remain None. Strictly positive finite volume AND amount reference suspended=False; absent/zero values never prove suspended=True or False. Confirm f47/f48 field identity and units in the probe before enabling these references. Price/limit validation is independent of missing name/volume fields.",
+    "Same-date stock/get close/preclose must match BaoStock within 0.005 for comparisons. Snapshot name/time/price provenance is required for ST/suspension references too; limit bound failures need not block valid ST/trading reference candidates. Full-day suspension positive references must still be independently evidenced: no turnover is not sufficient.",
+    "Complete paginated namechange is optional ST supplementation only; keep actual receipt, active interval and announcement date. Permission/transport/incomplete-page failures are recorded, never block other fields or substitute current names for historical names. All original per-field coverage and positive sample thresholds still apply.",
     "AKShare dated limit pools supply positive references only, never False from absence. BaoStock cannot independently validate its own suspension/ST, and Tushare price agreement is not risk agreement.",
-    "Use all declared dates and the whole daily universe including missing rows, unsupported stocks, unknowns and failed calls in coverage reporting. Report each field separately; incomplete suspension/ST reference must not prevent limit diagnostics, but prevents whole-tuple acceptance.",
+    "Coverage denominator matches v1 supported main-board/ChiNext prefixes only, selected from the whole dated full-market universe before results. Supported missing rows, ST, suspension, IPO and unknown remain in denominator. Archive excluded STAR/BJ too, report separately; no 20-percent STAR extension in this draft. Incomplete references prevent whole-tuple acceptance, not other field diagnostics.",
     "Later receipts are research references only, never point-in-time prediction inputs. No tomorrow/current snapshot is backdated into a missed session. No trading, recommendation or production license follows automatically from archive completion or passing local tests."
   ],
   "collection": {
@@ -51,7 +70,10 @@
     "root": "/home/pi/apps/stock-watch-risk-archive-20261008",
     "universe_endpoint": "https://push2.eastmoney.com/api/qt/clist/get",
     "snapshot_endpoint": "https://push2.eastmoney.com/api/qt/stock/get",
-    "fields": "f43,f51,f52,f57,f58,f59,f60,f86",
+    "fields": "f43,f47,f48,f51,f52,f57,f58,f59,f60,f86",
+    "reference_field_mapping_status": "pending_probe_confirmation",
+    "reference_field_candidates": {"name": "f58", "volume": "f47", "amount": "f48"},
+    "batch_probe": "Test clist/get f2/f18 price/preclose, f14 name, f5/f6 volume/amount, f51/f52 limits and f124 timestamp in one raw page; verify actual meanings against stock/get. If supported symbols have valid dated prices and both actual supplied bounds, use batches for those symbols and stock/get only for missing/invalid batch records. Freeze confirmed endpoint mappings and strategy in a separately hashed operational capability record, not by guessing field numbers.",
     "raw_policy": "Save original response bytes, SHA256 and real received_at for every response including invalid/error responses. Append-only per-run index and logs; exclusive directories; complete transport capture is distinct from valid reference coverage.",
     "enable_policy": "No requests, timer installation or service start before explicit user approval and a frozen protocol whose byte hash matches a separate approval record. Stop automatically after the declared 20-date window; continuation requires confirmation."
   },

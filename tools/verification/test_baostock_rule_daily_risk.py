@@ -37,8 +37,11 @@ def inputs(code="600000", close="11.01", previous="10.01"):
     listing = {**dated, "source": "baostock:listing-calendar", "complete": True,
                "list_date": "2010-01-01", "open_dates": ["2026-09-24", "2026-09-25",
                "2026-09-28", "2026-09-29", "2026-09-30", "2026-10-08"]}
-    regime = {**dated, "source": "exchange:trading-regime", "ordinary": True}
-    return row, {"batch_id": "fixture", "baostock": primary, "listing": listing, "regime": regime}
+    basic_raw = {"code": raw_code, "code_name": "普通股票", "ipoDate": "2010-01-01",
+                 "outDate": "", "type": "1", "status": "1"}
+    basic = {**dated, "source": "baostock:query_stock_basic", "batch_id": "fixture",
+             "complete": True, "raw": basic_raw, "evidence_hash": hash_raw(basic_raw)}
+    return row, {"batch_id": "fixture", "baostock": primary, "listing": listing, "basic": basic}
 
 
 def derive_changed(changes):
@@ -90,13 +93,13 @@ def test_baostock_st_not_current_name(status, expected):
     assert derive_changed({"isST": status})["fields"]["st"] is expected
 
 
-@pytest.mark.parametrize("change", ["missing_regime", "special", "missing_listing", "ipo", "unsupported"])
+@pytest.mark.parametrize("change", ["missing_basic", "special", "missing_listing", "ipo", "unsupported"])
 def test_unproven_regime_ipo_and_unsupported_board_never_false(change):
     row, evidence = inputs("688001" if change == "unsupported" else "600000")
-    if change == "missing_regime":
-        del evidence["regime"]
+    if change == "missing_basic":
+        del evidence["basic"]
     elif change == "special":
-        evidence["regime"]["ordinary"] = False
+        evidence["known_special_regime"] = True
     elif change == "missing_listing":
         del evidence["listing"]
     elif change == "ipo":
@@ -129,7 +132,7 @@ def test_tushare_is_only_price_crosscheck_and_conflict_blocks_limits():
 
 def test_new_protocol_preserves_all_thresholds_and_twenty_dates():
     protocol = json.loads((ROOT / "docs/FORMAL_RISK_FORWARD_ACCEPTANCE_20261004.json").read_text(encoding="utf-8"))
-    old = json.loads((ROOT / "docs/FORMAL_RISK_SPLIT_SOURCE_ACCEPTANCE_20261004.json").read_text(encoding="utf-8"))
+    old = json.loads((ROOT / "docs/FORMAL_RISK_DERIVED_ACCEPTANCE_20261003.json").read_text(encoding="utf-8"))
     assert protocol["thresholds"] == old["thresholds"]
     assert len(protocol["dates"]) == len(set(protocol["dates"])) == 20
     assert protocol["dates"][0] == "2026-10-08"
@@ -141,8 +144,11 @@ def test_missing_namechange_reference_does_not_stop_other_field_comparison():
     evaluator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(evaluator)
     row, evidence = inputs()
+    raw = json.dumps({"rc": 0, "data": {"f57": row["code"], "f59": 2, "f43": 1101,
+        "f60": 1001, "f51": 1101, "f52": 901, "f86": 1791442860}})
     reference = {"source": "eastmoney:companion", "code": row["code"], "trade_date": row["trade_date"],
-        "batch_id": "fixture", "validated": True, "evidence_hash": "fixture",
+        "batch_id": "fixture", "validated": True, "raw_response": raw,
+        "evidence_hash": hashlib.sha256(raw.encode()).hexdigest(),
         "first_observed_at": NOW, "source_timestamp": "2026-10-08T07:01:00+00:00",
         "reference_close": 11.01, "reference_pre_close": 10.01,
         "fields": {"limit_up": True, "limit_down": False}}
@@ -150,9 +156,68 @@ def test_missing_namechange_reference_does_not_stop_other_field_comparison():
     protocol = deepcopy(protocol)
     protocol["dates"] = [row["trade_date"]]
     session = {"batch_id": "fixture", "rows": [row], "evidence": {row["code"]: evidence},
-               "references": {row["code"]: [reference]}}
+               "references": {row["code"]: [reference]}, "universe_codes": [row["code"]],
+               "universe_complete": True}
     result = evaluator.compare({"sessions": {row["trade_date"]: session}, "observed_at": NOW}, protocol)
     assert result["totals"]["limit_up"]["compared"] == 1
     assert result["totals"]["limit_up"]["agreement_ppm"] == 1000000
     assert result["totals"]["st"]["reference_missing"] == 1
     assert result["verdict"] == "incomplete"
+
+
+@pytest.mark.parametrize("change", [
+    {"status": "0"}, {"outDate": "2026-10-09"}, {"code_name": "某某退"},
+    {"code_name": "ST某某"}, {"code_name": "C某某"}, {"code_name": "N某某"},
+    {"code_name": ""}, {"ipoDate": "2026-10-09"},
+])
+def test_basic_name_and_status_exclusions_cannot_be_ordinary(change):
+    row, evidence = inputs()
+    evidence["basic"]["raw"].update(change)
+    evidence["basic"]["evidence_hash"] = hash_raw(evidence["basic"]["raw"])
+    result = derive_daily_risk(row, evidence, observed_at=NOW)
+    assert result["fields"]["limit_up"] is None
+    assert result["fields"]["limit_down"] is None
+
+
+@pytest.mark.parametrize("change", [{"evidence_hash": "wrong"}, {"batch_id": "wrong"},
+    {"observed_at": "2026-10-09T08:00:00+00:00"}, {"complete": False}])
+def test_basic_provenance_is_not_a_blank_ordinary_boolean(change):
+    row, evidence = inputs()
+    evidence["basic"].update(change)
+    assert derive_daily_risk(row, evidence, observed_at=NOW)["fields"]["limit_up"] is None
+
+
+def test_supported_denominator_keeps_missing_bars_but_not_star_or_beijing():
+    spec = importlib.util.spec_from_file_location("compare_v4_denominator", ROOT / "tools/compare_derived_daily_risk.py")
+    evaluator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluator)
+    row, evidence = inputs()
+    protocol = json.loads((ROOT / "docs/FORMAL_RISK_FORWARD_ACCEPTANCE_20261004.json").read_text(encoding="utf-8"))
+    protocol["dates"] = [row["trade_date"]]
+    session = {"batch_id": "fixture", "rows": [row], "evidence": {row["code"]: evidence},
+               "universe_codes": ["600000", "000001", "688001", "920001"], "universe_complete": True}
+    result = evaluator.compare({"sessions": {row["trade_date"]: session}, "observed_at": NOW}, protocol)
+    daily = result["daily"][0]
+    assert daily["rows"] == daily["supported_universe"] == 2
+    assert daily["supported_returned_rows"] == 1 and daily["excluded_universe"] == 2
+    assert result["totals"]["st"]["unknown"] == 1
+
+
+def test_eastmoney_status_reference_needs_matching_raw_and_confirmed_mapping():
+    spec = importlib.util.spec_from_file_location("compare_v4_status", ROOT / "tools/compare_derived_daily_risk.py")
+    evaluator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluator)
+    row, evidence = inputs()
+    payload = {"rc": 0, "data": {"f57": row["code"], "f59": 2, "f43": 1101,
+        "f60": 1001, "f51": 1101, "f52": 901, "f86": 1791442860,
+        "f58": "普通股票", "f47": 1, "f48": 100}}
+    raw = json.dumps(payload)
+    reference = {"source": "eastmoney:companion", "code": row["code"], "trade_date": row["trade_date"],
+        "batch_id": "fixture", "validated": True, "raw_response": raw,
+        "evidence_hash": hashlib.sha256(raw.encode()).hexdigest(), "first_observed_at": NOW,
+        "source_timestamp": "2026-10-08T07:01:00+00:00", "reference_close": 11.01,
+        "reference_pre_close": 10.01, "status_mapping_confirmed": True,
+        "fields": {"st": False, "suspended": False}}
+    assert evaluator._reference_valid(reference, row, "fixture", NOW, forward=True)
+    reference["status_mapping_confirmed"] = False
+    assert not evaluator._reference_valid(reference, row, "fixture", NOW, forward=True)

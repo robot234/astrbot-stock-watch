@@ -27,7 +27,8 @@ def protocol():
 
 def stock(code="600000", **changes):
     data = {"f57": code, "f59": 2, "f43": 1000, "f60": 1000,
-            "f51": 1100, "f52": 900, "f86": int(NOW.replace(hour=7).timestamp())}
+            "f51": 1100, "f52": 900, "f86": int(NOW.replace(hour=7).timestamp()),
+            "f58": "普通股票", "f47": 10, "f48": 10000}
     data.update(changes)
     return {"rc": 0, "data": data}
 
@@ -96,7 +97,7 @@ def test_capture_keeps_original_bytes_real_time_hash_and_all_pages(tmp_path):
     assert manifest["universe_count"] == manifest["received_snapshots"] == 3
     assert manifest["requests"] == len(calls) == 5
     assert manifest["licensed"] is False
-    records = [json.loads(line) for line in (instance.run / "index.jsonl").read_text().splitlines()]
+    records = [json.loads(line) for line in (instance.run / "index.jsonl").read_text(encoding="utf-8").splitlines()]
     for record in records:
         assert record["received_at"] == NOW.isoformat()
         raw_response = (instance.run / record["raw_file"]).read_bytes()
@@ -115,7 +116,7 @@ def test_two_transport_failures_stop_and_keep_partial_log(tmp_path):
     assert manifest["status"] == "partial"
     assert manifest["stop_reason"] == "consecutive_request_failures"
     assert len(calls) == 4
-    assert "fixture transport error" not in instance.log.read_text()
+    assert "fixture transport error" not in instance.log.read_text(encoding="utf-8")
     assert (instance.run / "manifest.json").exists()
 
 
@@ -218,6 +219,28 @@ def test_invalid_http_response_keeps_raw_hash(tmp_path):
     instance.fetch = invalid_stocks
     manifest = instance.collect(raw, approval)
     assert manifest["status"] == "partial"
-    records = [json.loads(line) for line in (instance.run / "index.jsonl").read_text().splitlines()]
+    records = [json.loads(line) for line in (instance.run / "index.jsonl").read_text(encoding="utf-8").splitlines()]
     assert records[-1]["raw_sha256"] == ARCHIVE.digest(invalid)
     assert (instance.run / records[-1]["raw_file"]).read_bytes() == invalid
+
+
+@pytest.mark.parametrize("name,expected", [("*ST某某", True), ("ST某某", True),
+    ("普通股票", False), ("某某退", None), ("", None), ("--", None), (None, None)])
+def test_dated_name_independently_references_st(name, expected):
+    candidate = ARCHIVE.limit_reference(stock(f58=name), "600000", "2026-10-08", NOW.isoformat())
+    assert candidate["st"] is expected
+
+
+@pytest.mark.parametrize("volume,amount,expected", [(10, 100, False),
+    (0, 0, None), ("", "", None), (None, 100, None), (10, 0, None), (True, 100, None)])
+def test_only_positive_turnover_references_not_suspended(volume, amount, expected):
+    candidate = ARCHIVE.limit_reference(stock(f47=volume, f48=amount), "600000", "2026-10-08", NOW.isoformat())
+    assert candidate["suspended"] is expected
+
+
+def test_missing_limit_bounds_do_not_erase_valid_name_and_turnover():
+    payload = stock(f58="*ST某某")
+    del payload["data"]["f51"]
+    candidate = ARCHIVE.limit_reference(payload, "600000", "2026-10-08", NOW.isoformat())
+    assert candidate["limit_up"] is None and candidate["st"] is True
+    assert candidate["suspended"] is False
