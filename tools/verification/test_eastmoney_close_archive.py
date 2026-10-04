@@ -244,3 +244,45 @@ def test_missing_limit_bounds_do_not_erase_valid_name_and_turnover():
     candidate = ARCHIVE.limit_reference(payload, "600000", "2026-10-08", NOW.isoformat())
     assert candidate["limit_up"] is None and candidate["st"] is True
     assert candidate["suspended"] is False
+
+
+def batch_row(code="000001", **changes):
+    result = {"f12": code, "f13": 0, "f2": 1157, "f18": 1135, "f350": 1249,
+              "f351": 1022, "f14": "平安银行", "f5": 1045357, "f6": 1205814857.64,
+              "f124": int(NOW.replace(hour=7).timestamp())}
+    result.update(changes)
+    return result
+
+
+def test_batch_supplied_bounds_are_not_derived_or_f51_f52():
+    row = batch_row(f51=999999999, f52=888888888)
+    reference = ARCHIVE.batch_reference(row, "000001", 0, "2026-10-08", NOW.isoformat())
+    assert reference["upper"] == "12.49" and reference["lower"] == "10.22"
+    assert reference["st"] is False and reference["suspended"] is False
+    assert reference["limit_up"] is False and reference["limit_down"] is False
+    assert reference["mapping_status"] == "probe_candidate_not_formal_acceptance"
+
+
+@pytest.mark.parametrize("changes", [{"f350": "-"}, {"f351": None}, {"f350": True},
+                                     {"f2": "-"}, {"f124": True}, {"f13": 1},
+                                     {"f124": int(NOW.timestamp()) + 1}])
+def test_unavailable_or_invalid_batch_fields_are_unknown(changes):
+    reference = ARCHIVE.batch_reference(batch_row(**changes), "000001", 0, "2026-10-08", NOW.isoformat())
+    assert reference["limit_up"] is None and reference["limit_down"] is None
+
+
+def test_batch_records_each_stock_from_one_original_page_without_stock_get(tmp_path):
+    result, raw, approval = protocol()
+    calls = []
+    def fetch(url, timeout, maximum_bytes):
+        calls.append(url)
+        assert "clist/get" in url and "f350" in parse_qs(urlparse(url).query)["fields"][0]
+        return json.dumps({"rc": 0, "data": {"total": 2, "diff": [batch_row(), batch_row("000002")]}}).encode()
+    instance = ARCHIVE.Collector(tmp_path, result, batch=True, fetch=fetch, now=lambda: NOW, sleep=lambda _: None)
+    manifest = instance.collect(raw, approval)
+    assert manifest["requests"] == len(calls) == 1 and manifest["received_snapshots"] == 2
+    assert manifest["licensed"] is False and manifest["status"] == "complete_capture_not_acceptance"
+    records = [json.loads(line) for line in (instance.run / "index.jsonl").read_text(encoding="utf-8").splitlines()]
+    candidates = [record for record in records if record["kind"] == "batch_stock"]
+    assert len(candidates) == 2 and candidates[0]["raw_sha256"] == candidates[1]["raw_sha256"]
+    assert len(list(instance.run.glob("*.raw"))) == 1

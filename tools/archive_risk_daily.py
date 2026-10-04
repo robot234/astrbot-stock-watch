@@ -54,6 +54,55 @@ def verify_daily(rows, symbol, target):
         raise ArchiveStop("empty_stale_or_mismatched_daily")
 
 
+def listed_supported_codes(basic, target):
+    codes = []
+    seen = set()
+    for row in basic:
+        symbol = row.get("code")
+        if not isinstance(symbol, str) or not re.fullmatch(r"(?:sh|sz|bj)\.[0-9]{6}", symbol) or symbol in seen:
+            raise ArchiveStop("duplicate_or_invalid_basic_symbol")
+        seen.add(symbol)
+        code = symbol[3:]
+        if not code.startswith(SUPPORTED):
+            continue
+        if row.get("type") not in ("1", "2", "3") or row.get("status") not in ("0", "1"):
+            raise ArchiveStop("unsupported_basic_metadata")
+        if row["type"] != "1" or row["status"] != "1":
+            continue
+        if symbol[:2] != ("sh" if code.startswith("6") else "sz"):
+            raise ArchiveStop("unsupported_basic_metadata")
+        try:
+            ipo = date.fromisoformat(row["ipoDate"])
+        except (KeyError, TypeError, ValueError):
+            raise ArchiveStop("listed_basic_ipo_unverified") from None
+        if row.get("outDate") != "":
+            raise ArchiveStop("listed_basic_delisting_conflict")
+        if ipo <= date.fromisoformat(target):
+            codes.append(code)
+    if not codes:
+        raise ArchiveStop("empty_supported_universe")
+    return sorted(codes)
+
+
+def validate_amendment(raw, approval, protocol_hash, now):
+    if raw is None:
+        return None
+    amendment = json.loads(raw)
+    if (approval.get("collection_amendment_sha256") != digest(raw)
+            or amendment.get("base_protocol_sha256") != protocol_hash
+            or amendment.get("version") != "formal-risk-collection-amendment/2026-10-04-v1"
+            or amendment.get("status") != "user_authorized"
+            or amendment.get("daily_universe_source") != "baostock:stock_basic:listed-supported"):
+        raise ArchiveStop("collection_amendment_not_approved")
+    try:
+        confirmed = datetime.fromisoformat(amendment["confirmed_at"])
+        if confirmed.tzinfo is None or confirmed > now:
+            raise ValueError("invalid_approval_time")
+    except (KeyError, TypeError, ValueError):
+        raise ArchiveStop("invalid_amendment_time") from None
+    return amendment
+
+
 def suspension_candidate(row, target, *, semantics_confirmed=False):
     result = {"code": row.get("代码"), "suspended": None, "reason": "interval_or_scope_unverified"}
     code = result["code"]
@@ -164,10 +213,12 @@ class DailyArchive:
             self.sleep(min(5, deadline - self.monotonic()))
 
     def baostock(self, client):
-        codes = self.universe()
-        if not codes:
+        independent_collection = self.amendment is not None
+        codes = None if independent_collection else self.universe()
+        if not independent_collection and not codes:
             raise ArchiveStop("empty_supported_universe")
-        self.manifest.update(supported_count=len(codes), completed_codes=[], missing_codes=codes.copy())
+        if codes is not None:
+            self.manifest.update(supported_count=len(codes), completed_codes=[], missing_codes=codes.copy())
         with self.session(purpose="stock-watch-baostock-risk-archive",
                           max_calls=self.settings["run_message_cap"],
                           wait_seconds=self.settings["lock_wait_seconds"], target_date=self.target,
@@ -187,6 +238,13 @@ class DailyArchive:
                 started = self.now().isoformat()
                 basic = read_cursor(client.query_stock_basic(), self.check)
                 self.table("basic", basic, {}, started)
+                if independent_collection:
+                    codes = listed_supported_codes(basic, self.target)
+                    self.manifest.update(supported_count=len(codes), completed_codes=[], missing_codes=codes.copy(),
+                                         universe_source=self.amendment["daily_universe_source"],
+                                         independent_universe_acceptance=False)
+                    self.table("collection-universe", [{"code": code} for code in codes],
+                               {"source": "same_day_full_basic_before_daily_prices"}, started)
                 matches = {}
                 for row in basic:
                     symbol = row.get("code")
@@ -272,9 +330,10 @@ class DailyArchive:
         finally:
             requests_module.get = original
 
-    def collect(self, raw, approval, client=None, requests_module=None):
+    def collect(self, raw, approval, client=None, requests_module=None, amendment_raw=None):
         self.target = validate_frozen(self.protocol, raw, approval, self.now())
         self.protocol_hash = digest(raw)
+        self.amendment = validate_amendment(amendment_raw, approval, self.protocol_hash, self.now())
         clock = self.now().astimezone(CHINA).strftime("%H:%M:%S")
         latest = self.settings.get("latest_start_local", self.protocol["collection"]["latest_start_local"])
         if not self.settings["start_at_local"] <= clock <= latest:
@@ -291,11 +350,15 @@ class DailyArchive:
             self.run = day_root / ("run-" + uuid.uuid4().hex)
             self.run.mkdir()
             (self.run / "protocol.json").write_bytes(raw)
+            if amendment_raw is not None:
+                (self.run / "collection-amendment.json").write_bytes(amendment_raw)
             self.log = self.root / "logs" / (self.kind + "-" + self.target + ".jsonl")
             self.log.parent.mkdir(exist_ok=True)
             self.manifest = {"kind": self.kind, "trade_date": self.target, "status": "partial",
                              "licensed": False, "protocol_sha256": self.protocol_hash,
                              "started_at": self.now().isoformat()}
+            if amendment_raw is not None:
+                self.manifest["collection_amendment_sha256"] = digest(amendment_raw)
             self.deadline = self.monotonic() + self.settings["maximum_runtime_seconds"]
             append_json(self.log, {"event": "started", **self.manifest})
             previous_timeout = socket.getdefaulttimeout()
@@ -329,6 +392,7 @@ def main():
     parser.add_argument("--kind", choices=("baostock", "suspensions"), required=True)
     for name in ("root", "protocol", "approval"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--amendment", type=Path)
     args = parser.parse_args()
     try:
         raw = args.protocol.read_bytes()
@@ -343,7 +407,8 @@ def main():
         else:
             import akshare as client
             import requests as requests_module
-        result = collector.collect(raw, json.loads(args.approval.read_bytes()), client, requests_module)
+        result = collector.collect(raw, json.loads(args.approval.read_bytes()), client, requests_module,
+                                   args.amendment.read_bytes() if args.amendment else None)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result["status"] == "complete_capture_not_acceptance" else 5
     except Exception as exc:

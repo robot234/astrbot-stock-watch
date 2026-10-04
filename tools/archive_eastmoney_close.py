@@ -23,7 +23,7 @@ UNIVERSE_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 SNAPSHOT_URL = "https://push2.eastmoney.com/api/qt/stock/get"
 UNIVERSE_FILTER = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81"
 FIELDS = "f43,f47,f48,f51,f52,f57,f58,f59,f60,f86"
-UNIVERSE_FIELDS = "f2,f5,f6,f12,f13,f14,f18,f51,f52,f124"
+UNIVERSE_FIELDS = "f2,f5,f6,f12,f13,f14,f18,f350,f351,f124"
 
 
 class ArchiveStop(RuntimeError):
@@ -145,9 +145,60 @@ def download(url: str, timeout: float, maximum_bytes: int) -> bytes:
     return raw
 
 
+def batch_reference(row: dict, code: str, market: int, trade_date: str, received_at: str) -> dict:
+    result = {"limit_up": None, "limit_down": None, "st": None, "suspended": None,
+              "valid": False, "price_valid": False, "source": "eastmoney:clist",
+              "mapping_status": "probe_candidate_not_formal_acceptance"}
+    try:
+        received = datetime.fromisoformat(received_at)
+        stamp = datetime.fromtimestamp(row["f124"], timezone.utc)
+        if (row["f12"] != code or type(row["f13"]) is not int or row["f13"] != market
+                or market != (1 if code.startswith("6") else 0) or type(row["f124"]) is not int
+                or received.tzinfo is None or stamp > received
+                or stamp.astimezone(CHINA).date().isoformat() != trade_date
+                or received.astimezone(CHINA).date().isoformat() != trade_date
+                or stamp.astimezone(CHINA).hour < 15):
+            return result
+        prices = {}
+        for field in ("f2", "f18"):
+            if type(row[field]) is not int or row[field] <= 0:
+                return result
+            prices[field] = Decimal(row[field]) / 100
+        result.update(price_valid=True, close=str(prices["f2"]), pre_close=str(prices["f18"]),
+                      source_timestamp=stamp.isoformat(), price_scale="fltt=1:cents")
+        name = row.get("f14")
+        if isinstance(name, str) and name.strip() and name.strip() not in ("-", "--") and not name.isdigit():
+            result["security_name"] = name
+            if "ST" in name.upper():
+                result["st"] = True
+            elif "退" not in name:
+                result["st"] = False
+        try:
+            if isinstance(row.get("f5"), bool) or isinstance(row.get("f6"), bool):
+                raise ValueError("invalid_turnover")
+            volume = Decimal(str(row["f5"]))
+            amount = Decimal(str(row["f6"]))
+            if volume.is_finite() and amount.is_finite() and volume > 0 and amount > 0:
+                result.update(suspended=False, volume=str(volume), amount=str(amount), volume_unit="lots")
+        except (KeyError, ValueError, TypeError, InvalidOperation):
+            pass
+        for field in ("f350", "f351"):
+            if type(row[field]) is not int or row[field] <= 0:
+                return result
+            prices[field] = Decimal(row[field]) / 100
+        if not prices["f351"] <= prices["f2"] <= prices["f350"] or not prices["f351"] < prices["f350"]:
+            return result
+        result.update(valid=True, limit_up=prices["f2"] == prices["f350"],
+                      limit_down=prices["f2"] == prices["f351"],
+                      upper=str(prices["f350"]), lower=str(prices["f351"]))
+    except (KeyError, ValueError, TypeError, OverflowError, OSError):
+        pass
+    return result
+
+
 class Collector:
     def __init__(self, root: Path, protocol: dict, *, fetch=download, now=utc_now,
-                 monotonic=time.monotonic, sleep=time.sleep):
+                 monotonic=time.monotonic, sleep=time.sleep, batch=False):
         self.root = root
         self.protocol = protocol
         self.settings = protocol["collection"]
@@ -160,6 +211,8 @@ class Collector:
         self.failures = 0
         self.valid = 0
         self.snapshots = 0
+        self.batch = batch
+        self.last_response_record = None
 
     def check_stop(self, *, next_request=True):
         if self.interrupted or (self.root / "STOP").exists():
@@ -211,6 +264,7 @@ class Collector:
                 self.valid += reference["valid"]
                 self.snapshots += 1
         append_json(self.run / "index.jsonl", record)
+        self.last_response_record = record
         append_json(self.log, {key: value for key, value in record.items()
                                if key not in ("parameters", "reference_candidate")})
         if self.failures >= self.settings["maximum_consecutive_failures"]:
@@ -251,6 +305,15 @@ class Collector:
                     raise ArchiveStop("duplicate_or_invalid_universe_security")
                 seen.add(code)
                 securities.append((code, market))
+                if self.batch:
+                    response = self.last_response_record
+                    reference = batch_reference(row, code, market, self.trade_date, response["received_at"])
+                    append_json(self.run / "index.jsonl", {"kind": "batch_stock", "identity": code,
+                                "market": market, "raw_file": response["raw_file"],
+                                "raw_sha256": response["raw_sha256"], "received_at": response["received_at"],
+                                "reference_candidate": reference})
+                    self.snapshots += 1
+                    self.valid += reference["valid"]
             if len(securities) == total:
                 return securities
         raise ArchiveStop("universe_page_budget_exhausted")
@@ -264,7 +327,8 @@ class Collector:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         self.deadline = self.monotonic() + self.settings["maximum_runtime_seconds"]
         manifest = {"trade_date": self.trade_date, "status": "partial", "licensed": False,
-                    "protocol_sha256": digest(protocol_raw), "started_at": self.now().isoformat()}
+                    "protocol_sha256": digest(protocol_raw), "started_at": self.now().isoformat(),
+                    "collection_mode": "clist_batch_f350_f351" if self.batch else "stock_get_per_security"}
         try:
             os.write(descriptor, str(os.getpid()).encode())
             day_root = self.root / "archives" / self.trade_date
@@ -285,9 +349,10 @@ class Collector:
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(self.run / "universe.next", self.run / "universe.json")
-                for code, market in securities:
-                    self.request(SNAPSHOT_URL, {"secid": f"{market}.{code}", "fltt": 1,
-                                               "invt": 2, "fields": FIELDS}, "stock", code)
+                if not self.batch:
+                    for code, market in securities:
+                        self.request(SNAPSHOT_URL, {"secid": f"{market}.{code}", "fltt": 1,
+                                                   "invt": 2, "fields": FIELDS}, "stock", code)
                 self.check_stop(next_request=False)
                 if self.snapshots == len(securities):
                     manifest["status"] = "complete_capture_not_acceptance"
@@ -314,12 +379,13 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--protocol", type=Path, required=True)
     parser.add_argument("--approval", type=Path, required=True)
+    parser.add_argument("--batch", action="store_true")
     args = parser.parse_args()
     try:
         protocol_raw = args.protocol.read_bytes()
         protocol = json.loads(protocol_raw)
         approval = json.loads(args.approval.read_bytes())
-        collector = Collector(args.root, protocol)
+        collector = Collector(args.root, protocol, batch=args.batch)
         def stop(signum, frame):
             collector.interrupted = True
         signal.signal(signal.SIGTERM, stop)

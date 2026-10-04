@@ -218,3 +218,69 @@ def test_record_check_after_acquiring_shared_lock_prevents_duplicate(monkeypatch
     with pytest.raises(RuntimeError, match="another queued caller"):
         legacy.scheduled_capture(tmp_path / "db", tmp_path, "astrbot", "/evidence")
     assert legacy.scheduled_capture(tmp_path / "db", tmp_path, "astrbot", "/evidence")["status"] == "partial_no_automatic_retry"
+
+
+def amendment(raw, approval):
+    document = json.loads((TOOLS.parent / "docs/FORMAL_RISK_COLLECTION_AMENDMENT_20261004.json").read_bytes())
+    document["base_protocol_sha256"] = daily.digest(raw)
+    serialized = json.dumps(document).encode()
+    approval["collection_amendment_sha256"] = daily.digest(serialized)
+    return serialized
+
+
+def listed_basic(symbol="sz.000001", **changes):
+    return {"code": symbol, "type": "1", "status": "1", "ipoDate": "1991-04-03", "outDate": "", **changes}
+
+
+def test_authorized_baostock_collection_does_not_depend_on_eastmoney(tmp_path):
+    archive, raw, approval = setup_archive(tmp_path, session=fake_guard)
+    document = amendment(raw, approval)
+    client = fake_baostock()
+    client.query_stock_basic = lambda: Cursor([
+        listed_basic(), listed_basic("sh.000001", type="2"),
+        listed_basic("sz.000005", status="0", outDate="2024-01-01"),
+        listed_basic("sz.301001", ipoDate="2026-10-09"),
+        listed_basic("sh.688001")])
+    result = archive.collect(raw, approval, client, amendment_raw=document)
+    assert result["status"] == "complete_capture_not_acceptance"
+    assert result["completed_codes"] == ["000001"] and result["supported_count"] == 1
+    assert result["universe_source"] == "baostock:stock_basic:listed-supported"
+    assert result["independent_universe_acceptance"] is False
+    assert not (tmp_path / "archives").exists()
+    assert (archive.run / "collection-amendment.json").read_bytes() == document
+
+
+def test_suspended_st_and_new_listing_stay_in_collection_scope():
+    rows = [listed_basic("sz.000001", code_name="*ST某某"),
+            listed_basic("sz.301001", ipoDate="2026-10-08", code_name="N某某")]
+    assert daily.listed_supported_codes(rows, "2026-10-08") == ["000001", "301001"]
+
+
+@pytest.mark.parametrize("rows,reason", [
+    ([listed_basic(), listed_basic()], "duplicate_or_invalid"),
+    ([listed_basic(ipoDate="")], "ipo_unverified"),
+    ([listed_basic(outDate="2026-10-01")], "delisting_conflict"),
+    ([listed_basic(status="")], "unsupported_basic_metadata"),
+    ([listed_basic("sh.000001")], "unsupported_basic_metadata"),
+])
+def test_uncertain_basic_cannot_silently_shrink_collection_scope(rows, reason):
+    with pytest.raises(daily.ArchiveStop, match=reason):
+        daily.listed_supported_codes(rows, "2026-10-08")
+
+
+def test_bad_amendment_hash_refuses_before_archive_creation(tmp_path):
+    archive, raw, approval = setup_archive(tmp_path)
+    document = amendment(raw, approval)
+    with pytest.raises(daily.ArchiveStop, match="amendment_not_approved"):
+        archive.collect(raw, approval, amendment_raw=document + b" ")
+    assert not (tmp_path / "baostock").exists()
+
+
+def test_two_timers_only_schedule_the_twenty_frozen_dates():
+    protocol = json.loads((TOOLS.parent / "docs/FORMAL_RISK_FORWARD_ACCEPTANCE_20261004.json").read_bytes())
+    for name, clock in (("stock-watch-baostock-risk-archive", "18:00:00"),
+                        ("stock-watch-suspension-archive", "16:10:00")):
+        text = (TOOLS / "operations" / (name + ".timer")).read_text()
+        calendars = [line for line in text.splitlines() if line.startswith("OnCalendar=")]
+        assert calendars == ["OnCalendar=" + day + " " + clock + " Asia/Shanghai" for day in protocol["dates"]]
+        assert "Persistent=false" in text

@@ -2,7 +2,26 @@
 Description=Stock Watch suspension archive at Shanghai 16:10
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-08 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-09 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-12 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-13 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-14 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-15 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-16 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-19 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-20 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-21 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-22 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-23 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-26 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-27 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-28 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-29 16:10:00 Asia/Shanghai
+OnCalendar=2026-10-30 16:10:00 Asia/Shanghai
+OnCalendar=2026-11-02 16:10:00 Asia/Shanghai
+OnCalendar=2026-11-03 16:10:00 Asia/Shanghai
+OnCalendar=2026-11-04 16:10:00 Asia/Shanghai
 Persistent=false
 AccuracySec=1s
 Unit=stock-watch-suspension-archive.service

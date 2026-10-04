@@ -1,0 +1,14 @@
+{
+  "version": "formal-risk-collection-amendment/2026-10-04-v1",
+  "status": "user_authorized",
+  "base_protocol_sha256": "5e637b729255c9a6ba0c988b074c15ddbc58bc0c8ff776e95d5b6edba4faf10f",
+  "confirmed_at": "2026-10-04T22:57:17+08:00",
+  "authorization": "Install and enable suspension and BaoStock daily archives independently of Eastmoney; historical cool8/fundamentals callers remain manual, owner-guarded and subject to the combined 40000 hard cap, and will not be manually run during the collection window.",
+  "daily_universe_source": "baostock:stock_basic:listed-supported",
+  "daily_universe_policy": "Fetch the complete same-day stock_basic table once within the shared guard, then enumerate all listed stock-type rows in the original supported prefixes before fetching daily prices. Keep ST, suspension, IPO and missing daily rows in this collection scope; never choose scope from successful quotes. Contradictory or malformed basic metadata stops the batch.",
+  "acceptance_policy": "This amendment changes collection dependencies and installation gates only. The base frozen protocol, its 20 dates, eight numeric thresholds and original supported range are unchanged. This BaoStock collection scope is not an independently accepted universe or risk reference; reconcile with the frozen full-market universe for acceptance, and report incomplete if that independent evidence is missing or inconsistent.",
+  "new_tasks_soft_stop": 35000,
+  "combined_hard_cap": 40000,
+  "manual_jobs_during_window": "do_not_run",
+  "eastmoney_activation": "Not authorized by this amendment. Present the f350/f351 batch collection change and probe evidence separately before installation."
+}

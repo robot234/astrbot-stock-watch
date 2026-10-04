@@ -2,7 +2,26 @@
 Description=Stock Watch BaoStock archive at Shanghai 18:00
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-08 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-09 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-12 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-13 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-14 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-15 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-16 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-19 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-20 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-21 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-22 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-23 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-26 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-27 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-28 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-29 18:00:00 Asia/Shanghai
+OnCalendar=2026-10-30 18:00:00 Asia/Shanghai
+OnCalendar=2026-11-02 18:00:00 Asia/Shanghai
+OnCalendar=2026-11-03 18:00:00 Asia/Shanghai
+OnCalendar=2026-11-04 18:00:00 Asia/Shanghai
 Persistent=false
 AccuracySec=1s
 Unit=stock-watch-baostock-risk-archive.service
