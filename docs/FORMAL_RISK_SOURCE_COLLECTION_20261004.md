@@ -44,8 +44,9 @@ companion 默认不请求；必须显式指定 `--companion-symbols`。
 凭据不回显、companion 价格/日期，以及原未许可来源门进行了检查：
 `test_daily_risk_source_collection.py` 和 `test_v0162_formal_source_gate.py` 共 27 项通过。
 新测试是采集单元测试，不是来源许可或生产验收测试。
-同一代码及环境的完整回归已通过：443 passed，3 subtests passed，89.87 秒。
-后续仅做文档记录及干净提交快照的 release_check，不重跑不变的完整回归。
+首次完整回归通过：443 passed，3 subtests passed，89.87 秒。
+随后补齐采集结束时间，防止把请求前的时间误作整份来源可见时间；27 项针对性
+检查再次通过。这是新代码变化，最终提交快照重新做完整回归及 release_check。
 
 复用 10-03 已保存的 3 只真实 `stock/get` 快照验证新适配：3 只都能绑定
 09-30 价格/时间，但停牌和 ST 仍为未知。没有重复取网来模拟进展。
