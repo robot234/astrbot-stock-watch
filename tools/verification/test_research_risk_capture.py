@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,10 @@ class Frame:
 
 
 def setup_sources(monkeypatch, *, status="1", up=None, down=None, up_price=8.98):
+    @contextmanager
+    def fake_guard(max_calls, target_date="", on_first_send=None):
+        yield types.SimpleNamespace(login=lambda client: client.login(), logout=lambda client: client.logout())
+    monkeypatch.setattr(capture, "_guard_session", fake_guard)
     monkeypatch.setattr(capture, "_read_pool", lambda *args: (
         ("run-1", "2026-09-23", "batch-1"), [("600000", 8.98)]))
     monkeypatch.setitem(sys.modules, "baostock", types.SimpleNamespace(
@@ -123,3 +128,37 @@ def test_scheduled_publication_links_only_matching_batch(monkeypatch, tmp_path):
     result = capture.scheduled_capture(tmp_path / "db", tmp_path, "astrbot", "/evidence")
     assert result["status"] == "published"
     assert len(calls) == 2
+
+
+def test_scheduled_failure_does_not_retry_same_batch(monkeypatch, tmp_path):
+    today = capture.datetime.now(capture.ZoneInfo("Asia/Shanghai")).date().isoformat()
+    monkeypatch.setattr(capture, "_read_pool", lambda *args: (("run-1", today, "batch-1"), [("600000", 8.98)]))
+    monkeypatch.setattr(capture, "_published_batch", lambda *args: None)
+    calls = []
+    def fail_once(*args, **kwargs):
+        calls.append(1)
+        kwargs["before_request"]()
+        kwargs["on_first_send"]()
+        raise RuntimeError("source failed")
+    monkeypatch.setattr(capture, "capture", fail_once)
+    with pytest.raises(RuntimeError, match="source failed"):
+        capture.scheduled_capture(tmp_path / "db", tmp_path, "astrbot", "/evidence")
+    assert capture.scheduled_capture(tmp_path / "db", tmp_path, "astrbot", "/evidence")["status"] == "partial_no_automatic_retry"
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("reason", ["lock_wait_timeout", "shared_daily_budget_insufficient", "connect_failed"])
+def test_zero_request_stop_keeps_next_hour_available(monkeypatch, tmp_path, reason):
+    today = capture.datetime.now(capture.ZoneInfo("Asia/Shanghai")).date().isoformat()
+    monkeypatch.setattr(capture, "_read_pool", lambda *args: (("run-1", today, "batch-1"), [("600000", 8.98)]))
+    monkeypatch.setattr(capture, "_published_batch", lambda *args: None)
+    calls = []
+    def stop_before_send(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError(reason)
+    monkeypatch.setattr(capture, "capture", stop_before_send)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match=reason):
+            capture.scheduled_capture(tmp_path / "db", tmp_path, "astrbot", "/evidence")
+    assert calls == [1, 1]
+    assert not list(tmp_path.glob(".attempt-*"))

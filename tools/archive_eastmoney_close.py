@@ -45,7 +45,7 @@ def append_json(path: Path, item: dict):
         os.fsync(stream.fileno())
 
 
-def validate_gate(protocol: dict, protocol_raw: bytes, approval: dict, now: datetime) -> str:
+def validate_frozen(protocol: dict, protocol_raw: bytes, approval: dict, now: datetime) -> str:
     local = now.astimezone(CHINA)
     if (protocol.get("protocol_version") != "formal-risk-forward/2026-10-04-v4"
             or protocol.get("status") != "frozen_user_confirmed"
@@ -63,7 +63,12 @@ def validate_gate(protocol: dict, protocol_raw: bytes, approval: dict, now: date
     trade_date = local.date().isoformat()
     if trade_date < protocol["start_date"] or trade_date not in protocol["dates"]:
         raise ArchiveStop("outside_declared_trading_window")
-    clock = local.strftime("%H:%M:%S")
+    return trade_date
+
+
+def validate_gate(protocol: dict, protocol_raw: bytes, approval: dict, now: datetime) -> str:
+    trade_date = validate_frozen(protocol, protocol_raw, approval, now)
+    clock = now.astimezone(CHINA).strftime("%H:%M:%S")
     settings = protocol["collection"]
     if not settings["start_at_local"] <= clock <= settings["latest_start_local"]:
         raise ArchiveStop("outside_after_close_start_window")
@@ -275,8 +280,11 @@ class Collector:
             try:
                 securities = self.universe()
                 manifest["universe_count"] = len(securities)
-                with (self.run / "universe.json").open("x", encoding="utf-8") as stream:
+                with (self.run / "universe.next").open("x", encoding="utf-8") as stream:
                     json.dump(securities, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(self.run / "universe.next", self.run / "universe.json")
                 for code, market in securities:
                     self.request(SNAPSHOT_URL, {"secid": f"{market}.{code}", "fltt": 1,
                                                "invt": 2, "fields": FIELDS}, "stock", code)

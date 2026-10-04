@@ -2,8 +2,13 @@
   "protocol_version": "formal-risk-forward/2026-10-04-v4",
   "source": "derived:baostock-v1-rules",
   "scenario_version": "2026-10-v4",
-  "draft_revision": 3,
-  "status": "draft_pending_user_confirmation",
+  "draft_revision": 4,
+  "status": "frozen_user_confirmed",
+  "confirmation": {
+    "confirmed_at": "2026-10-04T13:56:55+00:00",
+    "authority": "User accepted prior revisions and authorized freezing after changing BaoStock to 18:00/20:00 and bounded lock queueing.",
+    "scope": "Research protocol and collection preparation only; legacy live replacement must first be shown to the user. No formal risk license or trading authorization."
+  },
   "licensed": false,
   "start_date": "2026-10-08",
   "dates": ["2026-10-08", "2026-10-09", "2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23", "2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30", "2026-11-02", "2026-11-03", "2026-11-04"],
@@ -103,8 +108,12 @@
     "state": "planned_not_installed",
     "task": "stock-watch-baostock-risk-archive.timer/service",
     "timezone": "Asia/Shanghai",
-    "start_at_local": "16:15:00",
-    "latest_start_local": "17:30:00",
+    "start_at_local": "18:00:00",
+    "latest_start_local": "20:00:00",
+    "lock_wait_seconds": 7200,
+    "lock_poll_seconds": 5,
+    "lock_policy": "Later arrivals wait at most 7200 seconds on the one shared lock without login or requests; never delete a live lock. Re-read date, budget and latest-start gates after acquisition; a new daily job acquiring after 20:00 remains partial with no login. Legacy service timeout must allow 7200 seconds wait plus its original 600 seconds work and cleanup margin.",
+    "daily_ingestion": "User-specified expected BaoStock daily-K completion around 17:30; verify official website wording in the probe and report unverifiable documentation separately. Every stock's daily result must be exactly one nonempty row for the target date/code. Empty results, stale dates and failed pages are partial, never evidence of no data, suspension or safety.",
     "universe_wait_seconds": 300,
     "scope": "Every supported main-board/ChiNext stock from the complete dated clist/get universe published by the 16:10 archive job, including suspended, ST and new stocks. Do not wait for all stock/get requests; require only a complete original same-day universe. Missing universe means partial with no guessed or pick-only substitute.",
     "basic": "Probe query_stock_basic() without a code first; daily mode requires one complete full-table query with counted cursor pagination, then select each supported code's unique current-day row. If full-table mode is unsupported, report before installation; do not silently switch to N individual basic requests or retry the failed query.",
@@ -135,5 +144,5 @@
     "archives": "baostock/YYYY-MM-DD/run-<id>/",
     "log": "logs/baostock-YYYY-MM-DD.jsonl"
   },
-  "activation": "Draft only. User confirmation is required before freeze and collection enable. Separate evidence review and explicit confirmation are required before licensing, production integration, full verification/release, main merge and backed-up plugin-only reload."
+  "activation": "Protocol frozen by explicit user authorization. Implement and test research collectors, show legacy guard diff before live replacement, run bounded capability probes, then install only with passed gates and main-corresponding files. Evidence review and separate explicit confirmation are required before any formal risk licensing, production recommendation integration and backed-up plugin-only reload. Do not enable collectors with failed or unknown required capabilities."
 }

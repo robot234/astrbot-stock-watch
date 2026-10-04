@@ -136,7 +136,7 @@ def test_new_protocol_preserves_all_thresholds_and_twenty_dates():
     assert protocol["thresholds"] == old["thresholds"]
     assert len(protocol["dates"]) == len(set(protocol["dates"])) == 20
     assert protocol["dates"][0] == "2026-10-08"
-    assert protocol["status"] == "draft_pending_user_confirmation"
+    assert protocol["status"] == "frozen_user_confirmed"
 
 
 def test_missing_namechange_reference_does_not_stop_other_field_comparison():
@@ -226,8 +226,8 @@ def test_eastmoney_status_reference_needs_matching_raw_and_confirmed_mapping():
 def test_draft_r3_defines_suspension_capture_and_one_shared_daily_budget():
     protocol = json.loads((ROOT / "docs/FORMAL_RISK_FORWARD_ACCEPTANCE_20261004.json").read_text(encoding="utf-8"))
     old = json.loads((ROOT / "docs/FORMAL_RISK_DERIVED_ACCEPTANCE_20261003.json").read_text(encoding="utf-8"))
-    assert protocol["draft_revision"] == 3
-    assert protocol["status"] == "draft_pending_user_confirmation"
+    assert protocol["draft_revision"] == 4
+    assert protocol["status"] == "frozen_user_confirmed"
     assert protocol["thresholds"] == old["thresholds"]
     assert len(protocol["dates"]) == 20
     assert protocol["coverage_scope"]["policy"] == "v1_supported_only"
@@ -238,7 +238,9 @@ def test_draft_r3_defines_suspension_capture_and_one_shared_daily_budget():
     assert "resumed_by_target_day" in suspension["exclude"]
     assert "intraday_or_temporary" in suspension["exclude"]
     daily = protocol["baostock_daily_collection"]
-    assert daily["start_at_local"] == "16:15:00"
+    assert daily["start_at_local"] == "18:00:00"
+    assert daily["latest_start_local"] == "20:00:00"
+    assert daily["lock_wait_seconds"] == 7200
     assert daily["daily"]["frequency"] == "d" and daily["daily"]["adjustflag"] == "3"
     assert daily["retry_count"] == 0
     assert daily["run_message_cap"] == 7000

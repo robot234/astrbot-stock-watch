@@ -1,0 +1,22 @@
+[Unit]
+Description=Stock Watch research-only AKShare suspension archive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/apps/stock-watch-risk-archive-20261008
+ExecStart=/home/pi/apps/stock-watch-data-probe/.venv/bin/python /home/pi/apps/stock-watch-risk-archive-20261008/archive_risk_daily.py --kind suspensions --root /home/pi/apps/stock-watch-risk-archive-20261008 --protocol /home/pi/apps/stock-watch-risk-archive-20261008/protocol.json --approval /home/pi/apps/stock-watch-risk-archive-20261008/approval.json
+TimeoutStartSec=240
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pi/apps/stock-watch-risk-archive-20261008
+StandardOutput=journal
+StandardError=journal

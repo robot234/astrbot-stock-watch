@@ -8,16 +8,29 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
 import sqlite3
+import socket
 import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+
+def _guard_session(max_calls: int, target_date: str = "", on_first_send=None):
+    local = Path(__file__).resolve().parents[1] / "shared_baostock.py"
+    helper = local if local.exists() else Path("/home/pi/apps/stock-fund-fetch-20260929/shared_baostock.py")
+    spec = importlib.util.spec_from_file_location("legacy_shared_baostock", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.owner_session(purpose="stock-watch-research-risk", max_calls=max_calls,
+                                target_date=target_date or None, work_seconds=600,
+                                on_first_send=on_first_send)
 
 
 def _read_pool(db_path: Path, container: str):
@@ -42,7 +55,8 @@ def _read_pool(db_path: Path, container: str):
         return tuple(run) if run else (), picks
 
 
-def capture(db_path: Path, out_dir: Path, *, container: str = "", expected_date: str = "") -> dict:
+def capture(db_path: Path, out_dir: Path, *, container: str = "", expected_date: str = "",
+            on_first_send=None, before_request=None) -> dict:
     import akshare as ak
     import baostock as bs
 
@@ -63,39 +77,48 @@ def capture(db_path: Path, out_dir: Path, *, container: str = "", expected_date:
     rows = {}
     failures = []
     source_captured_at = {}
-    login = bs.login()
-    if login.error_code != "0":
-        raise RuntimeError("BaoStock login failed")
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(15)
     try:
-        for code, frozen_close in picks:
-            symbol = ("sh." if code.startswith("6") else "sz.") + code
+        with _guard_session(2 * len(picks) + 2, expected_date, on_first_send) as guard:
+            if before_request is not None:
+                before_request()
+            login = guard.login(bs)
+            if login is None or login.error_code != "0":
+                raise RuntimeError("BaoStock login failed")
             try:
-                result = bs.query_history_k_data_plus(
-                    symbol, "date,code,close,tradestatus,isST",
-                    start_date=trade_date, end_date=trade_date, frequency="d", adjustflag="3")
-                found = []
-                if result.error_code == "0":
-                    while result.next():
-                        found.append(dict(zip(result.fields, result.get_row_data())))
-                if (len(found) != 1 or found[0]["date"] != trade_date
-                        or found[0]["code"] != symbol
-                        or abs(float(found[0]["close"]) - float(frozen_close)) > 0.005):
-                    failures.append(code)
-                    continue
-                row = found[0]
-                if row["tradestatus"] not in ("0", "1") or row["isST"] not in ("0", "1"):
-                    failures.append(code)
-                    continue
-                rows[code] = {
-                    "close": float(frozen_close),
-                    "suspended": {"0": True, "1": False}.get(row["tradestatus"]),
-                    "st": {"0": False, "1": True}.get(row["isST"]),
-                    "limit_up": None, "limit_down": None,
-                }
-            except (KeyError, ValueError, TypeError, OverflowError):
-                failures.append(code)
+                for code, frozen_close in picks:
+                    symbol = ("sh." if code.startswith("6") else "sz.") + code
+                    try:
+                        result = bs.query_history_k_data_plus(
+                            symbol, "date,code,close,tradestatus,isST",
+                            start_date=trade_date, end_date=trade_date, frequency="d", adjustflag="3")
+                        found = []
+                        if result.error_code == "0":
+                            while result.next():
+                                found.append(dict(zip(result.fields, result.get_row_data())))
+                        if (result.error_code != "0" or len(found) != 1 or found[0]["date"] != trade_date
+                                or found[0]["code"] != symbol
+                                or abs(float(found[0]["close"]) - float(frozen_close)) > 0.005):
+                            failures.append(code)
+                            break
+                        row = found[0]
+                        if row["tradestatus"] not in ("0", "1") or row["isST"] not in ("0", "1"):
+                            failures.append(code)
+                            break
+                        rows[code] = {
+                            "close": float(frozen_close),
+                            "suspended": {"0": True, "1": False}.get(row["tradestatus"]),
+                            "st": {"0": False, "1": True}.get(row["isST"]),
+                            "limit_up": None, "limit_down": None,
+                        }
+                    except (KeyError, ValueError, TypeError, OverflowError):
+                        failures.append(code)
+                        break
+            finally:
+                guard.logout(bs)
     finally:
-        bs.logout()
+        socket.setdefaulttimeout(previous_timeout)
     if failures:
         raise RuntimeError(f"BaoStock missing or inconsistent rows: {len(failures)}")
     source_captured_at["trading"] = datetime.now(timezone.utc).isoformat()
@@ -185,7 +208,23 @@ def scheduled_capture(db_path: Path, out_dir: Path, container: str, publish_dir:
         return {"status": "already_published", "trade_date": today}
     staged = out_dir / (today + ".json")
     if not staged.exists():
-        capture(db_path, out_dir, container=container, expected_date=today)
+        attempt = out_dir / (".attempt-" + today + "-" + hashlib.sha256(str(run[2]).encode()).hexdigest()[:16] + ".json")
+        if attempt.exists():
+            return {"status": "partial_no_automatic_retry", "trade_date": today, "batch_id": run[2]}
+        out_dir.mkdir(parents=True, exist_ok=True)
+        def check_attempt():
+            if attempt.exists():
+                raise RuntimeError("batch already sent BaoStock messages")
+
+        def record_first_send():
+            with attempt.open("x", encoding="utf-8") as stream:
+                json.dump({"status": "first_message_sent", "trade_date": today, "batch_id": run[2],
+                           "observed_at": datetime.now(timezone.utc).isoformat()}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        capture(db_path, out_dir, container=container, expected_date=today,
+                on_first_send=record_first_send, before_request=check_attempt)
     bundle = json.loads(staged.read_text(encoding="utf-8"))
     if (bundle.get("trade_date") != today or bundle.get("batch_id") != run[2]
             or bundle.get("failed_codes") or not bundle.get("source_captured_at")
