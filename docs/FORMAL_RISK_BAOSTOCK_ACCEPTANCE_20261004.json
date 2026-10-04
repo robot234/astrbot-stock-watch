@@ -1,0 +1,39 @@
+{
+  "protocol_version": "formal-risk-baostock-first/2026-10-04-v2",
+  "source": "derived:baostock-first",
+  "scenario_version": "2026-10-v2",
+  "status": "frozen_before_capture; unlicensed; awaiting_user_acceptance",
+  "supersedes_research_route_only": "formal-risk-derived-acceptance/2026-10-03-v1",
+  "dates": ["2026-09-02", "2026-09-03", "2026-09-04", "2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-28", "2026-09-29", "2026-09-30"],
+  "fields": ["suspended", "limit_up", "limit_down", "st"],
+  "thresholds": {
+    "minimum_sessions": 20,
+    "minimum_daily_universe": 2500,
+    "minimum_daily_complete_tuple_fraction": 0.8,
+    "minimum_daily_field_reference_fraction": 0.8,
+    "minimum_field_agreement": 0.999,
+    "minimum_positive_reference_samples_per_field": 10,
+    "maximum_unsafe_false": 0,
+    "maximum_unexplained_disagreements": 0
+  },
+  "scope": "Research source-priority replacement only. BaoStock unadjusted completed daily data first; Tushare is optional fallback and cross-check, not a required credential gate. No production activation or strategy change.",
+  "rules": [
+    "Preserve original frozen dates, numeric thresholds, v1 artifacts and incomplete verdict. Do not amend v1 or mark strategy checklist complete.",
+    "BaoStock daily frequency d, adjustflag 3, exact code/date/batch, observed after target close, positive finite close/preclose and nonnegative volume/amount are required. Source close and preclose must agree with the immutable baseline within 0.005.",
+    "Only explicit tradestatus 0/1 and isST 0/1 are facts. tradestatus 0 proves suspension only with zero trading volume/amount. tradestatus 1 proves non-suspension only with positive volume/amount. Missing or contradictory states remain None.",
+    "BaoStock provides dated ST and suspension facts; they never manufacture an ordinary trading regime, listing proof or limit prices. Invalid/mismatched source rows cannot yield safe False.",
+    "Tushare fallback is attempted only on absent BaoStock evidence and only from valid v1 dated evidence already supplied in memory. No credential/config access or automatic Tushare network requests; a malformed/conflicting BaoStock record does not trigger a safety fallback.",
+    "An explicit BaoStock risk-positive fact cannot be overwritten by fallback False. Valid supplied cross-source contradictions remain None with a conflict reason.",
+    "Normal limits still require dated complete listing/calendar evidence, exclusion of first five sessions, and exchange special-regime proof. ST/suspension/unsupported boards/unknown regimes keep limit states None. Decimal HALF_UP to cents, ordinary main-board 10 percent and ChiNext 20 percent only.",
+    "Retain real source retrieval time, original baseline identity, raw hashes and per-field provenance. Historical retrieval is retrospective research, not proof of historical decision-time availability."
+  ],
+  "comparison": [
+    "Compare every supported row of every date, report coverage, unknowns, positives, discrepancies and full tuple completeness. Small-budget probes are not acceptance or a formal list.",
+    "Preserve mandatory dated Eastmoney companion and AKShare checks. Pool absence never proves False; current companion responses cannot reconstruct historical snapshots.",
+    "BaoStock cannot serve as an independent reference for fields derived from that same BaoStock response. Tushare fallback cannot validate itself either. Count same-source references separately, not as agreement or reference coverage.",
+    "Optional tushare:dated-risk references may compare ST/suspension only with dated full source evidence, matching date/code/batch/close and raw evidence hash.",
+    "Missing mandatory inputs mean incomplete. Unsafe False or unexplained disagreement means fail. Passing tests do not license live sources."
+  ],
+  "activation": "User confirms real comparison evidence before adding exact source/version/field licenses, formal provider/persistence integration, activation tests, verification/release checks and main merge. Show diff/tests before backed-up plugin-only deployment.",
+  "post_holiday_first_session": "2026-10-08"
+}

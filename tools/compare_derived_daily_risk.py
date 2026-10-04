@@ -6,9 +6,11 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
+import importlib
 import json
 import math
 from pathlib import Path
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,10 +19,22 @@ DERIVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DERIVER)
 
 
-def _reference_valid(reference: dict, row: dict, batch_id: str, observed_at: str) -> bool:
+def _deriver(protocol: dict):
+    if protocol["source"] == DERIVER.SOURCE and protocol["scenario_version"] == DERIVER.SCENARIO_VERSION:
+        return DERIVER
+    if protocol["source"] == "derived:baostock-first" and protocol["scenario_version"] == "2026-10-v2":
+        sys.path.insert(0, str(ROOT.parent))
+        return importlib.import_module("astrbot_stock_watch.baostock_daily_risk")
+    raise ValueError("protocol_scenario_mismatch")
+
+
+def _reference_valid(reference: dict, row: dict, batch_id: str, observed_at: str,
+                     *, allow_tushare: bool = False) -> bool:
     source_fields = {"eastmoney:companion": DERIVER.FIELDS,
                      "akshare:dated-pools": ("limit_up", "limit_down"),
                      "baostock:daily:unadjusted": ("suspended", "st")}
+    if allow_tushare:
+        source_fields["tushare:dated-risk"] = ("suspended", "st")
     try:
         source = reference.get("source")
         close = float(reference["reference_close"])
@@ -57,9 +71,7 @@ def compare(bundle: dict, protocol: dict) -> dict:
     blockers = []
     totals = {field: Counter() for field in fields}
     inputs = bundle.get("sessions", {})
-    if (protocol["source"] != DERIVER.SOURCE
-            or protocol["scenario_version"] != DERIVER.SCENARIO_VERSION):
-        raise ValueError("protocol_scenario_mismatch")
+    deriver = _deriver(protocol)
     for trade_date in dates:
         session = inputs.get(trade_date, {})
         rows = session.get("rows", [])
@@ -77,7 +89,7 @@ def compare(bundle: dict, protocol: dict) -> dict:
             if code in seen or row.get("trade_date") != trade_date or row.get("batch_id") != session.get("batch_id"):
                 raise ValueError("duplicate_or_mismatched_daily_row")
             seen.add(code)
-            derived = DERIVER.derive_daily_risk(row, evidence.get(code, {}),
+            derived = deriver.derive_daily_risk(row, evidence.get(code, {}),
                                                observed_at=bundle["observed_at"])
             values = derived["fields"]
             reasons.update(derived["reasons"])
@@ -92,7 +104,11 @@ def compare(bundle: dict, protocol: dict) -> dict:
                 counts[field]["unknown"] += predicted is None
                 source_values = []
                 for reference in references.get(code, []):
-                    if not _reference_valid(reference, row, session.get("batch_id"), bundle["observed_at"]):
+                    if not _reference_valid(reference, row, session.get("batch_id"), bundle["observed_at"],
+                                            allow_tushare=deriver.SOURCE == "derived:baostock-first"):
+                        continue
+                    if reference.get("source") in derived.get("field_sources", {}).get(field, []):
+                        counts[field]["same_source_reference_ignored"] += 1
                         continue
                     value = reference.get("fields", {}).get(field)
                     if type(value) is bool:
@@ -160,10 +176,11 @@ def main() -> int:
     args = parser.parse_args()
     raw = args.input.read_bytes()
     protocol_raw = args.protocol.read_bytes()
-    report = compare(json.loads(raw), json.loads(protocol_raw))
+    protocol = json.loads(protocol_raw)
+    report = compare(json.loads(raw), protocol)
     report["hashes"] = {"input": hashlib.sha256(raw).hexdigest(),
                         "protocol": hashlib.sha256(protocol_raw).hexdigest(),
-                        "deriver": hashlib.sha256((ROOT / "derived_daily_risk.py").read_bytes()).hexdigest(),
+                        "deriver": hashlib.sha256(Path(_deriver(protocol).__file__).read_bytes()).hexdigest(),
                         "evaluator": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     with args.output.open("x", encoding="utf-8", newline="\n") as output:
         json.dump(report, output, ensure_ascii=False, indent=2)
