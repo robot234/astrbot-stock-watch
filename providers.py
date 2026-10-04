@@ -743,6 +743,15 @@ class TushareRequestGateway:
     async def request_api(self, api_name: str, payload: dict, *, client=None, cache_ttl: float = 0, cache_key: str | None = None, rate_retry_enabled: bool = True) -> dict:
         return await self.request_json(client, payload, api_name=api_name, cache_ttl=cache_ttl, cache_key=cache_key, rate_retry_enabled=rate_retry_enabled)
 
+    async def request_existing_api(self, api_name: str, params: dict, fields: str) -> dict:
+        """Reuse this already-configured gateway without reading credential files."""
+        if not self.token:
+            raise TusharePermissionError("Tushare runtime credential unavailable")
+        payload = {"api_name": api_name, "token": self.token,
+                   "params": dict(params), "fields": fields}
+        return await self.request_json(payload, api_name=api_name, cache_ttl=0,
+                                       rate_retry_enabled=False)
+
     async def request(self, *args, **kwargs) -> dict:
         """Compatibility wrapper accepting either (client, payload) or
         (api_name, payload, client=...)."""
@@ -3239,6 +3248,13 @@ class SinaQuoteProvider:
             await self.enrich_daily_risk_fields(result.quotes)
         self.last_diagnostics = dict(result.diagnostics or {}) if isinstance(result, BulkDailyResult) else {}
         return result
+
+    async def collect_daily_risk_source_inputs(self, sessions: dict, *, request_budget: int = 150) -> dict:
+        """Manual research collection only; never invoked by formal screening."""
+        from .daily_risk_sources import DailyRiskSourceCollector
+
+        return await DailyRiskSourceCollector(
+            self.gateway, request_budget=request_budget).collect(sessions)
 
     async def fetch_completed_trade_dates(
         self,
