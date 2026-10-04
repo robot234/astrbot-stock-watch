@@ -25,6 +25,9 @@ def _deriver(protocol: dict):
     if protocol["source"] == "derived:baostock-first" and protocol["scenario_version"] == "2026-10-v2":
         sys.path.insert(0, str(ROOT.parent))
         return importlib.import_module("astrbot_stock_watch.baostock_daily_risk")
+    if protocol["source"] == "mixed:baostock-eastmoney" and protocol["scenario_version"] == "2026-10-v3":
+        sys.path.insert(0, str(ROOT.parent))
+        return importlib.import_module("astrbot_stock_watch.split_source_daily_risk")
     raise ValueError("protocol_scenario_mismatch")
 
 
@@ -105,7 +108,8 @@ def compare(bundle: dict, protocol: dict) -> dict:
                 source_values = []
                 for reference in references.get(code, []):
                     if not _reference_valid(reference, row, session.get("batch_id"), bundle["observed_at"],
-                                            allow_tushare=deriver.SOURCE == "derived:baostock-first"):
+                                            allow_tushare=deriver.SOURCE in (
+                                                "derived:baostock-first", "mixed:baostock-eastmoney")):
                         continue
                     if reference.get("source") in derived.get("field_sources", {}).get(field, []):
                         counts[field]["same_source_reference_ignored"] += 1

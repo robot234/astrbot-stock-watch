@@ -1,0 +1,39 @@
+{
+  "protocol_version": "formal-risk-split-source/2026-10-04-v3",
+  "source": "mixed:baostock-eastmoney",
+  "scenario_version": "2026-10-v3",
+  "status": "frozen_before_new_audit; exploratory_known_samples; unlicensed",
+  "dates": ["2026-09-02", "2026-09-03", "2026-09-04", "2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-28", "2026-09-29", "2026-09-30"],
+  "fields": ["suspended", "limit_up", "limit_down", "st"],
+  "thresholds": {
+    "minimum_sessions": 20,
+    "minimum_daily_universe": 2500,
+    "minimum_daily_complete_tuple_fraction": 0.8,
+    "minimum_daily_field_reference_fraction": 0.8,
+    "minimum_field_agreement": 0.999,
+    "minimum_positive_reference_samples_per_field": 10,
+    "maximum_unsafe_false": 0,
+    "maximum_unexplained_disagreements": 0
+  },
+  "scope": "User-approved source-role audit, not production activation. Complete main price tuple from BaoStock only; BaoStock dated trading/ST facts; Eastmoney stock/get price and supplied limits together; Tushare remains optional v1 fallback with its own identity.",
+  "rules": [
+    "Preserve v1/v2 protocols, artifacts and incomplete verdicts. Preserve numeric thresholds and dates. Previously inspected three companion samples are exploratory, never blind validation.",
+    "Validate BaoStock daily frequency d, adjustflag 3, exact code/date/batch and actual observation time. Open/high/low/close/preclose/volume/amount must be from one original daily query, finite and internally consistent. Missing OHLC is not silently filled from another supplier.",
+    "Validate matching baseline close/preclose within 0.005. Baseline is an immutable historical cross-check, not the assembled main price source. If baseline OHLC exists, compare it as a separate diagnostic.",
+    "Suspension/ST retain v2 explicit-state, positive-volume, conflict and fail-closed rules. Do not license optional Tushare fallback by giving it a new source identity.",
+    "Use Eastmoney stock/get raw f57 code, f59=2 scale, f43 price, f60 prior close, f51 upper price, f52 lower price, f86 aware same-session after-close timestamp. Decode price and both limits from this one response. Require rc=0, exact symbol, positive finite prices, lower <= last <= upper and lower < upper.",
+    "Cross-check Eastmoney last/preclose against the same-date BaoStock close/preclose within 0.005, source receipt no later than audit time, and original evidence hashes. Missing or mismatched source prices/date/batch/scale mean limit states None, not safe False.",
+    "Equality of Eastmoney last and its upper/lower supplied bound determines daily limit state. No theoretical 10/20 percent rule and no guessed ordinary-regime proof for these supplied bounds. Zero/absent bounds or unsupported boards remain None.",
+    "Do not infer historical state from current undated names. Historical acquisition retains real acquisition timestamps. No current data reconstructs missing historical companion observations.",
+    "No new source calls without the existing owner-host BaoStock guard, official blacklist check and shared message budget. Login/logout, pagination and failures all count. Cached companion replay needs no new requests."
+  ],
+  "comparison": [
+    "Report whole original universe and all frozen dates, not only three probe stocks. Small audited overlap is not acceptance.",
+    "Preserve mandatory companion and AKShare dated pool checks. Pool membership proves True only; absence never proves False.",
+    "Primary BaoStock ST/suspension or primary companion limit output cannot validate itself. Same-source reference rows are counted as ignored, not independent coverage or agreement.",
+    "Cross-supplier price agreement proves price consistency only, not independent confirmation of all risk fields. Missing positive examples or historical reference coverage means incomplete.",
+    "No mismatched/unknown row may be promoted to a formal list. Show evidence for user confirmation before any exact scenario licensing."
+  ],
+  "activation": "No license or production consumer change in this audit. Only after real acceptance and explicit user confirmation: integration/tests, full verification/release, main merge and backed-up plugin-only reload.",
+  "post_holiday_first_session": "2026-10-08"
+}
