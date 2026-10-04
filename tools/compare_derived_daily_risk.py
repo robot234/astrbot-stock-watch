@@ -28,16 +28,22 @@ def _deriver(protocol: dict):
     if protocol["source"] == "mixed:baostock-eastmoney" and protocol["scenario_version"] == "2026-10-v3":
         sys.path.insert(0, str(ROOT.parent))
         return importlib.import_module("astrbot_stock_watch.split_source_daily_risk")
+    if protocol["source"] == "derived:baostock-v1-rules" and protocol["scenario_version"] == "2026-10-v4":
+        sys.path.insert(0, str(ROOT.parent))
+        return importlib.import_module("astrbot_stock_watch.baostock_rule_daily_risk")
     raise ValueError("protocol_scenario_mismatch")
 
 
 def _reference_valid(reference: dict, row: dict, batch_id: str, observed_at: str,
-                     *, allow_tushare: bool = False) -> bool:
+                     *, allow_tushare: bool = False, forward: bool = False) -> bool:
     source_fields = {"eastmoney:companion": DERIVER.FIELDS,
                      "akshare:dated-pools": ("limit_up", "limit_down"),
                      "baostock:daily:unadjusted": ("suspended", "st")}
     if allow_tushare:
         source_fields["tushare:dated-risk"] = ("suspended", "st")
+    if forward:
+        source_fields["tushare:namechange"] = ("st",)
+        source_fields["eastmoney:companion"] = ("limit_up", "limit_down")
     try:
         source = reference.get("source")
         close = float(reference["reference_close"])
@@ -58,6 +64,18 @@ def _reference_valid(reference: dict, row: dict, batch_id: str, observed_at: str
             stamp = datetime.fromisoformat(reference["source_timestamp"])
             if (stamp.tzinfo is None or stamp > observed
                     or stamp.astimezone(close_at.tzinfo).date() != close_at.date()):
+                return False
+            if forward and (stamp < close_at or observed.astimezone(close_at.tzinfo).date() != close_at.date()):
+                return False
+            if forward:
+                previous = float(reference["reference_pre_close"])
+                if not math.isfinite(previous) or previous <= 0 or abs(previous - float(row["pre_close"])) > 0.005:
+                    return False
+        if source == "tushare:namechange":
+            if (reference.get("complete") is not True
+                    or reference.get("ann_date", "9999-12-31") > row["trade_date"]
+                    or reference.get("start_date", "9999-12-31") > row["trade_date"]
+                    or (reference.get("end_date") and reference["end_date"] < row["trade_date"])):
                 return False
         return True
     except (KeyError, TypeError, ValueError, OverflowError):
@@ -109,7 +127,8 @@ def compare(bundle: dict, protocol: dict) -> dict:
                 for reference in references.get(code, []):
                     if not _reference_valid(reference, row, session.get("batch_id"), bundle["observed_at"],
                                             allow_tushare=deriver.SOURCE in (
-                                                "derived:baostock-first", "mixed:baostock-eastmoney")):
+                                                "derived:baostock-first", "mixed:baostock-eastmoney"),
+                                            forward=deriver.SOURCE == "derived:baostock-v1-rules"):
                         continue
                     if reference.get("source") in derived.get("field_sources", {}).get(field, []):
                         counts[field]["same_source_reference_ignored"] += 1

@@ -1,0 +1,22 @@
+[Unit]
+Description=Stock Watch research-only Eastmoney close archive (requires approval)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/apps/stock-watch-risk-archive-20261008
+ExecStart=/usr/bin/python3 /home/pi/apps/stock-watch-risk-archive-20261008/archive_eastmoney_close.py --root /home/pi/apps/stock-watch-risk-archive-20261008 --protocol /home/pi/apps/stock-watch-risk-archive-20261008/protocol.json --approval /home/pi/apps/stock-watch-risk-archive-20261008/approval.json
+TimeoutStartSec=7300
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pi/apps/stock-watch-risk-archive-20261008
+StandardOutput=journal
+StandardError=journal

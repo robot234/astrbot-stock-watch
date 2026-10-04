@@ -1,0 +1,11 @@
+[Unit]
+Description=Stock Watch research close archive at 16:10 Shanghai (disabled draft)
+
+[Timer]
+OnCalendar=*-*-* 16:10:00 Asia/Shanghai
+AccuracySec=30s
+Persistent=false
+Unit=stock-watch-eastmoney-archive.service
+
+[Install]
+WantedBy=timers.target
