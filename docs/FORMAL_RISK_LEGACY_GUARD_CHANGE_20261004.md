@@ -1,7 +1,7 @@
-# 旧 27 只采集任务：待现场替换的具体改动
+# 旧 27 只采集任务：已完成现场替换
 
-这份改动已在本地准备，但**还没有替换树莓派上的脚本、没有修改服务、没有重启容器**。
-用户已确认本范围，并补充实际发送后记录 attempt、永久适配器路径和新服务写权限要求；现场替换仍须完整测试/发布检查通过并合入 main。
+10-04 已按用户认可范围完成备份与现场替换，文件对应 main 提交 `7baeb08122923d39e950969569295e378e9a268e`。**只做 daemon-reload，没有启动旧 service、没有重载插件、没有重启容器**。
+用户补充的实际发送后记录 attempt、永久适配器路径和新服务写权限要求均已实现；全套测试和发布检查通过后合入 main 并推送。新研究采集仍未安装启用。
 
 ## 改什么、效果是什么
 
@@ -19,7 +19,7 @@
 - 新增 unit drop-in：`/etc/systemd/system/stock-watch-research-risk.service.d/stock-watch-shared-guard.conf`，对应 `tools/operations/stock-watch-shared-guard.conf`，内容仅为 `TimeoutStartSec=7920`，避免原 10 分钟总超时把排队任务杀掉。
 - 不改旧 timer 的 18:30–23:30 时刻，不关闭其他服务。安装时只 `systemctl daemon-reload` 重读 unit，不为了这项改动重启 AstrBot 或容器。
 
-## 备份与回退（拟定，未执行）
+## 备份与回退（已执行）
 
 安装前只读核对旧脚本哈希、服务是否运行、原 drop-in 是否存在。若服务正在工作，先等它正常结束，不抢锁覆盖。
 备份旧脚本、原 unit/drop-in（若有）到本次独占备份目录，记录权限和 SHA256；新适配器/脚本先放 staging、做导入及哈希检查，再原子替换。
@@ -28,5 +28,15 @@
 
 ## 已做与没做
 
-已有离线测试涵盖排队时不发消息、等待超时保留锁、拿锁后重新看预算/最晚启动时间、预留登出，以及同批次失败不重试。
-真实锁竞争、官网说明、联网字段语义与系统服务安装尚待现场验收；不能用合成测试代替这些检查。
+离线测试涵盖排队时不发消息、等待超时保留锁、拿锁后重新看预算/最晚启动时间、预留登出，以及发送成功后接收失败不重试、零发送下小时可再试、排队者发送前重新查 attempt。
+干净工作树全套：`python -m pytest tools/verification -q`，639 passed、3 subtests passed；`python tools/release_check.py` PASS，版本 0.13.3/schema 24。用户检查单哈希保留不变。
+
+现场结果（北京时间 10-04 22:42）：
+
+- 备份：`/home/pi/apps/stock-watch-data-probe/backups/shared-guard-20261004T144218Z`，保存旧脚本、缺失文件标记、权限/哈希、分步安装记录和回退脚本。回退副本字节核对及脚本编译通过，未在生产执行回退。
+- 回退命令：`sudo /usr/bin/python3 /home/pi/apps/stock-watch-data-probe/backups/shared-guard-20261004T144218Z/rollback.py`；执行前要求旧 service inactive、当前文件仍为本次哈希。只恢复这三处，不回退账本、不重启容器。
+- 新旧脚本/永久 helper 均完成哈希及 pi 用户导入核对。重读配置后 `TimeoutStartUSec=2h 12min`，旧 service inactive、旧 timer active。
+- 安装前后账本哈希一致；容器仍 running，StartedAt `2026-09-30T11:10:55.379022936Z`、RestartCount 0。
+- 安装后另做一次有界 BaoStock 真请求：09-30 日线一行，首次实际发送回调恰好一次；登录/查询/登出共 3 条消息，原账本 68 → 71/40000，没有封禁/空回复/重试。该试采不触发旧任务、不写插件数据库、不属于 20 日窗口验收。
+
+仍未验证：两个真实进程竞争时的排队现场演练、旧任务下一次定时完整发布、官网 17:30 原文、东方财富同股字段语义和全市场分页完整性。排队与失败边界目前是离线验证，不能冒充现场验证。正式风险许可保持为空。
