@@ -24,7 +24,7 @@ async def capture(sessions: dict, *, request_budget: int = 150,
     instant = datetime.now(timezone.utc).isoformat()
     credential = os.environ.get("TUSHARE_TOKEN", "")
     url = os.environ.get("TUSHARE_URL", "") or "https://api.tushare.pro"
-    output = {"observed_at": instant, "licensed": False, "credential_files_read": False,
+    output = {"started_at": instant, "observed_at": instant, "licensed": False, "credential_files_read": False,
               "destination_host": urlsplit(url).hostname,
               "tushare": {"status": "not_executed", "requests": 0,
                           "reason": "TUSHARE_TOKEN_missing_from_process_environment"},
@@ -50,6 +50,7 @@ async def capture(sessions: dict, *, request_budget: int = 150,
             output["companion"]["status"] = "captured_unlicensed"
     finally:
         await http.close()
+    output["observed_at"] = datetime.now(timezone.utc).isoformat()
     return output
 
 

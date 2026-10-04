@@ -223,3 +223,4 @@ def test_offline_runner_without_environment_credential_makes_zero_api_calls(monk
     assert result["tushare"]["status"] == "not_executed"
     assert result["tushare"]["requests"] == 0 and result["credential_files_read"] is False
     assert result["production_mutation"] is False and result["formal_calls"] == 0
+    assert datetime.fromisoformat(result["started_at"]) <= datetime.fromisoformat(result["observed_at"])
