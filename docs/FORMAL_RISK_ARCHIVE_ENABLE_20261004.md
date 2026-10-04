@@ -64,3 +64,18 @@ systemctl is-active stock-watch-suspension-archive.timer stock-watch-baostock-ri
 - 继续核对各页 total、页大小、代码/市场、重码、当日收盘后时间；不完整/非法名单保留 partial。完整原始响应仍不等于验收。
 - `f2/f18/f350/f351` 必须为有效正整数分报价。缺失上下限仍未知；有效同日名称与正成交只提供对应字段的候选参考。候选标记为 `probe_candidate_not_formal_acceptance`，所有许可仍关闭。
 - 本次只准备/测试批量模式，不安装、启用或运行全市场东方财富任务。等用户审核本改动后再推进其安装；不影响两个已授权独立任务。
+
+## 已完成现场安装（10-04 23:17，北京时间）
+
+`Host fact`：部署文件对应 main `1b620bab62418a5dc6697e942c2b9014e5cf7a47`，逐一核对安装字节哈希；采用 Git 固定的原协议字节，SHA256 仍为 `5e637b729255c9a6ba0c988b074c15ddbc58bc0c8ff776e95d5b6edba4faf10f`，避免 Windows 自动换行转换影响批准哈希。
+
+- `stock-watch-suspension-archive.timer`：loaded、active/waiting、enabled；下一次 2026-10-08 16:10:00 CST。
+- `stock-watch-baostock-risk-archive.timer`：loaded、active/waiting、enabled；下一次 2026-10-08 18:00:00 CST。
+- 两个 service 均 inactive，未启动假期采集；以 pi 用户验证两个命令在 10-04 均拒绝窗口外取数，未创建当天结果目录。
+- unit 语法和日历校验通过；657 项测试、3 项子测试通过，干净工作树 release_check PASS（0.13.3/schema 24）。
+- 执行的生命周期命令只有 `systemctl daemon-reload` 与 `systemctl enable --now stock-watch-suspension-archive.timer stock-watch-baostock-risk-archive.timer`。未替换插件、未重载插件、未重启容器；容器 StartedAt `2026-09-30T11:10:55.379022936Z`、RestartCount 0，安装前后账本哈希相同。
+- 备份/缺失状态记录和回退脚本：`/home/pi/apps/stock-watch-data-probe/backups/independent-archives-20261004T151726Z`。回退命令 `sudo /usr/bin/python3 /home/pi/apps/stock-watch-data-probe/backups/independent-archives-20261004T151726Z/rollback.py`；先停止两个任务，逐一核对安装文件哈希，只移除本轮安装文件，保留行情、日志、STOP、原账本和旧任务。已验证状态清单往返和脚本编译，未在现场执行回退。
+- 第一次安装在 staging 的回退清单格式核对失败，现场确认根目录与 unit 均未安装后修正，再进行一次安装；保留了第一份失败记录，没有重复这两次东方财富试采，也未重置账本。
+- `stock-watch-eastmoney-archive.timer` 仍 not-found；批量改动仅已准备，等待用户审查后再核验全量分页和特殊样本，不能把两只普通股票的数值核对说成全市场参考验收。
+
+当前实际完成的是**安装与首跑预约就绪**，不是 10-08 当日日线完整性、20 日验收、风险许可或正式名单恢复。原策略检查单的用户未提交字节保留不变。
