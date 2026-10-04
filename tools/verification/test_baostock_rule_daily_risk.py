@@ -221,3 +221,30 @@ def test_eastmoney_status_reference_needs_matching_raw_and_confirmed_mapping():
     assert evaluator._reference_valid(reference, row, "fixture", NOW, forward=True)
     reference["status_mapping_confirmed"] = False
     assert not evaluator._reference_valid(reference, row, "fixture", NOW, forward=True)
+
+
+def test_draft_r3_defines_suspension_capture_and_one_shared_daily_budget():
+    protocol = json.loads((ROOT / "docs/FORMAL_RISK_FORWARD_ACCEPTANCE_20261004.json").read_text(encoding="utf-8"))
+    old = json.loads((ROOT / "docs/FORMAL_RISK_DERIVED_ACCEPTANCE_20261003.json").read_text(encoding="utf-8"))
+    assert protocol["draft_revision"] == 3
+    assert protocol["status"] == "draft_pending_user_confirmation"
+    assert protocol["thresholds"] == old["thresholds"]
+    assert len(protocol["dates"]) == 20
+    assert protocol["coverage_scope"]["policy"] == "v1_supported_only"
+    suspension = protocol["suspension_positive_collection"]
+    assert suspension["start_at_local"] == "16:10:00"
+    assert suspension["endpoint"] == "akshare.stock_tfp_em"
+    assert suspension["reference_fields"] == {"suspended": True}
+    assert "resumed_by_target_day" in suspension["exclude"]
+    assert "intraday_or_temporary" in suspension["exclude"]
+    daily = protocol["baostock_daily_collection"]
+    assert daily["start_at_local"] == "16:15:00"
+    assert daily["daily"]["frequency"] == "d" and daily["daily"]["adjustflag"] == "3"
+    assert daily["retry_count"] == 0
+    assert daily["run_message_cap"] == 7000
+    assert daily["combined_daily_soft_stop"] == 35000
+    assert daily["combined_daily_hard_cap"] == 40000
+    assert daily["supplier_recorded_limit"] == 50000
+    assert daily["shared_ledger"] == "baostock_request_ledger.json"
+    assert daily["shared_lock"] == "baostock_guard.lock"
+    assert daily["state"] == suspension["state"] == "planned_not_installed"
