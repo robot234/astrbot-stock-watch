@@ -286,3 +286,9 @@ def test_batch_records_each_stock_from_one_original_page_without_stock_get(tmp_p
     candidates = [record for record in records if record["kind"] == "batch_stock"]
     assert len(candidates) == 2 and candidates[0]["raw_sha256"] == candidates[1]["raw_sha256"]
     assert len(list(instance.run.glob("*.raw"))) == 1
+
+
+def test_uninstalled_eastmoney_service_explicitly_selects_batch_mode():
+    service = (ROOT / "tools/operations/stock-watch-eastmoney-archive.service").read_text(encoding="utf-8")
+    command = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+    assert command.split()[-1] == "--batch"
