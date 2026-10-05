@@ -1,0 +1,69 @@
+{
+  "mode": "LLM_SECTOR_FIRST_EXP_V0",
+  "registration_commit": "61bc12440161269611332a03d10e5a27b9c0ade7",
+  "execution_commit": "90663846e75607109d96067fe6a8a4ece397850d",
+  "frozen_at": "2026-10-05T21:30:13.813570+08:00",
+  "cutoff": "2026-10-05T22:00:00+08:00",
+  "input_as_of": "2026-09-30",
+  "status": "flow_complete",
+  "label": "研究观察，未验证收益，不是正式推荐",
+  "selected_sectors": ["K70房地产业", "J66货币金融服务", "C27医药制造业"],
+  "list": [
+    {
+      "rank": 1, "code": "sz.300110", "name": "华仁药业", "sector_id": "C27医药制造业",
+      "return5": -0.1974683544303798, "amount20": 296271841.06,
+      "source_daily_risk": {"date": "2026-09-30", "close": "3.1700", "preclose": "3.2100", "volume": "170389802", "tradestatus": "1", "isST": "0", "adjustflag": "3"},
+      "raw_file_sha256": "bf7ca96715b3bfef9f2fbb2f42a26f914c04a6c7b4940ce7730762993384d908"
+    },
+    {
+      "rank": 2, "code": "sh.600664", "name": "哈药股份", "sector_id": "C27医药制造业",
+      "return5": -0.18502202643171806, "amount20": 3293611175.3515,
+      "source_daily_risk": {"date": "2026-09-30", "close": "7.4000", "preclose": "7.1400", "volume": "519161997", "tradestatus": "1", "isST": "0", "adjustflag": "3"},
+      "raw_file_sha256": "b1c2cb0eb4c98fcf39a10ea71533ce9acc34713039b4d4e90fdf4edb58a3a4a3"
+    },
+    {
+      "rank": 3, "code": "sz.301201", "name": "诚达药业", "sector_id": "C27医药制造业",
+      "return5": -0.17794553788083056, "amount20": 203740830.3575,
+      "source_daily_risk": {"date": "2026-09-30", "close": "30.4900", "preclose": "29.3200", "volume": "7881833", "tradestatus": "1", "isST": "0", "adjustflag": "3"},
+      "raw_file_sha256": "5f3a69e54723b405687fbd8164e5d5e381bb94e95a63627b3e878f7a57639c49"
+    },
+    {
+      "rank": 4, "code": "sh.600246", "name": "万通发展", "sector_id": "K70房地产业",
+      "return5": -0.14071038251366108, "amount20": 1403668283.9304998,
+      "source_daily_risk": {"date": "2026-09-30", "close": "12.5800", "preclose": "13.1300", "volume": "76787520", "tradestatus": "1", "isST": "0", "adjustflag": "3"},
+      "raw_file_sha256": "691ea4abb5c3055890f948eb7710811cbf2cfe2a31240a9a2b67f7bbda23b549"
+    },
+    {
+      "rank": 5, "code": "sz.301093", "name": "华兰股份", "sector_id": "C27医药制造业",
+      "return5": -0.13725222146274796, "amount20": 385480564.092,
+      "source_daily_risk": {"date": "2026-09-30", "close": "63.1100", "preclose": "63.1100", "volume": "4782244", "tradestatus": "1", "isST": "0", "adjustflag": "3"},
+      "raw_file_sha256": "be9f7352e1e3c09b08839ad248067c448fd4156a684bccc722a34e4a35174a76"
+    }
+  ],
+  "risk_basis": "V1_research_proxy_not_independent_formal_permission",
+  "price_basis": "unadjusted_BaoStock",
+  "industry_denominator": 4605,
+  "industry_known": 4603,
+  "industry_coverage": 0.9995656894679696,
+  "unknown_stock_qualification": 217,
+  "eligible_in_selected_sectors": 212,
+  "baseline_codes": ["sh.600857", "sh.601086", "sh.603221", "sh.600487", "sh.603823"],
+  "baseline_overlap": 0,
+  "empty_slots": 0,
+  "source_hashes": {
+    "industry": "1906f0b2fb8615e5b46ccbdd7aa5caecdfd50a5fb82c396b23bf9da097410369",
+    "news": "c88fa705d01fbc4aeb5ff531418555f8a878765765b23654e6754484f7e9b60c",
+    "capture_report": "5db0e71a8b6d85c5dc97fa9357dc9847b2ef751aa84d5c0320ceae4da06de7ba"
+  },
+  "llm_input_sha256": "d538c47b686d2a690eb21469d019e57998ef42d421d165bb1d3023c912964651",
+  "llm_output_sha256": "fbe47e1c3b41d17a04b303387e23c88112b32af07d075b9ea382dc69ade95b8b",
+  "private_result_sha256": "3a1a6ced749886ba40729c2ae6ae9248f8011abe83e7d28396b8e5caa51c205f",
+  "LLM_execution": "current_Codex_chat_not_plugin_API",
+  "LLM_model_version": "unknown",
+  "prior_V1_list_already_known": true,
+  "research_budget": {"new_sector_messages": 5, "V1_messages": 4614, "cumulative_research_messages": 4619, "shared_daily_after_capture": 4619},
+  "historical_returns_recomputed": false,
+  "future_outcomes_computed": false,
+  "plugin_integrated": false,
+  "formal_permission_changed": false
+}

@@ -162,3 +162,81 @@ def test_capture_rejects_insufficient_cumulative_budget_without_import_or_send(t
         assert not (tmp_path / 'ATTEMPT_STARTED.json').exists()
     finally:
         capture.datetime = previous
+
+
+def prepared_run(tmp_path, monkeypatch, missing_labels=0):
+    count = 10
+    dates = np.array(pd_dates())
+    codes = np.array([f'sh.{600000 + index}' for index in range(count)])
+    shape = (len(dates), count)
+    market = {key: np.full(shape, 10.0) for key in ('open', 'close', 'preclose')}
+    market.update(high=np.full(shape, 10.5), low=np.full(shape, 9.5), volume=np.full(shape, 1000.0),
+                  amount=np.full(shape, 2e8), tradestatus=np.ones(shape), isST=np.zeros(shape),
+                  ordinary=np.ones(shape, dtype=bool), expected=np.ones(shape, dtype=bool),
+                  age=np.full(shape, 1000), dates=dates, codes=codes,
+                  identities=[{'code': code, 'code_name': code} for code in codes])
+    report = {'finished': '2026-10-05T20:00:00+08:00', 'run_messages': 5}
+    monkeypatch.setattr(research, 'read_capture', lambda path: (market, report))
+    source = tmp_path / 'capture'
+    source.mkdir()
+    research.write_json(source / 'capture_report.json', report)
+    payload = classification()
+    payload['rows'] = [[code, 'sector1', '证监会行业分类', '2026-09-28']
+                       for code in codes[:count - missing_labels]]
+    industry = tmp_path / 'industry.json'
+    research.write_json(industry, payload)
+    snapshot = tmp_path / 'open_1.json'
+    research.write_json(snapshot, {'sealed_at': '2026-10-05 12:00:00 UTC'})
+    articles = [news(), news('news2', 'publisher2', 'event2')]
+    for article in articles:
+        article.update(snapshot='open_1.json', snapshot_sha256=research.digest(snapshot))
+    news_path = tmp_path / 'news.json'
+    research.write_json(news_path, {'items': articles})
+    output = tmp_path / 'output'
+    current = datetime(2026, 10, 5, 21, 1, tzinfo=research.CHINA)
+    research.prepare(source, industry, news_path, output, current)
+    model_output = decision()
+    model_output['input_sha256'] = research.digest(output / 'llm_input.json')
+    decision_path = tmp_path / 'decision.json'
+    research.write_json(decision_path, model_output)
+    return source, industry, output, decision_path, market
+
+
+def pd_dates():
+    import pandas as pd
+    return pd.bdate_range(end=research.TARGET, periods=25).strftime('%Y-%m-%d').tolist()
+
+
+def test_end_to_end_selection_and_second_write_blocked(tmp_path, monkeypatch):
+    source, industry, output, decision_path, market = prepared_run(tmp_path, monkeypatch)
+    now = datetime(2026, 10, 5, 21, 6, tzinfo=research.CHINA)
+    result = research.execute(source, industry, output, decision_path, now)
+    assert result['status'] == 'flow_complete'
+    assert [row['code'] for row in result['list']] == market['codes'][:5].tolist()
+    assert result['baseline_overlap'] == 5
+    assert result['future_outcomes_computed'] is False
+    with pytest.raises(FileExistsError):
+        research.execute(source, industry, output, decision_path, now)
+
+
+def test_global_mapping_failure_keeps_unknown_denominator_and_empty_list(tmp_path, monkeypatch):
+    source, industry, output, decision_path, _ = prepared_run(tmp_path, monkeypatch, missing_labels=2)
+    result = research.execute(source, industry, output, decision_path,
+                              datetime(2026, 10, 5, 21, 6, tzinfo=research.CHINA))
+    assert result['status'] == 'incomplete' and result['industry_denominator'] == 10
+    assert len(result['industry_unknown']) == 2 and result['list'] == []
+    assert 'industry_mapping_below_90_percent' in result['failure_reasons']
+
+
+def test_future_model_output_and_changed_industry_fail_before_result(tmp_path, monkeypatch):
+    source, industry, output, decision_path, _ = prepared_run(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match='LLM_decision_from_future'):
+        research.execute(source, industry, output, decision_path,
+                         datetime(2026, 10, 5, 21, 4, tzinfo=research.CHINA))
+    assert not (output / 'result.json').exists()
+    with industry.open('ab') as stream:
+        stream.write(b' ')
+    with pytest.raises(ValueError, match='industry_input_changed'):
+        research.execute(source, industry, output, decision_path,
+                         datetime(2026, 10, 5, 21, 6, tzinfo=research.CHINA))
+    assert not (output / 'result.json').exists()

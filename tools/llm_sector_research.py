@@ -205,8 +205,8 @@ def prepare(capture, industry_path, news_path, output, current_time=None):
     if current > CUTOFF:
         raise ValueError('cutoff_passed_do_not_prepare')
     market, report = read_capture(capture)
-    if aware(report['finished']) > CUTOFF:
-        raise ValueError('price_capture_received_after_cutoff')
+    if aware(report['finished']) > min(CUTOFF, current):
+        raise ValueError('price_capture_received_after_prepare_or_cutoff')
     industry = json.loads(Path(industry_path).read_text(encoding='utf-8'))
     if aware(industry['received_at']) > current:
         raise ValueError('classification_received_after_prepare')
