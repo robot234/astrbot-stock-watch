@@ -164,7 +164,7 @@ def features(market):
     valid_ratio = ohlc & (preclose > 0) & (market['tradestatus'] == 1) & (market['volume'] > 0)
     ratio = np.where(valid_ratio, market['close'] / np.where(preclose > 0, preclose, np.nan), np.nan)
     score = pd.DataFrame(ratio).rolling(5, min_periods=5).apply(np.prod, raw=True).to_numpy() - 1
-    amounts = np.where(market['amount'] > 0, market['amount'], np.nan)
+    amounts = np.where(market['amount'] >= 0, market['amount'], np.nan)
     amount20 = pd.DataFrame(amounts).rolling(20, min_periods=20).mean().to_numpy()
     known = state_known & ohlc & (preclose > 0) & np.isfinite(score) & np.isfinite(amount20) & market['ordinary']
     eligible = (known & market['expected'] & regular & (amount20 >= 1e8)
@@ -194,6 +194,9 @@ def ticket(market, derived, signal, column, horizon, budget, pressure=False):
               'entry_date': str(market['dates'][entry]), 'exit_date': str(market['dates'][exit_index]),
               'status': 'unknown_entry', 'net_return': None, 'shares': None,
               'spent': None, 'received': None, 'pnl': None}
+    if market['tradestatus'][entry, column] == 0:
+        result['status'] = 'entry_unfilled_suspended'
+        return result
     if not quote(market, derived, entry, column):
         return result
     if cents(market['open'][entry, column]) >= cents(derived['upper'][entry, column]):

@@ -54,6 +54,17 @@ def test_invalid_state_codes_are_unknown_not_known_exclusions():
     assert not derived['eligible'][30, 0]
 
 
+def test_real_zero_turnover_is_not_missing_or_guessed_zero():
+    data = market()
+    data['amount'][25, 0] = 0
+    data['amount'][25, 1] = np.nan
+    derived = research.features(data)
+    assert derived['amount20'][30, 0] == 1.9e8
+    assert derived['eligible'][30, 0]
+    assert np.isnan(derived['amount20'][30, 1])
+    assert not derived['known'][30, 1]
+
+
 def test_continuous_ratio_split_does_not_create_fake_loss():
     data = market()
     original = research.features(data)
@@ -98,6 +109,17 @@ def test_limit_entry_cash_known_exit_unknown():
     data['low'][27, 0] = 9
     derived = research.features(data)
     assert research.ticket(data, derived, 25, 0, 1, 10000)['status'] == 'unknown_exit_limit'
+
+
+def test_explicit_suspension_is_known_unfilled_not_unknown_cash():
+    data = market()
+    data['tradestatus'][26, 0] = 0
+    data['volume'][26, 0] = 0
+    data['amount'][26, 0] = 0
+    trade = research.ticket(data, research.features(data), 25, 0, 1, 10000)
+    assert trade['status'] == 'entry_unfilled_suspended'
+    assert trade['net_return'] is None
+    assert trade['spent'] is None
 
 
 def test_actual_nav_becomes_unknown_at_event_not_in_advance():
