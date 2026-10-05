@@ -7,7 +7,6 @@ from decimal import Decimal, ROUND_HALF_UP
 import gzip
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -391,13 +390,32 @@ def exact_neighbors(distances, query, training, dictionary_indices):
         size = min(len(distances), size * 2)
 
 
+def certified_neighbors(approximate_distances, candidates, query, training, dictionary_indices):
+    direct = np.mean((training[candidates] - query) ** 2, axis=1)
+    chosen = choose_spaced(candidates[np.lexsort((candidates, direct))], dictionary_indices)
+    if len(chosen) == 50:
+        selected_distances = np.mean((training[chosen] - query) ** 2, axis=1)
+        radius = float(selected_distances[-1] * 60)
+        query_norm = float(np.linalg.norm(query))
+        unit = np.finfo(np.float32).eps
+        cast_error = unit * (2 * query_norm + np.sqrt(radius))
+        gamma = 256 * unit / (1 - 256 * unit)
+        error = (gamma * (2 * query_norm + np.sqrt(radius) + cast_error) ** 2
+                 + 2 * np.sqrt(radius) * cast_error + cast_error ** 2 + 1e-8)
+        if float(approximate_distances[-1]) > radius + error:
+            return chosen, selected_distances, False
+    distances = np.mean((training - query) ** 2, axis=1)
+    chosen = choose_spaced(np.lexsort((np.arange(len(distances)), distances)), dictionary_indices)
+    return chosen, distances[chosen], True
+
+
 def score_known(values, neighbors):
     known = np.isfinite(values[neighbors])
     return (float(np.mean(values[neighbors][known])) if known.sum() >= 45 else None,
             int((~known).sum()))
 
 
-def prepare(out):
+def prepare(out, cache=None):
     out.mkdir(parents=True, exist_ok=False)
     write_json(out / 'rules.json', RULE)
     write_json(out / 'registration.json', {
@@ -408,8 +426,26 @@ def prepare(out):
         'approval': RULE['approval'], 'outcome_values_computed': False,
     })
     append_event(out, {'event': 'prepare_start', 'outcome_values_computed': False})
-    market = read_market()
-    derived = continuous_features(market)
+    if cache is None:
+        market = read_market()
+        derived = continuous_features(market)
+    else:
+        old_rule = json.loads((cache / 'rules.json').read_text(encoding='utf-8'))
+        old_registration = json.loads((cache / 'registration.json').read_text(encoding='utf-8'))
+        if old_rule != RULE or old_registration['outcome_values_computed']:
+            raise ValueError('cached rules/state mismatch')
+        for filename, expected_hash in SOURCE_HASHES.items():
+            if digest(SOURCE / filename) != expected_hash:
+                raise ValueError('source changed during matcher recovery')
+        cached_names = ['market.npz', 'derived.npz', 'indices.npz', 'training.npy', 'query.npy']
+        hashes = {name: digest(cache / name) for name in cached_names}
+        write_json(out / 'cache_recovery.json', {'time': now(), 'origin': str(cache),
+                                               'origin_registration_sha256': digest(cache / 'registration.json'),
+                                               'cached_files': hashes, 'outcomes_computed': False})
+        with np.load(cache / 'market.npz', allow_pickle=False) as data:
+            market = {name: data[name] for name in data.files}
+        with np.load(cache / 'derived.npz', allow_pickle=False) as data:
+            derived = {name: data[name] for name in data.files}
     dates = market['dates']
     training_days = (dates >= RULE['dictionary'][0]) & (dates <= RULE['dictionary'][1])
     query_days = (dates >= RULE['signals'][0]) & (dates <= RULE['signals'][1])
@@ -418,11 +454,19 @@ def prepare(out):
     query_indices = np.argwhere(eligible & query_days[:, None])
     if len(dictionary_indices) < 50 or not len(query_indices):
         raise ValueError('insufficient training/query features')
-    training = make_vectors(derived, dictionary_indices)
-    query = make_vectors(derived, query_indices)
-    training, query, mean, std = standardize(training, query)
-    structures = np.array([label_structure(market, derived, int(row), int(column))
-                           for row, column in dictionary_indices], dtype=np.int32)
+    if cache is None:
+        training = make_vectors(derived, dictionary_indices)
+        query = make_vectors(derived, query_indices)
+        training, query, mean, std = standardize(training, query)
+        structures = np.array([label_structure(market, derived, int(row), int(column))
+                               for row, column in dictionary_indices], dtype=np.int32)
+    else:
+        training = np.load(cache / 'training.npy')
+        query = np.load(cache / 'query.npy')
+        with np.load(cache / 'indices.npz', allow_pickle=False) as data:
+            if not np.array_equal(data['dictionary'], dictionary_indices) or not np.array_equal(data['query'], query_indices):
+                raise ValueError('cache index mismatch')
+            structures, mean, std = data['structures'], data['mean'], data['std']
     known = np.isin(structures[:, 0], [ENTRY_FAIL, MATURED])
     print(json.dumps({'stage': 'features_ready', 'dictionary': len(training), 'queries': len(query),
                       'outcome_values_computed': False}), flush=True)
@@ -436,40 +480,39 @@ def prepare(out):
                                         shape=(len(query), 50))
     distance_summary = np.empty((len(query), 2))
     counts = np.zeros(len(query), dtype=np.int8)
-    norms = np.sum(training * training, axis=1)
     started = time.monotonic()
-    try:
-        from threadpoolctl import threadpool_limits
-        context = threadpool_limits(limits=8)
-    except ImportError:
-        from contextlib import nullcontext
-        context = nullcontext()
-    with context:
-        for start in range(0, len(query), 128):
-            batch = query[start:start + 128]
-            distances = (np.sum(batch * batch, axis=1)[:, None] + norms[None, :]
-                         - 2 * (batch @ training.T)) / 60
-            for offset, vector in enumerate(batch):
-                chosen, direct = exact_neighbors(distances[offset], vector, training, dictionary_indices)
-                if len(chosen) != 50:
-                    raise ValueError('fewer than fifty spaced neighbors')
-                position = start + offset
-                neighbors[position] = chosen
-                counts[position] = known[chosen].sum()
-                distance_summary[position] = direct.mean(), direct.max()
-            if start % 4096 == 0:
-                neighbors.flush()
-                progress = {'stage': 'neighbors', 'done': min(start + 128, len(query)),
-                            'total': len(query), 'seconds': round(time.monotonic() - started, 1),
-                            'outcome_values_computed': False}
-                print(json.dumps(progress), flush=True)
-                append_event(out, progress)
+    import faiss
+    faiss.omp_set_num_threads(12)
+    matcher = faiss.IndexFlatL2(60)
+    matcher.add(training.astype(np.float32))
+    fallbacks = 0
+    for start in range(0, len(query), 1024):
+        batch = query[start:start + 1024]
+        approximate, candidates = matcher.search(batch.astype(np.float32), 256)
+        for offset, vector in enumerate(batch):
+            chosen, direct, fallback = certified_neighbors(approximate[offset], candidates[offset], vector, training, dictionary_indices)
+            fallbacks += int(fallback)
+            if len(chosen) != 50:
+                raise ValueError('fewer than fifty spaced neighbors')
+            position = start + offset
+            neighbors[position] = chosen
+            counts[position] = known[chosen].sum()
+            distance_summary[position] = direct.mean(), direct.max()
+        if start % 16384 == 0:
+            neighbors.flush()
+            progress = {'stage': 'neighbors', 'done': min(start + len(batch), len(query)),
+                        'total': len(query), 'seconds': round(time.monotonic() - started, 1),
+                        'outcome_values_computed': False, 'exact_float64_fallbacks': fallbacks}
+            print(json.dumps(progress), flush=True)
+            append_event(out, progress)
     neighbors.flush()
     np.save(out / 'known_counts.npy', counts)
     np.save(out / 'distances.npy', distance_summary)
     report = {'time': now(), 'version': RULE['version'], 'outcome_values_computed': False,
               'dictionary_statuses': dict(Counter(map(int, structures[:, 0]))),
-              'source_files_verified': 4650, 'training_vectors': len(training), 'years': {}}
+              'source_files_verified': 4650, 'training_vectors': len(training), 'years': {},
+              'matcher': 'flat_float32_seed_certified_float64_order_or_exhaustive_fallback',
+              'exact_float64_fallbacks': fallbacks}
     action_recent = pd.DataFrame(derived['action']).rolling(40, min_periods=1).max().to_numpy() > 0
     for year in ('2021', '2022', '2023'):
         stage_days = training_days if year == '2021' else query_days
@@ -783,11 +826,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('stage', choices=['prepare', 'evaluate'])
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--cache', type=Path)
     args = parser.parse_args()
     if not args.out.resolve().is_relative_to((ROOT / '.local_records').resolve()):
         raise ValueError('research output must stay in local records')
     if args.stage == 'prepare':
-        prepare(args.out)
+        prepare(args.out, args.cache)
     else:
         evaluate(args.out)
 

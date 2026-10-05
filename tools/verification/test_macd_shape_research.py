@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 SPEC = importlib.util.spec_from_file_location('macd_shape_research', Path(__file__).resolve().parents[1] / 'macd_shape_research.py')
 research = importlib.util.module_from_spec(SPEC)
@@ -150,3 +151,41 @@ def test_account_action_does_not_fabricate_cash_or_shares(monkeypatch):
     assert result['summary']['end_value'] is None
     assert result['summary']['completed_trades'] == 0
     assert result['sleeves'][0]['holding']['shares'] > 0
+
+
+def test_certified_matcher_falls_back_when_boundary_unproved():
+    training = np.zeros((100, 60))
+    indices = np.column_stack([np.zeros(100, dtype=int), np.arange(100)])
+    candidates = np.arange(50, 100)
+    chosen, distances, fallback = research.certified_neighbors(np.zeros(50), candidates, np.zeros(60), training, indices)
+    assert fallback
+    np.testing.assert_array_equal(chosen, np.arange(50))
+    np.testing.assert_array_equal(distances, np.zeros(50))
+
+
+def test_certified_matcher_proves_omitted_candidates_outside_radius():
+    training = np.repeat(np.arange(400)[:, None], 60, axis=1).astype(float)
+    indices = np.column_stack([np.zeros(400, dtype=int), np.arange(400)])
+    candidates = np.arange(256)
+    chosen, distances, fallback = research.certified_neighbors(np.sum(training[candidates] ** 2, axis=1), candidates,
+                                                              np.zeros(60), training, indices)
+    assert not fallback
+    np.testing.assert_array_equal(chosen, np.arange(50))
+    np.testing.assert_allclose(distances, np.arange(50) ** 2, atol=1e-10)
+
+
+def test_faiss_certification_matches_exhaustive_float64():
+    faiss = pytest.importorskip('faiss')
+    generator = np.random.default_rng(20261005)
+    training = generator.normal(size=(4000, 60))
+    query = generator.normal(size=(10, 60))
+    identities = np.column_stack([np.arange(4000), np.arange(4000) % 500])
+    matcher = faiss.IndexFlatL2(60)
+    matcher.add(training.astype(np.float32))
+    approximate, candidates = matcher.search(query.astype(np.float32), 256)
+    for position, vector in enumerate(query):
+        chosen, distances, _ = research.certified_neighbors(approximate[position], candidates[position], vector, training, identities)
+        direct = np.mean((training - vector) ** 2, axis=1)
+        reference = research.choose_spaced(np.lexsort((np.arange(len(direct)), direct)), identities)
+        np.testing.assert_array_equal(chosen, reference)
+        np.testing.assert_allclose(distances, direct[chosen], atol=1e-10)
