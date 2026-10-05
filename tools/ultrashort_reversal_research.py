@@ -84,8 +84,6 @@ def read_market(source, kind):
         age[:, column] = (dates_array - np.datetime64(identity['ipoDate'])).astype(int)
         if identity['outDate']:
             expected[:, column] &= dates_array < np.datetime64(identity['outDate'])
-            exit_index = np.searchsorted(dates, identity['outDate'])
-            ordinary[max(0, exit_index - 30):, column] = False
     manifest = []
     observed = set()
 
@@ -158,8 +156,9 @@ def features(market):
             & (market['low'] > 0) & (market['high'] >= market['low'])
             & (market['open'] >= market['low']) & (market['open'] <= market['high'])
             & (market['close'] >= market['low']) & (market['close'] <= market['high']))
-    state_known = (np.isfinite(market['isST']) & np.isfinite(market['tradestatus'])
-                   & np.isfinite(market['volume']) & (market['volume'] >= 0))
+    state_known = (np.isin(market['isST'], (0, 1)) & np.isin(market['tradestatus'], (0, 1))
+                   & np.isfinite(market['volume']) & (market['volume'] >= 0)
+                   & ((market['tradestatus'] == 0) | (market['volume'] > 0)))
     regular = (market['ordinary'] & (market['age'] >= 120) & (preclose > 0)
                & (market['isST'] == 0) & (market['tradestatus'] == 1) & (market['volume'] > 0))
     valid_ratio = ohlc & (preclose > 0) & (market['tradestatus'] == 1) & (market['volume'] > 0)
@@ -401,6 +400,9 @@ def run(kind, source, output, index_path=None):
     marker = output / 'ONCE_STARTED.json'
     write_json(marker, {'rule': RULE, 'registration_commit': REGISTRATION, 'kind': kind,
                         'started': stamp(), 'tool_sha256': digest(__file__)})
+    completed_test = ROOT / '.local_records/ultrashort_20261005/test/report.json'
+    if kind == 'test' and completed_test.exists():
+        raise RuntimeError('registered_half_blind_already_completed_no_new_output_rerun')
     market, manifest = read_market(source, kind)
     if kind == 'design':
         np.savez_compressed(output / 'warmup_raw.npz', **{name: market[name][-20:] for name in FIELDS},

@@ -46,9 +46,8 @@ def read_capture(source):
     for column, identity in enumerate(identities):
         expected[:, column] = dates_array >= np.datetime64(identity['ipoDate'])
         age[:, column] = (dates_array - np.datetime64(identity['ipoDate'])).astype(int)
-        if identity['outDate']:
-            exit_index = np.searchsorted(dates, identity['outDate'])
-            ordinary[max(0, exit_index - 30):, column] = False
+        if '退' in identity.get('code_name', '') or 'ST' in identity.get('code_name', '').upper():
+            ordinary[:, column] = False
         item = manifest.get(identity['code'])
         if item is None:
             continue
@@ -112,7 +111,11 @@ def freeze(source, report_path, output, current_time=None):
               'source_capture_report_sha256': digest(Path(source) / 'capture_report.json'),
               'basic_sha256': digest(Path(source) / 'basic.json'), 'calendar_sha256': digest(Path(source) / 'calendar.json'),
               'test_report_sha256': digest(report_path), 'source_manifest_sha256': digest(Path(report_path).parent / 'source_manifest.json'),
+              'historical_evaluation_status': 'incomplete_account_and_noncausal_random_pool_not_passed_no_return_retest',
+              'implementation_revision': 'point_in_time_delisting_fix_after_historical_run_no_return_retest',
               'research_messages': capture['run_messages'], 'not_formal_recommendation': True,
+              'hash_kind': 'SDK_original_string_table_serialization_gzip_bytes_not_raw_TCP',
+              'price_basis': 'unadjusted',
               'not_qq_push': True, 'opening_not_seen': True,
               'next_observation': '2026-10-08 original 18:00 BaoStock archive; missing means unknown; no refetch'}
     write_json(output, frozen)

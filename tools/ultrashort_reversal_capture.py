@@ -54,9 +54,9 @@ def universe(payload, target):
     return codes
 
 
-def capture(output, target='2026-09-30', max_calls=10000):
+def capture(output, target='2026-09-30', max_calls=10000, operator_start_now=False):
     local = datetime.now(CHINA)
-    if '16:10' <= local.strftime('%H:%M') <= '20:30':
+    if '16:10' <= local.strftime('%H:%M') <= '20:30' and not operator_start_now:
         raise RuntimeError('legacy_capture_window_do_not_start')
     if max_calls > 15000 or max_calls < 3:
         raise ValueError('research message budget must be 3..15000')
@@ -71,7 +71,8 @@ def capture(output, target='2026-09-30', max_calls=10000):
     report = {'source': 'BaoStock guarded unadjusted daily', 'started': now(), 'target': target,
               'max_run_messages': max_calls, 'soft_daily': 35000, 'hard_daily': 40000,
               'run_messages': 0, 'captured_codes': 0, 'failed_codes': [], 'status': 'partial',
-              'raw_manifest': [], 'retries': 0, 'process_pid': os.getpid()}
+              'raw_manifest': [], 'retries': 0, 'process_pid': os.getpid(),
+              'operator_start_now': operator_start_now}
     guard = None
 
     def started():
@@ -151,8 +152,9 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--target', default='2026-09-30')
     parser.add_argument('--max-calls', type=int, default=10000)
+    parser.add_argument('--operator-start-now', action='store_true')
     args = parser.parse_args()
-    capture(args.output, args.target, args.max_calls)
+    capture(args.output, args.target, args.max_calls, args.operator_start_now)
 
 
 if __name__ == '__main__':

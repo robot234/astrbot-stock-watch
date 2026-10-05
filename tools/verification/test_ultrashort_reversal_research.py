@@ -40,7 +40,18 @@ def test_qualification_unknown_not_false_and_no_fill():
     data['age'][30, 4] = 119
     derived = research.features(data)
     assert not derived['known'][30, 0]
+    assert not derived['known'][30, 2]
     assert research.selection(data, derived, 30) == [5]
+
+
+def test_invalid_state_codes_are_unknown_not_known_exclusions():
+    data = market()
+    data['isST'][30, 0] = -1
+    data['tradestatus'][30, 1] = 2
+    derived = research.features(data)
+    assert not derived['known'][30, 0]
+    assert not derived['known'][30, 1]
+    assert not derived['eligible'][30, 0]
 
 
 def test_continuous_ratio_split_does_not_create_fake_loss():
@@ -106,6 +117,15 @@ def test_one_shot_marker_refuses_rerun(tmp_path):
     research.write_json(tmp_path / 'ONCE_STARTED.json', {'started': 'test'})
     with pytest.raises(FileExistsError):
         research.run('test', tmp_path, tmp_path)
+
+
+def test_new_output_directory_cannot_repeat_completed_half_blind(tmp_path, monkeypatch):
+    monkeypatch.setattr(research, 'ROOT', tmp_path)
+    report = tmp_path / '.local_records/ultrashort_20261005/test/report.json'
+    report.parent.mkdir(parents=True)
+    research.write_json(report, {'already': 'completed'})
+    with pytest.raises(RuntimeError, match='already_completed'):
+        research.run('test', tmp_path, tmp_path / 'another_output')
 
 
 def test_random_seed_reproducibility_and_two_versions_only():

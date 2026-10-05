@@ -43,6 +43,9 @@ def test_archive_window_stops_before_transport(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match='legacy_capture_window'):
         capture.capture(tmp_path)
     assert not (tmp_path / 'ATTEMPT_STARTED.json').exists()
+    with pytest.raises(ValueError, match='budget'):
+        capture.capture(tmp_path, max_calls=15001, operator_start_now=True)
+    assert not (tmp_path / 'ATTEMPT_STARTED.json').exists()
 
 
 def test_immutable_raw_hash(tmp_path):
@@ -69,7 +72,7 @@ def test_current_freeze_uses_true_asof_keeps_st_in_denominator(tmp_path):
     codes = ['sh.600000', 'sz.300001']
     dates = [f'2026-09-{number:02d}' for number in range(1, 31)]
     basic = {'status': 'observed', 'fields': ['code', 'code_name', 'type', 'status', 'ipoDate', 'outDate'],
-             'rows': [[code, 'sample', '1', '1', '1999-01-01', ''] for code in codes]}
+             'rows': [[code, 'sample', '1', '1', '1999-01-01', '2026-11-01'] for code in codes]}
     capture.save(tmp_path / 'basic.json', basic)
     capture.save(tmp_path / 'calendar.json', {'status': 'observed', 'rows': [[date, '1'] for date in dates]})
     manifest = []
