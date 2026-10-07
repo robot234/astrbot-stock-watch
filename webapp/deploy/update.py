@@ -32,11 +32,11 @@ STAGING_PORT = 18767
 
 
 def server_arguments(unit_text):
-    """--host/--port/--database/--artifact (and --signals when wired) from the installed unit's ExecStart."""
+    """--host/--port/--database/--artifact (and --signals / --watch-inbox when wired) from the installed unit's ExecStart."""
     line = next((item for item in unit_text.splitlines() if item.startswith("ExecStart=")), "")
     parts = shlex.split(line.split("=", 1)[1]) if line else []
     return {part[2:]: parts[index + 1] for index, part in enumerate(parts[:-1])
-            if part in ("--host", "--port", "--database", "--artifact", "--signals")}
+            if part in ("--host", "--port", "--database", "--artifact", "--signals", "--watch-inbox")}
 
 
 def failures(report, revision=None):
@@ -154,7 +154,8 @@ def main():
         staging = subprocess.Popen(["runuser", "-u", "pi", "--", "/usr/bin/python3", "-B", "-m", "webapp.server",
                                     "--host", "127.0.0.1", "--port", str(STAGING_PORT), "--database", arguments["database"],
                                     "--artifact", arguments["artifact"],
-                                    *(["--signals", arguments["signals"]] if arguments.get("signals") else [])],
+                                    *(["--signals", arguments["signals"]] if arguments.get("signals") else []),
+                                    *(["--watch-inbox", arguments["watch-inbox"]] if arguments.get("watch-inbox") else [])],
                                    cwd=str(new_web), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             time.sleep(3)

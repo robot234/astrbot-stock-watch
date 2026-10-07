@@ -31,6 +31,7 @@ def main():
     service = payload.get("webapp/deploy/stock-watch-web.service", b"")
     assert b"--artifact /home/pi/astrbot/data/plugin_data/astrbot_stock_watch/intraday_quotes.json" in service, "artifact_wiring_missing"
     assert b"--signals /home/pi/apps/stock-watch-web/state/research_signals.json" in service, "signals_wiring_missing"
+    assert b"--watch-inbox /home/pi/astrbot/data/plugin_data/astrbot_stock_watch/web_watch_inbox" in service, "watch_inbox_wiring_missing"
     web = Path("/home/pi/apps/stock-watch-web")
     helper = Path("/opt/stock-watch-web-snapshot")
     state = Path("/var/lib/stock-watch-web-snapshot")

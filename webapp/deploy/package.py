@@ -11,7 +11,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
 FILES = (
-    "webapp/__init__.py", "webapp/server.py", "webapp/data.py", "webapp/research_signals.py",
+    "webapp/__init__.py", "webapp/server.py", "webapp/data.py", "webapp/research_signals.py", "webapp/watch_inbox.py",
     "data_evidence.py", "paper_forward.py", "paper_review.py", "_conf_schema.json",
     "docs/research/ULTRASHORT_REVERSAL_V1_FROZEN.json", "docs/research/LLM_SECTOR_FIRST_EXP_V0_FROZEN.json",
     "webapp/deploy/snapshot.py", "webapp/deploy/stock-watch-web.service",
