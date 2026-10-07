@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Stock Watch research signals each evening after the close data reaches the snapshot
+
+[Timer]
+OnCalendar=*-*-* 18:40:00
+OnCalendar=*-*-* 21:40:00
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

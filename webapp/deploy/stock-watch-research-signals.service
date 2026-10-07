@@ -1,0 +1,15 @@
+[Unit]
+Description=Stock Watch evening research signals (display-only overheat label and index trend)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/apps/stock-watch-web/current
+ExecStart=/home/pi/apps/stock-watch-data-probe/.venv/bin/python -B -m webapp.research_signals --database /var/lib/stock-watch-web-snapshot/stock_watch.sqlite3 --output /home/pi/apps/stock-watch-web/state/research_signals.json
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONNOUSERSITE=1
+TimeoutStartSec=900
+Nice=10
+UMask=0077
+NoNewPrivileges=yes

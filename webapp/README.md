@@ -132,6 +132,34 @@ snapshot helper, runs one snapshot check and writes
 arguments are read from the installed user unit. The snapshot helper removes
 staging files left by killed runs before each check and cleans up on SIGTERM.
 
+## Evening Research Signals
+
+`webapp/research_signals.py` is a separate evening job, not a Web route. It
+reads the published snapshot and writes `research_signals.json`, which the
+server reads through `--signals` (`/api/research_signals`, optionally `?code=`):
+
+- **Overheat label (scheme F)**: the COOL8 composite's top decile inside the
+  round-1 research pool on the latest active-raw session. Turnover ratios use
+  volume ratios and ST comes from the current `stock_symbols` name; both
+  approximations are listed in the file and on the stock page.
+- **Index trend (scheme D)**: CSI 500 / CSI 1000 close against the 200-session
+  mean (120 shown as a diagnostic) from AKShare's Sina index series.
+
+Both are display-only: no formal gate, candidate, recommendation or plugin
+setting changes. Each new trade date is appended once to
+`research_overheat_forward.jsonl` and `research_index_trend_forward.jsonl`
+next to the output; those files are never rewritten. Evidence and forward-check
+rules: `docs/research/NEW_SCHEMES_RESULTS_20261007.md`.
+
+On the Pi the job runs as `pi` with the data-probe venv (numpy, pandas,
+akshare) from `deploy/stock-watch-research-signals.service`, triggered by the
+matching user timer at 18:40 and 21:40. Install or refresh the user units:
+
+```powershell
+scp webapp/deploy/stock-watch-research-signals.* pi@192.168.124.6:/home/pi/.config/systemd/user/
+ssh pi@192.168.124.6 "systemctl --user daemon-reload && systemctl --user enable --now stock-watch-research-signals.timer"
+```
+
 ## Explicit Existing Database
 
 Pass an already authorized, consistent **local** SQLite snapshot explicitly:

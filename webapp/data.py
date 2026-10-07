@@ -38,8 +38,17 @@ CAPABILITIES = (
     "overview", "signals", "candidates", "research_pools", "research_parameters", "stock_detail",
     "stock_active_raw_bars", "stock_search", "performance", "health", "provider_state_v2",
     "session_calendar", "coverage_breakdown", "settings", "intraday", "revision",
-    "snapshot_check_status", "version", "research_catalog",
+    "snapshot_check_status", "version", "research_catalog", "research_signals",
 )
+# Written by webapp/research_signals.py each evening; kept as a literal so the server never imports numpy or pandas.
+SIGNALS_SCHEMA = "stock_watch_research_signals/v1"
+SIGNALS_MAX_AGE_SECONDS = 3 * 86400
+SIGNALS_MAX_BYTES = 8 * 1024 * 1024
+SIGNAL_FACTORS = ("R20", "C_MA20", "IVOL20", "VOLR5_60", "MAX20", "TURN5_20", "ABTURN", "RSI14")
+SIGNAL_EXCLUSIONS = frozenset({"not_main_or_chinext", "st_name", "no_bar_today", "history_lt_60",
+                               "corporate_action_60d", "price_above_50", "amount_below_20m", "indicator_missing"})
+SIGNAL_APPROXIMATIONS = frozenset({"turnover_ratio_from_volume", "st_from_current_name"})
+SIGNAL_INDICES = ("000905", "000852")
 # Offline research freezes shown read-only; stages are curated from each study's own delivery documents.
 RESEARCH_CATALOG = (
     {"file": "ULTRASHORT_REVERSAL_V1_FROZEN.json", "stages": ("not_passed", "forward_pending"),
@@ -178,6 +187,31 @@ def safe_text(value, limit=120):
 
 def sha256_text(value):
     return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+def flag(value):
+    return value if isinstance(value, bool) else None
+
+
+def signal_stock(code, overheat):
+    """One code's overheat entry, or why it was outside the research pool on that session."""
+    entry = obj(obj(overheat.get("stocks")).get(code))
+    if entry:
+        indicators = obj(entry.get("indicators"))
+        return {"code": code, "status": "evaluated", "hot": entry.get("hot") is True, "score": number(entry.get("score")),
+                "pct": number(entry.get("pct")), "reason": None,
+                "indicators": {key: number(indicators.get(key)) for key in SIGNAL_FACTORS}}
+    reason = obj(overheat.get("excluded")).get(code)
+    return {"code": code, "status": "excluded" if reason in SIGNAL_EXCLUSIONS else "not_evaluated", "hot": False,
+            "score": None, "pct": None, "reason": reason if reason in SIGNAL_EXCLUSIONS else None, "indicators": {}}
+
+
+def signal_index(item):
+    item = obj(item)
+    values = {key: number(item.get(key)) for key in ("close", "ma200", "distance_ma200", "ma120", "distance_ma120",
+                                                     "sessions_on_side")}
+    return {"name": safe_text(item.get("name"), 20) or None, "date": safe_text(item.get("date"), 10) or None, **values,
+            "above_ma200": flag(item.get("above_ma200")), "above_ma120": flag(item.get("above_ma120"))}
 
 
 def catalog_entry(directory, spec):
@@ -1301,9 +1335,12 @@ class Snapshot:
         return sources
 
 class Dashboard:
-    def __init__(self, database: Path, *, origin="", settings=None, artifact_path=None, snapshot_status_path=None, now=None):
+    def __init__(self, database: Path, *, origin="", settings=None, artifact_path=None, snapshot_status_path=None,
+                 signals_path=None, now=None):
         self.database = Path(database).absolute()
         self.origin, self.settings = origin, settings
+        self.signals_path = Path(signals_path).absolute() if signals_path else None
+        self._signals_cache = (None, None)
         self.artifact_configured = artifact_path is not None
         self.artifact_path = Path(artifact_path).absolute() if artifact_path else self.database.with_name("intraday_quotes.json")
         self.snapshot_status_path = (Path(snapshot_status_path).absolute() if snapshot_status_path
@@ -1323,6 +1360,66 @@ class Dashboard:
                 unavailable.append({"file": spec["file"], "reason": "frozen_file_unreadable"})
         return {"entries": entries, "unavailable": unavailable, "stage_vocabulary": list(RESEARCH_STAGES),
                 "formal_tables_written": False}
+
+    def _signals_file(self):
+        stat = self.signals_path.stat()
+        if stat.st_size > SIGNALS_MAX_BYTES:
+            raise ValueError("signals_file_too_large")
+        key = (stat.st_mtime_ns, stat.st_size)
+        if self._signals_cache[0] != key:
+            self._signals_cache = (key, json.loads(self.signals_path.read_text(encoding="utf-8")))
+        return self._signals_cache[1]
+
+    def research_signals(self, code=None):
+        """Evening research job output (scheme F overheat label, scheme D index trend); display only."""
+        empty = {"status": "not_configured", "generated_at": None, "age_seconds": None, "inputs": None,
+                 "overheat": None, "index_trend": None, "stock": None, "display_only": True}
+        if self.signals_path is None:
+            return empty
+        try:
+            data = self._signals_file()
+        except FileNotFoundError:
+            return {**empty, "status": "missing"}
+        except (OSError, UnicodeError, ValueError):
+            return {**empty, "status": "unreadable"}
+        if not isinstance(data, dict) or data.get("schema") != SIGNALS_SCHEMA:
+            return {**empty, "status": "invalid"}
+        generated = instant(data.get("generated_at"))
+        age = (self.clock() - generated).total_seconds() if generated else None
+        hot = obj(data.get("overheat"))
+        hot_items = []
+        for item in arr(hot.get("hot"))[:2000]:
+            item = obj(item)
+            item_code = safe_text(item.get("code"), 6)
+            if re.fullmatch(r"\d{6}", item_code):
+                hot_items.append({"code": item_code, "name": safe_text(item.get("name"), 40) or None,
+                                  "score": number(item.get("score")), "pct": number(item.get("pct"))})
+        overheat = {"status": safe_text(hot.get("status"), 20) or "unknown",
+                    "reason": "pool_lt_30" if hot.get("reason") == "pool_lt_30" else
+                              "history_lt_60" if hot.get("reason") == "history_lt_60" else
+                              "job_error" if hot.get("reason") else None,
+                    "rule": safe_text(hot.get("rule"), 20) or None, "trade_date": safe_text(hot.get("trade_date"), 10) or None,
+                    "pool_size": number(hot.get("pool_size")), "evaluated": number(hot.get("evaluated")),
+                    "quantile": number(hot.get("quantile")), "threshold": number(hot.get("threshold")),
+                    "hot_count": len(hot_items), "hot": hot_items,
+                    "approximations": [a for a in arr(hot.get("approximations")) if a in SIGNAL_APPROXIMATIONS],
+                    "excluded_counts": {key: number(value) for key, value in obj(hot.get("excluded_counts")).items()
+                                        if key in SIGNAL_EXCLUSIONS}}
+        trend = obj(data.get("index_trend"))
+        index_trend = {"status": safe_text(trend.get("status"), 20) or "unknown", "rule": safe_text(trend.get("rule"), 20) or None,
+                       "source": safe_text(trend.get("source"), 80) or None,
+                       "indices": {code_: signal_index(item) for code_, item in obj(trend.get("indices")).items()
+                                   if code_ in SIGNAL_INDICES},
+                       "failed": sorted(code_ for code_ in obj(trend.get("errors")) if code_ in SIGNAL_INDICES)}
+        inputs = obj(data.get("inputs"))
+        return {"status": "available" if age is not None and 0 <= age <= SIGNALS_MAX_AGE_SECONDS else "stale",
+                "generated_at": generated.isoformat() if generated else None,
+                "age_seconds": int(age) if age is not None and age >= 0 else None,
+                "inputs": {"trade_date": safe_text(inputs.get("trade_date"), 10) or None,
+                           "generation": number(inputs.get("generation")), "sessions": number(inputs.get("sessions")),
+                           "snapshot_revision": safe_text(inputs.get("snapshot_revision"), 16) or None},
+                "overheat": overheat, "index_trend": index_trend,
+                "stock": signal_stock(code, hot) if code else None, "display_only": True}
 
     def snapshot_check(self):
         """The refresh timer's last check; it can be recent while an unchanged copy stays old."""
@@ -1550,6 +1647,18 @@ class Dashboard:
                              "dataset_kind": "research_files", "database": self.database.name, "at": self.clock().isoformat(),
                              "sources": [{"dataset": "research_catalog", "status": "frozen_files", "count": len(data["entries"])}],
                              "notices": [item["file"] + ":" + item["reason"] for item in data["unavailable"]]},
+                    "data": data}
+        if route == "research_signals":
+            code = params.get("code")
+            if code is not None and not re.fullmatch(r"\d{6}", str(code)):
+                return {"meta": {"status": "unavailable", "reason": "invalid_stock_code", "read_only": True,
+                                 "dataset_kind": "research_job_file", "at": self.clock().isoformat()}, "data": None}
+            data = self.research_signals(code)
+            return {"meta": {"status": "available" if data["status"] == "available" else "partial", "read_only": True,
+                             "dataset_kind": "research_job_file", "database": self.database.name, "at": self.clock().isoformat(),
+                             "sources": [{"dataset": "research_signals", "status": data["status"],
+                                          "count": (data["overheat"] or {}).get("hot_count", 0)}],
+                             "notices": [] if data["status"] == "available" else ["research_signals:" + data["status"]]},
                     "data": data}
         if route == "version":
             data = self.version()

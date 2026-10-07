@@ -156,7 +156,7 @@ const kpi = (label, value, sub = "", opts = {}) => `<div class="kpi ${opts.cls |
 const notice = (kind, icon, body) => `<div class="notice ${kind}">${ic(icon)}<div>${body}</div></div>`;
 const titleMap = {overview:"今日总览",signals:"盯盘",intraday:"盯盘",candidates:"候选池",stock:"个股详情",research:"研究观察池",performance:"历史表现",health:"系统健康",settings:"策略设置"};
 const defaultFilter = () => ({query:"", risk:"", sort:"desc", board:"all", cheap:false, noSt:false});
-const state = {view:"overview", watchSeg:"signals", selectedCode:null, horizon:5, period:60, ma:true, candidates:[], signals:[], performance:null, stock:null, request:0, chartCleanup:null, controller:null, dataRevision:null, snapshotRevision:null, artifactRevision:null, polling:false, meta:null, ctx:{overview:null, health:null, research:null, perf3:null, version:null, catalog:null}, filter:defaultFilter()};
+const state = {view:"overview", watchSeg:"signals", selectedCode:null, horizon:5, period:60, ma:true, candidates:[], signals:[], performance:null, stock:null, request:0, chartCleanup:null, controller:null, dataRevision:null, snapshotRevision:null, artifactRevision:null, polling:false, meta:null, ctx:{overview:null, health:null, research:null, perf3:null, version:null, catalog:null, signals:null}, filter:defaultFilter()};
 
 async function api(route, signal) {
   const response = await fetch(`/api/${route}`, {signal, cache:"no-store"});
@@ -351,11 +351,11 @@ function renderOverview(d) {
   const current = Object.keys(CLOSE_REGIME).includes(m.regime) ? m.regime : "unknown";
   const states = Object.entries(CLOSE_REGIME).map(([k, t]) => `<div class="state ${current === k ? "on" : ""}" title="${k}"><b>${t}</b>${current === k ? "当前" : "&nbsp;"}</div>`).join("");
   const market = panel("市场宽度与状态", pb(`<div class="breadth">${count ? `<i class="rise" data-width="${w(m.advancing)}"></i><i class="fall" data-width="${w(m.declining)}"></i><i class="flatbar" data-width="${w(m.flat)}"></i>` : ""}</div><div class="legend"><span>涨 <b>${fmt(m.advancing, 0)}</b></span><span>跌 <b>${fmt(m.declining, 0)}</b></span><span>平 <b>${fmt(m.flat, 0)}</b></span><span>涨跌分档数据未提供，不显示分布柱</span></div><div class="states">${states}</div><div class="regime-note">收盘市场状态 · ${esc(d.market_date || "未知")} · 市场状态只调阈值，不覆盖链路异常</div>${liveMarketCard(d.live_market)}`));
-  const top = (d.candidates || []).slice(0, 5).map((c, i) => `<a href="${stockHref(c.code)}" class="mini-item"><span class="mini-rank">${String(i + 1).padStart(2, "0")}</span><span>${esc(c.name)}<small>${esc(c.code)} · ${esc(c.industry || "行业未知")}</small></span><span class="mini-score">${fmt(c.score, 0)}<small>/ ${fmt(c.score_max, 0)}</small></span></a>`).join("");
+  const top = (d.candidates || []).slice(0, 5).map((c, i) => `<a href="${stockHref(c.code)}" class="mini-item"><span class="mini-rank">${String(i + 1).padStart(2, "0")}</span><span>${esc(c.name)}${hotBadge(c.code)}<small>${esc(c.code)} · ${esc(c.industry || "行业未知")}</small></span><span class="mini-score">${fmt(c.score, 0)}<small>/ ${fmt(c.score_max, 0)}</small></span></a>`).join("");
   const topPanel = panel("排名前列", top ? `<div class="mini-list">${top}</div>` : empty("没有可见候选", "no_candidates"), `<a class="more" href="#candidates">全部候选</a>`);
   const rs = state.ctx.research;
   const research = panel("研究进度", !rs || ["unavailable", "missing"].includes(rs.status) ? empty("研究进度不可用", rs?.reason || "research_pool_schema_unavailable") : `<div class="status-rows"><div class="status-row"><span>冻结状态</span>${badge(rs.status)}</div><div class="status-row"><span>业务日</span><span>${esc(rs.trade_date || "未知")}</span></div><div class="status-row"><span>冻结时间</span><span>${esc(bj(rs.frozen_at))}</span></div><div class="status-row"><span>发布时间</span><span>${esc(bj(rs.published_at))}</span></div></div>`, `<a class="more" href="#research">研究观察池</a>`);
-  return pageHead("今日总览") + verdict + kpis + `<div class="grid g-2-1"><div class="col">${coveragePanel(d.coverage_breakdown)}${market}${pipeline(d, chain)}</div><div class="col">${topPanel}${research}</div></div>`;
+  return pageHead("今日总览") + verdict + kpis + `<div class="grid g-2-1"><div class="col">${coveragePanel(d.coverage_breakdown)}${market}${pipeline(d, chain)}</div><div class="col">${topPanel}${research}${indexTrendPanel()}</div></div>`;
 }
 // Each measure keeps its own denominator: complete prices and unknown risk can both be true.
 function coveragePanel(cb = {}) {
@@ -458,7 +458,7 @@ function candidateEmpty() {
 }
 function candidateTable(rows) {
   if (!rows.length) return candidateEmpty();
-  const body = rows.map(c => `<tr class="click"><td class="m-name">${link(c.code, c.name)}</td><td class="m-price r num">${priceCell(c)}</td><td class="m-pct r num ${tone(c.pct_change)}">${pct(c.pct_change)}</td><td class="m-score"><span class="score"><i><b data-width="${percentWidth(finite(c.score) && Number(c.score_max) > 0 ? c.score / c.score_max * 100 : 0)}"></b></i><span class="num"><strong>${fmt(c.score, 0)}</strong><small>/ ${fmt(c.score_max, 0)}</small></span></span></td><td class="m-risk">${badge(c.risk_level)}</td><td class="m-hide wrap">${esc(c.industry || "行业未知")}<small>技术 ${fmt(c.technical_score, 0)} · 行业 ${fmt(c.industry_score, 0)} · 基本面 ${fmt(c.fundamental_score, 0)}</small><small>风险区间 ${fmt(c.attention_low)}–${fmt(c.attention_high)} · 建议买入价 ${fmt(c.confirmation)}</small></td><td class="m-hide">${d3Cell(c)}</td></tr>`);
+  const body = rows.map(c => `<tr class="click"><td class="m-name">${link(c.code, c.name)}${hotBadge(c.code)}</td><td class="m-price r num">${priceCell(c)}</td><td class="m-pct r num ${tone(c.pct_change)}">${pct(c.pct_change)}</td><td class="m-score"><span class="score"><i><b data-width="${percentWidth(finite(c.score) && Number(c.score_max) > 0 ? c.score / c.score_max * 100 : 0)}"></b></i><span class="num"><strong>${fmt(c.score, 0)}</strong><small>/ ${fmt(c.score_max, 0)}</small></span></span></td><td class="m-risk">${badge(c.risk_level)}</td><td class="m-hide wrap">${esc(c.industry || "行业未知")}<small>技术 ${fmt(c.technical_score, 0)} · 行业 ${fmt(c.industry_score, 0)} · 基本面 ${fmt(c.fundamental_score, 0)}</small><small>风险区间 ${fmt(c.attention_low)}–${fmt(c.attention_high)} · 建议买入价 ${fmt(c.confirmation)}</small></td><td class="m-hide">${d3Cell(c)}</td></tr>`);
   return table(["股票", {t:"收盘价", cls:"r"}, {t:"涨跌幅", cls:"r"}, "评分", "风险", "理由", "D3 结果"], body, 900, {cls:"mlist"});
 }
 const sortText = sort => `评分${sort === "asc" ? "从低到高" : "从高到低"}`;
@@ -494,7 +494,7 @@ function researchRows(rows) {
     : r.fill_status === "unfilled" ? "模拟未成交<small>无持仓估值</small>" : "未入场<small>缺合格风险、分钟或执行证据</small>";
   const markText = r => [1, 3, 5].map(h => {const m = r.valuation?.[String(h)]; return `<small>D${h} ${badge(m?.status)}${m?.status === "complete" && finite(m.return_pct) ? ` · 收盘估值 ${fmt(m.return_pct, 6)}%` : ""}${m?.reason ? ` · ${esc(m.reason)}` : ""}</small>`;}).join("");
   return table(["研究序号 / 日期", "标的 / 记录", "评分 / 风险", "冻结参考价 / 计划", "资格 / 确认", "模拟状态 / 入场", "D1 / D3 / D5", "版本 / 缺口"],
-    rows.map(r => `<tr class="click"><td class="m-hide">${esc(r.rank)}<small>${esc(r.data_date || "—")}</small></td><td class="m-name"><span class="show-m">${esc(r.rank)}. </span>${link(r.code, r.name)}<small class="hide-m">${esc(r.record_id)}</small></td><td class="m-score">${fmt(r.score, 0)} · ${badge(r.risk_level)}</td><td class="m-price wrap">${fmt(r.observation_reference_close)}<small>未复权冻结收盘</small><span class="hide-m">${planText(r)}</span></td><td class="m-risk">${badge(r.eligibility)}<span class="hide-m"><small>${r.confirmation === "not_assessed" ? "B 未确认" : "B 两根完成柱确认（模拟）"}</small><small>A：未观察，不计未触发</small>${r.entry_qualification_version && r.entry_qualification_version !== r.qualification_version ? "<small>模拟记录绑定成交时资格；当前风险另列</small>" : ""}</span></td><td class="m-pct wrap">${badge(r.paper_status)}<small class="hide-m">${entryText(r)}</small></td><td class="m-hide">${markText(r)}</td><td class="m-hide">${esc(r.protocol_version || "—")}<small>${esc(r.accounting_version || "尚无核算")}</small><small>${esc(gapText(r.missing_reason))}</small></td></tr>`), 1480, {cls:"mlist"});
+    rows.map(r => `<tr class="click"><td class="m-hide">${esc(r.rank)}<small>${esc(r.data_date || "—")}</small></td><td class="m-name"><span class="show-m">${esc(r.rank)}. </span>${link(r.code, r.name)}${hotBadge(r.code)}<small class="hide-m">${esc(r.record_id)}</small></td><td class="m-score">${fmt(r.score, 0)} · ${badge(r.risk_level)}</td><td class="m-price wrap">${fmt(r.observation_reference_close)}<small>未复权冻结收盘</small><span class="hide-m">${planText(r)}</span></td><td class="m-risk">${badge(r.eligibility)}<span class="hide-m"><small>${r.confirmation === "not_assessed" ? "B 未确认" : "B 两根完成柱确认（模拟）"}</small><small>A：未观察，不计未触发</small>${r.entry_qualification_version && r.entry_qualification_version !== r.qualification_version ? "<small>模拟记录绑定成交时资格；当前风险另列</small>" : ""}</span></td><td class="m-pct wrap">${badge(r.paper_status)}<small class="hide-m">${entryText(r)}</small></td><td class="m-hide">${markText(r)}</td><td class="m-hide">${esc(r.protocol_version || "—")}<small>${esc(r.accounting_version || "尚无核算")}</small><small>${esc(gapText(r.missing_reason))}</small></td></tr>`), 1480, {cls:"mlist"});
 }
 function paperHistoryRows(rows) {
   const mark = (r, h) => {const m = r.marks?.[h]; return `<small>D${h} ${badge(m?.status)}${m?.status === "complete" ? ` · ${m.return_kind === "mark_to_close" ? "收盘估值" : "旧版收益"} ${fmt(m.return_kind === "mark_to_close" ? m.return_pct : m.net_return_pct, 6)}%` : ""}</small>`;};
@@ -507,7 +507,7 @@ function catalogSection(payload = state.ctx.catalog) {
   const data = payload?.data;
   if (!data) return panel("独立研究成果 · 离线冻结文件", empty("研究成果目录不可用", payload?.meta?.reason || "research_catalog_unavailable"));
   const entry = e => {
-    const rows = (e.items || []).map(r => `<tr><td>${esc(r.rank ?? "—")}</td><td>${r.code ? link(r.code, r.name) : esc(r.name || "—")}</td><td>${esc(r.sector || "—")}</td><td class="r num">${fmt(r.close)}</td><td class="r num ${tone(r.return5)}">${finite(r.return5) ? pct(Number(r.return5) * 100) : "—"}</td><td class="r num">${finite(r.amount20) ? `${fmt(Number(r.amount20) / 1e8)}<small>亿</small>` : "—"}</td></tr>`);
+    const rows = (e.items || []).map(r => `<tr><td>${esc(r.rank ?? "—")}</td><td>${r.code ? link(r.code, r.name) + hotBadge(r.code) : esc(r.name || "—")}</td><td>${esc(r.sector || "—")}</td><td class="r num">${fmt(r.close)}</td><td class="r num ${tone(r.return5)}">${finite(r.return5) ? pct(Number(r.return5) * 100) : "—"}</td><td class="r num">${finite(r.amount20) ? `${fmt(Number(r.amount20) / 1e8)}<small>亿</small>` : "—"}</td></tr>`);
     const meta = `<div class="status-rows"><div class="status-row"><span>冻结时间 / 输入日</span><span>${esc(bj(e.frozen_at))} · ${esc(e.input_as_of || "未知")}</span></div><div class="status-row"><span>注册提交 / 文件哈希</span><span class="mono">${esc((e.registration_commit || "未知").slice(0, 12))} · ${esc((e.file_sha256 || "").slice(0, 16))}</span></div><div class="status-row"><span>历史检验</span><span>${esc(e.historical_evaluation || e.status || "未记录")}</span></div>${e.next_observation ? `<div class="status-row"><span>下一次观察</span><span>${esc(e.next_observation)}</span></div>` : ""}<div class="status-row"><span>风险口径</span><span>${esc(e.risk_basis || "未记录")}</span></div></div>`;
     const title = `${esc(e.id)} · ${(e.stages || []).map(s => badge(s)).join("")} ${badge("research_only")}`;
     return panel(title, `<div class="lab-band">${ic("flask-conical")}<div><b>${esc(e.label || "研究观察")}</b><br>独立冻结名单，不是正式推荐，未接入插件自动策略，不写入正式候选或推荐表。</div></div>` + meta +
@@ -515,6 +515,62 @@ function catalogSection(payload = state.ctx.catalog) {
   };
   const missing = (data.unavailable || []).map(u => notice("", "triangle-alert", `${esc(u.file)} 不可用 · 原因代码 ${esc(u.reason)}`)).join("");
   return `<h2 class="section-title">独立研究成果 · 离线冻结文件（只读）</h2>` + missing + (data.entries || []).map(entry).join("");
+}
+// Evening research job (schemes F and D): display-only labels, never part of the formal gates.
+const EXCLUSION_TEXT = {not_main_or_chinext:"不在主板或创业板", st_name:"ST 股票", no_bar_today:"当日没有行情", history_lt_60:"近 60 日行情不完整",
+  corporate_action_60d:"近 60 日有除权除息", price_above_50:"收盘价高于 50 元", amount_below_20m:"成交额低于 2000 万元", indicator_missing:"指标无法计算"};
+const FACTOR_TEXT = {R20:"20 日涨幅", C_MA20:"偏离 20 日均线", IVOL20:"20 日特质波动", VOLR5_60:"5 日 / 60 日均量", MAX20:"20 日最大 3 日涨幅均值",
+  TURN5_20:"5 日 / 20 日换手（用量代替）", ABTURN:"20 日 / 60 日换手（用量代替）", RSI14:"RSI14"};
+const SIGNAL_STATUS_TEXT = {not_configured:"没有配置研究信号文件", missing:"研究信号还没有生成", unreadable:"研究信号文件读取失败",
+  invalid:"研究信号文件格式不对", job_error:"研究信号任务这次没算出来", pool_lt_30:"研究股票池不足 30 只", history_lt_60:"行情不足 60 个交易日"};
+const signalsData = (payload = state.ctx.signals) => payload?.data || null;
+function hotMap(payload = state.ctx.signals) {
+  const d = signalsData(payload), oh = d?.overheat;
+  if (!d || !["available", "stale"].includes(d.status) || oh?.status !== "available") return new Map();
+  return new Map((oh.hot || []).map(item => [item.code, item]));
+}
+function hotBadge(code, payload = state.ctx.signals) {
+  const item = hotMap(payload).get(code);
+  if (!item) return "";
+  const oh = signalsData(payload).overheat;
+  return ` ${kindBadge("warn", "过热", `研究标签 · ${oh.trade_date || "日期未知"} 过热综合分位 ${fmt(Number(item.pct) * 100, 1)}%，属于研究股票池里最热的 10%。只做提醒，不改正式门槛。`)}`;
+}
+function signalsUnavailable(title, code) {
+  return panel(title, empty(SIGNAL_STATUS_TEXT[code] || `${title}暂不可用`, code), `<span class="src">研究参考</span>`);
+}
+function indexTrendPanel(payload = state.ctx.signals) {
+  const d = signalsData(payload), it = d?.index_trend;
+  if (!d || ["not_configured", "missing", "unreadable", "invalid"].includes(d.status)) return signalsUnavailable("大盘温度计", d?.status || payload?.meta?.reason || "research_signals_unavailable");
+  if (!Object.keys(it?.indices || {}).length) return signalsUnavailable("大盘温度计", it?.status || "index_trend_unavailable");
+  const rows = [["000905", "中证500"], ["000852", "中证1000"]].map(([c, name]) => {
+    const x = it.indices[c];
+    if (!x) return `<div class="status-row"><span>${name}</span><span class="muted">这次没有取到</span></div>`;
+    const side = x.above_ma200 ? kindBadge("ok", "200 日均线上方", "研究口径：次日持有") : kindBadge("warn", "200 日均线下方", "研究口径：次日空仓");
+    return `<div class="status-row"><span>${esc(x.name || name)}<small>${esc(x.date || "—")} · 收盘 ${fmt(x.close)} · 200 日均线 ${fmt(x.ma200)}</small></span><span>${side}<small>偏离 ${pct(x.distance_ma200, true)} · 已持续 ${fmt(x.sessions_on_side, 0)} 个交易日 · 120 日均线${x.above_ma120 ? "上方" : "下方"}</small></span></div>`;
+  }).join("");
+  const stale = d.status === "stale" ? notice("", "triangle-alert", `研究信号超过 3 天没有更新（生成于 ${esc(bj(d.generated_at))}）`) : "";
+  return panel("大盘温度计", stale + `<div class="status-rows">${rows}</div><p class="regime-note">2021—2026 回看：只在指数高于 200 日均线时持有，中证 500 和中证 1000 的最大回撤都减半左右；换成 120 日均线，中证 500 反而更差，所以只作仓位参考，不是交易规则。</p>`, `<span class="src">研究参考 · 只显示</span>`);
+}
+function factorValue(key, value) {
+  if (!finite(value)) return "—";
+  if (["R20", "C_MA20", "MAX20"].includes(key)) return pct(value, true);
+  if (key === "IVOL20") return `${fmt(Number(value) * 100)}%`;
+  if (key === "RSI14") return fmt(value, 1);
+  return `${fmt(value)} 倍`;
+}
+function overheatStockPanel(code, payload = state.ctx.signals) {
+  const d = signalsData(payload), oh = d?.overheat, s = d?.stock;
+  if (!d || ["not_configured", "missing", "unreadable", "invalid"].includes(d.status)) return signalsUnavailable("过热标签", d?.status || payload?.meta?.reason || "research_signals_unavailable");
+  if (oh?.status !== "available") return signalsUnavailable("过热标签", oh?.reason || "overheat_unavailable");
+  const head = `<span class="src">研究参考 · ${esc(oh.trade_date || "日期未知")}</span>`;
+  const stale = d.status === "stale" ? notice("", "triangle-alert", `研究信号超过 3 天没有更新（生成于 ${esc(bj(d.generated_at))}）`) : "";
+  if (!s || s.code !== code || s.status !== "evaluated") {
+    const why = s?.code === code && s.reason ? EXCLUSION_TEXT[s.reason] || s.reason : "当天不在研究股票池里";
+    return panel("过热标签", stale + `<div class="status-rows"><div class="status-row"><span>状态</span><span>${kindBadge("unk", "不在评估范围", s?.reason || "not_evaluated")}</span></div><div class="status-row"><span>原因</span><span>${esc(why)}</span></div></div>`, head);
+  }
+  const label = s.hot ? kindBadge("warn", "过热", "研究股票池里最热的 10%") : kindBadge("ok", "未过热", "不在研究股票池最热的 10% 里");
+  const rows = Object.entries(s.indicators || {}).map(([k, v]) => `<div>${esc(FACTOR_TEXT[k] || k)}</div><div class="num">${factorValue(k, v)}</div>`).join("");
+  return panel("过热标签", stale + `<div class="status-rows"><div class="status-row"><span>状态</span><span>${label}</span></div><div class="status-row"><span>过热综合分位</span><span>${fmt(Number(s.pct) * 100, 1)}%<small>最热的 10% 标为过热 · ${fmt(oh.evaluated, 0)} 只参与排名</small></span></div></div><div class="kv">${rows}</div><p class="regime-note">2021—2023 回看：最热的 10% 之后 5 日平均跑输股票池 0.55%、20 日跑输 1.43%，三年都为负。只做提醒，不改正式门槛；换手比值用成交量代替，ST 按当前名称判断。</p>`, head);
 }
 function renderResearch() {
   const rs = state.ctx.research || {status:"unavailable", reason:"research_pool_schema_unavailable"};
@@ -593,7 +649,7 @@ function renderStock(d) {
   const evRows = Object.entries({...(ev.financial || {}), ...(ev.risk || {})}).map(([k, v]) => `<tr><td>${esc(EVIDENCE_FIELDS[k] || k)}</td><td class="num">${v?.value === null || v?.value === undefined ? "未知" : typeof v.value === "boolean" ? (v.value ? "是" : "否") : fmt(v.value)}</td><td>${badge(v?.quality)}</td><td class="wrap">${esc(v?.reason || "—")}</td></tr>`);
   const recs = (d.recommendations || []).slice(0, LIMITS.recommendations).map(r => `<tr><td>${esc(r.date)}</td><td>${badge(r.plan_status)}</td><td>${badge(r.comparability)}</td><td class="mono">${esc(r.plan_version || "—")}</td></tr>`);
   return panel("查找个股", stockSearchForm()) + `<section class="panel">${head}${coverage}${tools}${chart}</section>` + stockStatusNotice(d) + quality +
-    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
+    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
 }
 function movingAverage(bars, n) {
   const out = []; let sum = 0;
@@ -789,8 +845,12 @@ function syncNav(view) {
 }
 function openSheet() {$("#sheet").classList.add("open"); $("#sheet-mask").classList.add("open"); $("#sheet-close").focus();}
 function closeSheet() {$("#sheet").classList.remove("open"); $("#sheet-mask").classList.remove("open");}
-async function contextJobs(view, signal) {
+async function contextJobs(view, signal, parts = []) {
   const jobs = {};
+  if (["overview", "candidates", "research", "stock"].includes(view)) {
+    const code = view === "stock" ? parts[1] || state.selectedCode : null;
+    jobs.signals = soft(/^\d{6}$/.test(code || "") ? `research_signals?code=${encodeURIComponent(code)}` : "research_signals", signal);
+  }
   if (view !== "overview") jobs.overview = soft("overview", signal);
   if (view !== "health") jobs.health = soft("health", signal);
   if (view === "health") jobs.version = soft("version", signal);
@@ -809,6 +869,7 @@ function applyContext(view, payload, ctx) {
   if (ctx.perf3) state.ctx.perf3 = ctx.perf3.data || null;
   if (ctx.version) state.ctx.version = ctx.version.data ? ctx.version : null;
   if (ctx.catalog) state.ctx.catalog = ctx.catalog;
+  if (ctx.signals) state.ctx.signals = ctx.signals;
 }
 
 async function load({silent=false} = {}) {
@@ -822,7 +883,7 @@ async function load({silent=false} = {}) {
     if(view==="candidates")state.filter=defaultFilter();
     $("#refresh").disabled=true;$("#content").innerHTML=`<div class="loading">正在读取快照…</div>`;
   }
-  const ctxJob=contextJobs(view,signal);
+  const ctxJob=contextJobs(view,signal,parts);
   try {
     let path=view==="research"?"candidates":view;
     if(view==="performance")path+=`?horizon=${state.horizon}`;

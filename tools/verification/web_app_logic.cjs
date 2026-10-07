@@ -23,7 +23,8 @@ context.window = context;
 vm.createContext(context);
 vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
-  dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice};`, context, {filename: "app.js"});
+  dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice,
+  hotBadge, indexTrendPanel, overheatStockPanel};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -155,6 +156,26 @@ check("settings_changed", settings.includes("与默认值不同 · 2 项") && se
 check("settings_hidden_value", settings.includes("已修改（值不公开）") && settings.includes("没有读到插件配置"));
 check("settings_deprecated", settings.includes("confirmation_enabled") && settings.includes("实际行为不变"));
 check("settings_missing", app.renderSettings({snapshot: {status: "missing"}, items: []}).includes("没有读到插件配置快照"));
+
+// Evening research signals: overheat badges, the index thermometer and the stock panel stay display-only.
+const signals = (extra = {}) => ({meta: {status: "available"}, data: {status: "available", generated_at: "2026-10-07T10:40:00+00:00",
+  overheat: {status: "available", trade_date: "2026-09-30", evaluated: 2990, hot: [{code: "600010", name: "测试", score: 0.83, pct: 0.991}]},
+  index_trend: {status: "available", indices: {"000905": {name: "中证500", date: "2026-09-30", close: 7000, ma200: 6500, above_ma200: true,
+    distance_ma200: 0.0769, sessions_on_side: 12, above_ma120: false}}},
+  stock: {code: "600010", status: "evaluated", hot: true, score: 0.83, pct: 0.991, indicators: {R20: 0.31, IVOL20: 0.025, ABTURN: 1.8, RSI14: 81.2}},
+  ...extra}});
+check("hot_badge_shown", app.hotBadge("600010", signals()).includes("过热") && app.hotBadge("600010", signals()).includes("99.1%"));
+check("hot_badge_absent", app.hotBadge("600011", signals()) === "" && app.hotBadge("600010", {meta: {status: "partial"}, data: {status: "missing"}}) === "");
+const thermo = app.indexTrendPanel(signals());
+check("thermometer_above", thermo.includes("200 日均线上方") && thermo.includes("+7.69%") && thermo.includes("已持续 12 个交易日") && thermo.includes("120 日均线下方"));
+check("thermometer_partial", thermo.includes("中证1000") && thermo.includes("这次没有取到") && thermo.includes("不是交易规则"));
+check("thermometer_missing", app.indexTrendPanel({meta: {status: "partial"}, data: {status: "missing"}}).includes("研究信号还没有生成"));
+check("thermometer_stale", app.indexTrendPanel(signals({status: "stale"})).includes("超过 3 天没有更新"));
+const hotPanel = app.overheatStockPanel("600010", signals());
+check("stock_panel_hot", hotPanel.includes("过热综合分位") && hotPanel.includes("99.1%") && hotPanel.includes("+31.00%") && hotPanel.includes("2.50%") && hotPanel.includes("1.80 倍"));
+const excluded = app.overheatStockPanel("600002", signals({stock: {code: "600002", status: "excluded", reason: "corporate_action_60d", indicators: {}}}));
+check("stock_panel_excluded", excluded.includes("不在评估范围") && excluded.includes("近 60 日有除权除息"));
+check("stock_panel_job_error", app.overheatStockPanel("600010", signals({overheat: {status: "unavailable", reason: "job_error"}})).includes("研究信号任务这次没算出来"));
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

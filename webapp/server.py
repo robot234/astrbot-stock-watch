@@ -87,12 +87,14 @@ def main():
     parser.add_argument("--origin", default="", help="Fixed authorized origin; blank exposes public records only")
     parser.add_argument("--settings", type=Path, help="Explicit sanitized public settings snapshot, never a credential file")
     parser.add_argument("--artifact", type=Path, help="Explicit read-only intraday target quote artifact path")
+    parser.add_argument("--signals", type=Path, help="Explicit evening research signals file (research_signals.json)")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address; defaults to IPv4 loopback")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if str(args.database).startswith("\\\\"):
         parser.error("use an explicit local database, not a network share")
-    server = create_server(Dashboard(args.database, origin=args.origin, settings=args.settings, artifact_path=args.artifact), args.port, args.host)
+    server = create_server(Dashboard(args.database, origin=args.origin, settings=args.settings, artifact_path=args.artifact,
+                                     signals_path=args.signals), args.port, args.host)
     print(f"Stock Watch read-only dashboard: http://{args.host}:{server.server_port}", flush=True)
     try:
         server.serve_forever()

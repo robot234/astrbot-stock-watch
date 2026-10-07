@@ -7,7 +7,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 WorkingDirectory=/home/pi/apps/stock-watch-web/current
-ExecStart=/usr/bin/python3 -B -m webapp.server --host 192.168.124.6 --database /var/lib/stock-watch-web-snapshot/stock_watch.sqlite3 --port 8767 --artifact /home/pi/astrbot/data/plugin_data/astrbot_stock_watch/intraday_quotes.json
+ExecStart=/usr/bin/python3 -B -m webapp.server --host 192.168.124.6 --database /var/lib/stock-watch-web-snapshot/stock_watch.sqlite3 --port 8767 --artifact /home/pi/astrbot/data/plugin_data/astrbot_stock_watch/intraday_quotes.json --signals /home/pi/apps/stock-watch-web/state/research_signals.json
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONNOUSERSITE=1

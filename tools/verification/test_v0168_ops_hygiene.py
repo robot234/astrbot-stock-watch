@@ -49,7 +49,8 @@ def test_termination_during_backup_still_removes_the_staging_copy(tmp_path, monk
 def test_updater_reads_server_arguments_and_rejects_bad_probes():
     unit = (ROOT / "webapp/deploy/stock-watch-web.service").read_text(encoding="utf-8")
     assert server_arguments(unit) == {"host": "192.168.124.6", "database": "/var/lib/stock-watch-web-snapshot/stock_watch.sqlite3",
-                                      "port": "8767", "artifact": "/home/pi/astrbot/data/plugin_data/astrbot_stock_watch/intraday_quotes.json"}
+                                      "port": "8767", "artifact": "/home/pi/astrbot/data/plugin_data/astrbot_stock_watch/intraday_quotes.json",
+                                      "signals": "/home/pi/apps/stock-watch-web/state/research_signals.json"}
     good = {"version": {"http": 200, "status": "available", "revision": "abc1234"},
             "candidates": {"http": 200, "status": "partial", "research_status": "research_only"}}
     assert failures(good, "abc1234") == []
