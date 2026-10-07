@@ -185,6 +185,14 @@ def safe_text(value, limit=120):
     return re.sub(r"[\x00-\x1f\x7f]", "", str(value or ""))[:limit]
 
 
+def setting_issue_rows(value):
+    """The plugin's load-time setting checks, trimmed to display text."""
+    return [{"code": safe_text(item.get("code"), 40), "level": item["level"],
+             "keys": [safe_text(key, 60) for key in arr(item.get("keys")) if isinstance(key, str)][:4],
+             "message": safe_text(item.get("message"), 200), "effect": safe_text(item.get("effect"), 200)}
+            for item in arr(value)[:30] if isinstance(item, dict) and item.get("level") in ("error", "warning")]
+
+
 def sha256_text(value):
     return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
 
@@ -1488,7 +1496,7 @@ class Dashboard:
         path = (Path(self.settings) if self.settings is not None
                 else self.artifact_path.with_name("public_settings.json") if self.artifact_configured else None)
         unknown = {"status": "not_configured", "values": {}, "configured": {}, "written_at": None, "plugin_version": None,
-                   "code_sha256": None, "schema_sha256": None, "deprecated_settings": []}
+                   "code_sha256": None, "schema_sha256": None, "deprecated_settings": [], "setting_issues": []}
         if path is None:
             return unknown
         try:
@@ -1507,7 +1515,8 @@ class Dashboard:
                 "written_at": written.isoformat() if written else None,
                 "plugin_version": safe_text(data.get("plugin_version"), 40) or None,
                 "code_sha256": sha256_text(data.get("code_sha256")), "schema_sha256": sha256_text(data.get("schema_sha256")),
-                "deprecated_settings": [safe_text(key, 60) for key in arr(data.get("deprecated_settings")) if isinstance(key, str)][:20]}
+                "deprecated_settings": [safe_text(key, 60) for key in arr(data.get("deprecated_settings")) if isinstance(key, str)][:20],
+                "setting_issues": setting_issue_rows(data.get("setting_issues"))}
 
     def public_settings(self):
         """Schema default next to the plugin's load-time value; strings outside the allowlist show only a state."""
@@ -1538,7 +1547,7 @@ class Dashboard:
         plugin_sha = snapshot["code_sha256"]
         build_sha = self.build_info()["plugin_main_sha256"] if plugin_sha else None
         meta = {key: snapshot[key] for key in ("status", "written_at", "plugin_version", "code_sha256", "schema_sha256",
-                                               "deprecated_settings")}
+                                               "deprecated_settings", "setting_issues")}
         meta["matches_web_build"] = (plugin_sha == build_sha) if plugin_sha and build_sha else None
         return {"items": result, "snapshot": meta, "read_only": True, "sensitive_fields": "not_exposed"}
 

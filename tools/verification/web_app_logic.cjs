@@ -156,6 +156,12 @@ check("settings_changed", settings.includes("与默认值不同 · 2 项") && se
 check("settings_hidden_value", settings.includes("已修改（值不公开）") && settings.includes("没有读到插件配置"));
 check("settings_deprecated", settings.includes("confirmation_enabled") && settings.includes("实际行为不变"));
 check("settings_missing", app.renderSettings({snapshot: {status: "missing"}, items: []}).includes("没有读到插件配置快照"));
+const checked = app.renderSettings({snapshot: {status: "plugin_snapshot", setting_issues: [
+  {level: "error", keys: ["price_min", "price_max"], message: "price_min 90 高于 price_max 80", effect: "正式候选会一直为空"},
+  {level: "warning", keys: ["screen_min_indicator_coverage"], message: "<b>95</b> 超出允许范围", effect: "实际按 1 使用"}]}, items: []});
+check("settings_issues", checked.includes("notice crit") && checked.includes("price_min 90 高于 price_max 80") && checked.includes("正式候选会一直为空")
+  && checked.includes("price_min · price_max") && checked.includes("&lt;b&gt;95&lt;/b&gt;") && !checked.includes("<b>95</b>"));
+check("settings_no_issues", !app.renderSettings({snapshot: {status: "plugin_snapshot"}, items: []}).includes("配置检查"));
 
 // Evening research signals: overheat badges, the index thermometer and the stock panel stay display-only.
 const signals = (extra = {}) => ({meta: {status: "available"}, data: {status: "available", generated_at: "2026-10-07T10:40:00+00:00",

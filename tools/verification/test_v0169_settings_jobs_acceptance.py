@@ -134,7 +134,7 @@ def test_plugin_snapshot_copies_numbers_and_allowlisted_strings_only(tmp_path):
               "llm_base_url": "https://internal.example/v1", "intraday_artifact_path": "/data/private.json"}
     config = {**dict(main_module._SCHEMA_DEFAULTS), **hidden, "max_concurrency": 7, "confirmation_enabled": True,
               "llm_model": "deepseek-chat", "price_max": "80"}
-    stub = types.SimpleNamespace(config=config, deprecated_settings=["confirmation_enabled"])
+    stub = types.SimpleNamespace(config=config, deprecated_settings=["confirmation_enabled"], setting_issues=[])
     stub.public_settings_snapshot = lambda: Main.public_settings_snapshot(stub)
 
     snapshot = Main.public_settings_snapshot(stub)

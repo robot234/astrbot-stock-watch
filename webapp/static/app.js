@@ -820,7 +820,9 @@ function renderSettings(d) {
     : s.status === "explicit_values" ? notice("info", "lock", "当前值来自显式指定的公开配置快照，不是插件自己写出的。")
     : notice("warn", "triangle-alert", `${esc(SNAP[s.status] || "插件配置快照状态未知。")}当前值显示为未知；默认值不代表正在运行的配置。`);
   const deprecated = (s.deprecated_settings || []).length ? notice("warn", "triangle-alert", `这些旧配置项设成了非默认值，但当前代码不读取：${esc(s.deprecated_settings.join("、"))}。在面板改回默认可以消掉加载告警，实际行为不变。`) : "";
-  return pageHead("策略设置", "", ["只读"]) + head + deprecated +
+  const issues = (s.setting_issues || []).map(i => notice(i.level === "error" ? "crit" : "warn", "triangle-alert",
+    `配置检查：${esc(i.message)}。${esc(i.effect)}。<small class="mono">${esc((i.keys || []).join(" · "))}</small>`)).join("");
+  return pageHead("策略设置", "", ["只读"]) + head + deprecated + issues +
     (changed.length ? panel(`与默认值不同 · ${fmt(changed.length, 0)} 项`, table(heads, changed.map(row), 760)) : "") +
     panel("常用参数", table(heads, common.map(row), 760)) +
     panel(`全部参数 · ${fmt(items.length, 0)} 项`, `<details class="history"><summary>展开其余 ${fmt(others.length, 0)} 项（高级）</summary>${table(heads, others.map(row), 760)}</details>`) +

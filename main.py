@@ -32,6 +32,7 @@ from .storage import SnapshotLeaseCapabilityError, SnapshotLeaseError, SnapshotL
 from .research_selector import radar_crossed, select_pools
 from .research_risk import evidence_label, load_evidence
 from . import formal_source_policy
+from . import config_checks
 
 PLUGIN_NAME = "astrbot_stock_watch"
 
@@ -150,6 +151,7 @@ class Main(Star):
         configured_artifact = str(self.config.get("intraday_artifact_path", "") or "").strip()
         self.intraday_artifact_path = Path(configured_artifact) if configured_artifact else data_dir / "intraday_quotes.json"
         self.deprecated_settings = self._warn_deprecated_settings()
+        self.setting_issues = self._warn_setting_issues()
         self._write_public_settings(self.intraday_artifact_path.with_name("public_settings.json"))
         timeout = self._float("request_timeout", 10, 3, 60)
         self.http = HttpRuntime(timeout, self._max_concurrency())
@@ -1852,7 +1854,7 @@ class Main(Star):
         return {"schema_version": 1, "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "plugin_version": version.group(1) if version else None, "code_sha256": code_sha,
                 "schema_sha256": schema_sha, "values": values, "configured": configured,
-                "deprecated_settings": list(self.deprecated_settings)}
+                "deprecated_settings": list(self.deprecated_settings), "setting_issues": list(self.setting_issues)}
 
     def _write_public_settings(self, path: Path) -> None:
         try:
@@ -1876,6 +1878,17 @@ class Main(Star):
                 found.append(key)
                 logger.warning("[%s] 配置项 %s 已废弃且不生效；连续确认请改用 %s", PLUGIN_NAME, key, replacement)
         return found
+
+    def _warn_setting_issues(self) -> list[dict]:
+        try:
+            issues = config_checks.setting_issues(self.config, _SCHEMA_DEFAULTS)
+        except Exception:
+            # Runs during plugin load: a checker bug must never block startup.
+            logger.warning("[%s] 配置跨项校验未完成，Web 设置页不显示校验结果", PLUGIN_NAME, exc_info=True)
+            return []
+        for issue in issues:
+            logger.warning("[%s] 配置校验：%s；%s", PLUGIN_NAME, issue["message"], issue["effect"])
+        return issues
 
     @staticmethod
     def _session_count_from_config(config) -> int:
