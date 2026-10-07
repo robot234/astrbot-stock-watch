@@ -23,7 +23,7 @@ context.window = context;
 vm.createContext(context);
 vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
-  dataState, renderResearch, renderPerformance, renderHealth};`, context, {filename: "app.js"});
+  dataState, renderResearch, renderPerformance, renderHealth, reasonText, candidateEmpty, stockStatusNotice};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -108,6 +108,25 @@ const health = app.renderHealth({database: "readable", integrity: "not_checked",
 check("health_expired_deadline", health.includes("（已过期）"));
 check("health_history_folded", health.includes("更早记录 1 条"));
 check("health_version_unknown", health.includes("version_unavailable"));
+check("health_limits_shown", health.includes("最近 10 次") && health.includes("最近 15 条"));
+app.state.ctx.overview = {meta: {status: "available"}, data: {batches: [{state: "published"}], quality: "good", complete: true, data_date: "2026-09-30",
+  acceptance: {trade_date: "2026-09-30", status: "critical", findings: [{code: "candidate_freeze_missing", severity: "critical"}]}}};
+const helped = app.renderHealth({database: "readable", integrity: "not_checked", tables: 72, data_date: "2026-09-30", providers: [],
+  daily_acceptance: [{date: "2026-09-30", status: "critical", checked_at: "2026-09-30T07:40:00"}], jobs: [], batches: [], failures: []});
+check("finding_help", helped.includes("影响：当天没有冻结正式候选") && helped.includes("下一步："));
+check("finding_reason_text", app.reasonText("candidate_freeze_missing") === "缺少候选冻结记录");
+
+app.state.ctx.research = {status: "research_only", trade_date: "2026-09-30", paper_history: [], parameters: null, independent_of: [],
+  primary: [{rank: 1, code: "600276", name: "恒瑞医药", record_id: "research:batch:600276", score: 25, risk_level: "unknown", eligibility: "research_only",
+             confirmation: "not_assessed", paper_status: "not_entered", observation_reference_close: 47.2}], radar: []};
+app.state.ctx.catalog = null;
+const pools = app.renderResearch();
+check("research_mobile_cards", pools.includes('class="mlist"') && pools.includes('class="m-name"') && pools.includes("#stock/600276"));
+app.state.candidates = [];
+check("candidates_empty_links_research", app.candidateEmpty().includes("查看研究观察池（重点 1 / 警戒 0"));
+app.state.ctx.catalog = {data: {entries: [{id: "ULTRASHORT_REVERSAL_V1", label: "未通过检验，仅观察", items: [{rank: 1, code: "600857"}]}]}};
+check("stock_offline_membership", app.stockStatusNotice({code: "600857", bar_source: {kind: "active_raw"}, formal_status: "no_formal_candidate"})
+  .includes("离线研究名单：ULTRASHORT_REVERSAL_V1 第 1 名"));
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

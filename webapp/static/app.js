@@ -118,7 +118,22 @@ const REASONS = {
   candidates_unavailable:"候选数据读取失败", health_unavailable:"健康数据读取失败", overview_unavailable:"总览数据读取失败",
   "连接不可用":"无法连接本地只读服务"
 };
-const reasonText = code => REASONS[code] || (/[\u4e00-\u9fa5]/.test(String(code || "")) ? String(code) : "读取失败，详见原因代码");
+const reasonText = code => REASONS[code] || FINDINGS[code] || (/[\u4e00-\u9fa5]/.test(String(code || "")) ? String(code) : "读取失败，详见原因代码");
+// What a daily-acceptance finding means for the user and where to look next.
+const FINDING_HELP = {
+  calendar_unverified:["无法确认当天是否交易日，当天验收无法判定", "查看系统健康里的交易日历接口是否限流或失败"],
+  daily_snapshot_missing:["当天没有完整收盘快照，筛选和验收缺少输入", "查看原始数据批次是否已发布、日线接口是否失败"],
+  candidate_freeze_missing:["当天没有冻结正式候选，正式名单为空", "查看任务里自动收盘筛选的错误代码；四项风险证据未通过验收时属于预期结果"],
+  ai_review_missing:["AI 影子评审没有生成，只影响研究对照，不影响规则候选", "检查模型配置和每日请求上限"],
+  ai_review_terminal_problem:["AI 影子评审异常结束，只影响研究对照", "查看插件日志里的模型请求错误"],
+  ai_review_stale_pending:["AI 影子评审长时间未完成，只影响研究对照", "检查模型接口是否超时"],
+  recommendation_outcomes_blocked:["推荐结果评估被阻断，历史表现无法更新", "检查复权因子与交易日历证据"],
+  recommendation_outcomes_overdue:["推荐结果评估逾期，历史表现无法更新", "检查到期日行情是否已采集"]
+};
+function findingHelp(findings = []) {
+  const codes = [...new Set(findings.map(f => f.code).filter(code => FINDING_HELP[code]))];
+  return codes.length ? `<div class="status-rows">${codes.map(code => `<div class="status-row"><span>${esc(FINDINGS[code] || code)}<small>影响：${esc(FINDING_HELP[code][0])}</small><small>下一步：${esc(FINDING_HELP[code][1])}</small></span><span class="mono">${esc(code)}</span></div>`).join("")}</div>` : "";
+}
 
 function badge(code, map = STATUS) {
   const key = code === null || code === undefined || code === "" ? "unknown" : String(code);
@@ -437,8 +452,9 @@ function d3Cell(c) {
 }
 function candidateEmpty() {
   if (state.candidates.length) return empty("筛选后没有候选", "filters_excluded_all", ["放宽搜索词或板块", "关闭股价或 ST 筛选", "把风险改回全部"]);
-  const chain = chainState();
-  return empty("今天没有可见候选", chain.kind !== "ok" ? chain.reasons[0]?.code || "no_candidates" : "no_candidates", ["到系统健康查看链路验收与数据批次", "等待下一次收盘筛选完成后刷新"]);
+  const chain = chainState(), rs = state.ctx.research;
+  const research = rs && (rs.primary || []).length + (rs.radar || []).length ? `<p><a class="btn" href="#research">${ic("flask-conical")}查看研究观察池（重点 ${(rs.primary || []).length} / 警戒 ${(rs.radar || []).length}，仅研究）</a></p>` : "";
+  return empty("今天没有可见候选", chain.kind !== "ok" ? chain.reasons[0]?.code || "no_candidates" : "no_candidates", ["到系统健康查看链路验收与数据批次", "等待下一次收盘筛选完成后刷新"], research);
 }
 function candidateTable(rows) {
   if (!rows.length) return candidateEmpty();
@@ -478,7 +494,7 @@ function researchRows(rows) {
     : r.fill_status === "unfilled" ? "模拟未成交<small>无持仓估值</small>" : "未入场<small>缺合格风险、分钟或执行证据</small>";
   const markText = r => [1, 3, 5].map(h => {const m = r.valuation?.[String(h)]; return `<small>D${h} ${badge(m?.status)}${m?.status === "complete" && finite(m.return_pct) ? ` · 收盘估值 ${fmt(m.return_pct, 6)}%` : ""}${m?.reason ? ` · ${esc(m.reason)}` : ""}</small>`;}).join("");
   return table(["研究序号 / 日期", "标的 / 记录", "评分 / 风险", "冻结参考价 / 计划", "资格 / 确认", "模拟状态 / 入场", "D1 / D3 / D5", "版本 / 缺口"],
-    rows.map(r => `<tr><td>${esc(r.rank)}<small>${esc(r.data_date || "—")}</small></td><td>${esc(r.name)}<small>${esc(r.code)} · ${esc(r.record_id)}</small></td><td>${fmt(r.score, 0)} · ${badge(r.risk_level)}</td><td class="wrap">${fmt(r.observation_reference_close)}<small>未复权冻结收盘</small>${planText(r)}</td><td>${badge(r.eligibility)}<small>${r.confirmation === "not_assessed" ? "B 未确认" : "B 两根完成柱确认（模拟）"}</small><small>A：未观察，不计未触发</small>${r.entry_qualification_version && r.entry_qualification_version !== r.qualification_version ? "<small>模拟记录绑定成交时资格；当前风险另列</small>" : ""}</td><td class="wrap">${badge(r.paper_status)}<small>${entryText(r)}</small></td><td>${markText(r)}</td><td>${esc(r.protocol_version || "—")}<small>${esc(r.accounting_version || "尚无核算")}</small><small>${esc(gapText(r.missing_reason))}</small></td></tr>`), 1480);
+    rows.map(r => `<tr class="click"><td class="m-hide">${esc(r.rank)}<small>${esc(r.data_date || "—")}</small></td><td class="m-name"><span class="show-m">${esc(r.rank)}. </span>${link(r.code, r.name)}<small class="hide-m">${esc(r.record_id)}</small></td><td class="m-score">${fmt(r.score, 0)} · ${badge(r.risk_level)}</td><td class="m-price wrap">${fmt(r.observation_reference_close)}<small>未复权冻结收盘</small><span class="hide-m">${planText(r)}</span></td><td class="m-risk">${badge(r.eligibility)}<span class="hide-m"><small>${r.confirmation === "not_assessed" ? "B 未确认" : "B 两根完成柱确认（模拟）"}</small><small>A：未观察，不计未触发</small>${r.entry_qualification_version && r.entry_qualification_version !== r.qualification_version ? "<small>模拟记录绑定成交时资格；当前风险另列</small>" : ""}</span></td><td class="m-pct wrap">${badge(r.paper_status)}<small class="hide-m">${entryText(r)}</small></td><td class="m-hide">${markText(r)}</td><td class="m-hide">${esc(r.protocol_version || "—")}<small>${esc(r.accounting_version || "尚无核算")}</small><small>${esc(gapText(r.missing_reason))}</small></td></tr>`), 1480, {cls:"mlist"});
 }
 function paperHistoryRows(rows) {
   const mark = (r, h) => {const m = r.marks?.[h]; return `<small>D${h} ${badge(m?.status)}${m?.status === "complete" ? ` · ${m.return_kind === "mark_to_close" ? "收盘估值" : "旧版收益"} ${fmt(m.return_kind === "mark_to_close" ? m.return_pct : m.net_return_pct, 6)}%` : ""}</small>`;};
@@ -556,7 +572,9 @@ function stockStatusNotice(d) {
   const source = s.kind === "active_raw" ? `active raw 第 ${fmt(s.generation, 0)} 代 · 批次 ${s.batch_id || "未知"} · 截至 ${s.trade_date || "未知"}` : s.kind === "legacy_daily_bars" ? `旧日线表（兼容路径）· 截至 ${s.trade_date || "未知"}` : "没有已存日线";
   const r = d.research;
   const research = r ? `研究池：${r.pool === "primary" ? "重点观察" : "警戒"} 第 ${esc(r.rank)} 名（${esc(r.trade_date)} 冻结，仅研究，不是正式推荐）` : "研究池：最新冻结批次中没有这只股票";
-  return notice("info", "database", `行情来源 ${esc(source)}<br>正式身份：${d.formal_status === "formal_candidate" ? "当前有效正式候选" : "不是当前正式候选"} · 推荐记录：${d.recommendation_status === "recorded" ? "有" : "无"}<br>${research}`);
+  const offline = (state.ctx.catalog?.data?.entries || []).flatMap(e => (e.items || []).filter(i => i.code === d.code)
+    .map(i => `${esc(e.id)} 第 ${esc(i.rank)} 名（${esc(e.label || "研究观察")}）`));
+  return notice("info", "database", `行情来源 ${esc(source)}<br>正式身份：${d.formal_status === "formal_candidate" ? "当前有效正式候选" : "不是当前正式候选"} · 推荐记录：${d.recommendation_status === "recorded" ? "有" : "无"}<br>${research}${offline.length ? `<br>离线研究名单：${offline.join("；")}` : ""}`);
 }
 function renderStock(d) {
   const bars = (d.bars || []).slice(-LIMITS.bars);
@@ -682,10 +700,10 @@ function renderHealth(d) {
   const fails = (d.failures || []).map(r => `<tr><td>${esc(r.code)}</td><td>${badge(r.state)}</td><td>${badge(r.risk)}</td><td>${esc(bj(r.at))}</td></tr>`);
   const outbox = (title, o) => panel(title, Object.keys(o || {}).length ? `<div class="status-rows">${Object.entries(o).map(([s, n]) => `<div class="status-row">${badge(s, DELIVERY)}<span class="num">${fmt(n, 0)}</span></div>`).join("")}</div>` : empty("没有投递记录", "no_records"));
   return pageHead("系统健康", "", ["持久状态快照，不代表远端服务探活"]) + sec + svc +
-    panel("数据源接口", table(["接口 / 遥测", "状态", "最近成功", "最近错误", "质量记录", "错误", "暂停 / 熔断到", "状态更新"], prov, 980)) +
-    panel("原始数据批次", table(["批次", "数据日期", {t:"代", cls:"r"}, "状态", {t:"行数", cls:"r"}, "口径", "发布时间"], batches, 760)) +
-    panel(`每日链路验收 · 当前数据日 ${esc(current || "未知")}`, table(accHeads, accNow.map(accRow), 640, {empty:empty("当前数据日没有验收记录", "daily_acceptance_missing")}) + history(accHeads, accOld.map(accRow), 640)) +
-    `<div class="grid g-1-1"><div class="col">${panel(`任务 · 当前数据日 ${esc(current || "未知")}`, table(jobHeads, jobsNow.map(jobRow), 520, {empty:empty("当前数据日没有任务记录", "no_records")}) + history(jobHeads, jobsOld.map(jobRow), 520))}${panel("失败与风险标的", table(["标的", "状态", "风险", "时间"], fails, 480))}</div><div class="col">${outbox("盘中信号投递", d.outbox)}${outbox("自动收盘推送", d.automatic_outbox)}${outbox("每日验收推送", d.daily_acceptance_outbox)}</div></div>`;
+    panel("数据源接口", table(["接口 / 遥测", "状态", "最近成功", "最近错误", "质量记录", "错误", "暂停 / 熔断到", "状态更新"], prov, 980), `<span class="src">每类最多 30 条</span>`) +
+    panel("原始数据批次", table(["批次", "数据日期", {t:"代", cls:"r"}, "状态", {t:"行数", cls:"r"}, "口径", "发布时间"], batches, 760), `<span class="src">最近 10 批</span>`) +
+    panel(`每日链路验收 · 当前数据日 ${esc(current || "未知")}`, table(accHeads, accNow.map(accRow), 640, {empty:empty("当前数据日没有验收记录", "daily_acceptance_missing")}) + findingHelp(state.ctx.overview?.data?.acceptance?.findings) + history(accHeads, accOld.map(accRow), 640), `<span class="src">最近 10 次</span>`) +
+    `<div class="grid g-1-1"><div class="col">${panel(`任务 · 当前数据日 ${esc(current || "未知")}`, table(jobHeads, jobsNow.map(jobRow), 520, {empty:empty("当前数据日没有任务记录", "no_records")}) + history(jobHeads, jobsOld.map(jobRow), 520), `<span class="src">最近 15 条</span>`)}${panel("失败与风险标的", table(["标的", "状态", "风险", "时间"], fails, 480), `<span class="src">最近 20 条</span>`)}</div><div class="col">${outbox("盘中信号投递", d.outbox)}${outbox("自动收盘推送", d.automatic_outbox)}${outbox("每日验收推送", d.daily_acceptance_outbox)}</div></div>`;
 }
 function renderSettings(d) {
   const names = {min_score:"最低技术分", price_min:"最低价格", price_max:"最高价格", deep_screen_limit:"技术深筛上限", factor_screen_limit:"因子筛选上限", screen_min_indicator_coverage:"最低指标覆盖", intraday_confirmation_periods:"连续确认次数", intraday_cooldown_seconds:"信号冷却（秒）", intraday_min_amount:"最低成交额", market_comparison_enabled:"量价对照", market_comparison_benchmark:"指定基准指数", paper_trading_only:"仅研究 / 模拟", price_plan_close_tolerance_pct:"收盘计划偏差容限", official_evidence_enabled:"官方证据核验", official_evidence_candidate_limit:"官方证据候选上限", official_evidence_cache_seconds:"官方证据缓存（秒）"};
@@ -717,7 +735,7 @@ async function contextJobs(view, signal) {
   if (view !== "overview") jobs.overview = soft("overview", signal);
   if (view !== "health") jobs.health = soft("health", signal);
   if (view === "health") jobs.version = soft("version", signal);
-  if (view === "research") jobs.catalog = soft("research_catalog", signal);
+  if (view === "research" || view === "stock") jobs.catalog = soft("research_catalog", signal);
   if (view === "overview") jobs.candidates = soft("candidates", signal);
   if (view === "candidates") jobs.perf3 = soft("performance?horizon=3", signal);
   const keys = Object.keys(jobs), values = await Promise.all(Object.values(jobs));
