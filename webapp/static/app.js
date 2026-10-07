@@ -996,6 +996,23 @@ function renderHealth(d) {
     panel(`任务 · 当前数据日 ${esc(current || "未知")}`, table(jobHeads, jobsNow.map(jobRow), 760, {empty:empty("当前数据日没有任务记录", "no_records")}) + history(jobHeads, jobsOld.map(jobRow), 760), `<span class="src">最近 15 条</span>`) +
     `<div class="grid g-1-1"><div class="col">${panel("失败与风险标的", table(["标的", "状态", "风险", "时间"], fails, 480), `<span class="src">最近 20 条</span>`)}</div><div class="col">${outbox("盘中信号投递", d.outbox)}${outbox("自动收盘推送", d.automatic_outbox)}${outbox("每日验收推送", d.daily_acceptance_outbox)}</div></div>`;
 }
+// C10: how the screen's caps chain, in the order the plugin applies them (values from the load-time snapshot).
+const CAP_CHAIN = [
+  ["price_min", "price_max", "价格区间", "价格不在区间的股票不进入后面任何一步"],
+  ["deep_screen_limit", null, "深筛名额", "停牌 / 涨跌停 / ST 都核验为否的股票里，按成交额取前 N 只算指标和技术分"],
+  ["factor_screen_limit", null, "因子名额", "深筛里技术分前 N 只才去取 ST / 审计和基本面字段；其余拿不到，会被算成“风险未知”，进不了正式候选"],
+  ["official_evidence_candidate_limit", null, "官方证据名额", "因子名额里前 N 只再查官方公告证据"],
+  ["min_score", null, "最低技术分", "风险复核通过且技术分不低于它的才算达标"],
+  ["candidate_limit", null, "候选上限", "达标的按排名取前 N 只写成正式候选"],
+  ["fallback_limit", null, "观察候选上限", "一只都没达标时，最多列出 N 只未达最低分的观察候选"],
+  ["report_candidate_limit", null, "报告展示上限", "推送报告里最多展示 N 只"],
+];
+function capsPanel(items) {
+  const byKey = new Map(items.map(r => [r.key, r]));
+  const show = key => {const r = byKey.get(key); if (!r) return `<span class="muted">未知</span>`; return r.state === "shown" && r.effective !== null && r.effective !== undefined ? `${esc(r.effective)}${r.differs ? `<small>默认 ${esc(r.default)}</small>` : ""}` : `<span class="muted">未知</span><small>默认 ${esc(r.default ?? "—")}</small>`;};
+  const rows = CAP_CHAIN.map(([key, second, label, help], i) => `<div class="status-row"><span>${i + 1}. ${label}<small>${help}</small></span><span class="num">${second ? `${show(key)} – ${show(second)}` : show(key)}<small class="mono">${esc(second ? `${key} / ${second}` : key)}</small></span></div>`).join("");
+  return panel("筛选上限怎么串起来（C10）", `<div class="status-rows">${rows}</div><p class="regime-note">顺序就是插件实际执行的顺序；每一步只在上一步留下的股票里做。候选页的“筛选漏斗”显示每次筛选在每一步还剩多少只。</p>`, `<span class="src">只读 · 来自插件加载时的配置快照</span>`);
+}
 function renderSettings(d) {
   const names = {min_score:"最低技术分", price_min:"最低价格", price_max:"最高价格", deep_screen_limit:"技术深筛上限", factor_screen_limit:"因子筛选上限", screen_min_indicator_coverage:"最低指标覆盖", intraday_confirmation_periods:"连续确认次数", intraday_cooldown_seconds:"信号冷却（秒）", intraday_min_amount:"最低成交额", market_comparison_enabled:"量价对照", market_comparison_benchmark:"指定基准指数", paper_trading_only:"仅研究 / 模拟", price_plan_close_tolerance_pct:"收盘计划偏差容限", official_evidence_enabled:"官方证据核验", official_evidence_candidate_limit:"官方证据候选上限", official_evidence_cache_seconds:"官方证据缓存（秒）"};
   const s = d.snapshot || {}, items = d.items || [];
@@ -1016,7 +1033,7 @@ function renderSettings(d) {
   const deprecated = (s.deprecated_settings || []).length ? notice("warn", "triangle-alert", `这些旧配置项设成了非默认值，但当前代码不读取：${esc(s.deprecated_settings.join("、"))}。在面板改回默认可以消掉加载告警，实际行为不变。`) : "";
   const issues = (s.setting_issues || []).map(i => notice(i.level === "error" ? "crit" : "warn", "triangle-alert",
     `配置检查：${esc(i.message)}。${esc(i.effect)}。<small class="mono">${esc((i.keys || []).join(" · "))}</small>`)).join("");
-  return pageHead("策略设置", "", ["只读"]) + head + deprecated + issues +
+  return pageHead("策略设置", "", ["只读"]) + head + deprecated + issues + capsPanel(items) +
     (changed.length ? panel(`与默认值不同 · ${fmt(changed.length, 0)} 项`, table(heads, changed.map(row), 760)) : "") +
     panel("常用参数", table(heads, common.map(row), 760)) +
     panel(`全部参数 · ${fmt(items.length, 0)} 项`, `<details class="history"><summary>展开其余 ${fmt(others.length, 0)} 项（高级）</summary>${table(heads, others.map(row), 760)}</details>`) +

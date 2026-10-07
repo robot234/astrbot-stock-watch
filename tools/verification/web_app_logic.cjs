@@ -163,6 +163,12 @@ const checked = app.renderSettings({snapshot: {status: "plugin_snapshot", settin
 check("settings_issues", checked.includes("notice crit") && checked.includes("price_min 90 高于 price_max 80") && checked.includes("正式候选会一直为空")
   && checked.includes("price_min · price_max") && checked.includes("&lt;b&gt;95&lt;/b&gt;") && !checked.includes("<b>95</b>"));
 check("settings_no_issues", !app.renderSettings({snapshot: {status: "plugin_snapshot"}, items: []}).includes("配置检查"));
+const caps = app.renderSettings({snapshot: {status: "plugin_snapshot"}, items: [
+  {key: "deep_screen_limit", state: "shown", effective: 300, default: 300, differs: false},
+  {key: "factor_screen_limit", state: "shown", effective: 80, default: 100, differs: true},
+  {key: "price_min", state: "shown", effective: 2, default: 2}, {key: "price_max", state: "unknown", effective: null, default: 80}]});
+check("settings_caps_chain", caps.includes("筛选上限怎么串起来") && caps.includes("2. 深筛名额") && caps.includes("3. 因子名额") && caps.includes("80<small>默认 100</small>")
+  && caps.includes("进不了正式候选") && caps.includes("未知</span><small>默认 80</small>") && caps.indexOf("深筛名额") < caps.indexOf("因子名额"));
 
 // Evening research signals: overheat badges, the index thermometer and the stock panel stay display-only.
 const signals = (extra = {}) => ({meta: {status: "available"}, data: {status: "available", generated_at: "2026-10-07T10:40:00+00:00",
