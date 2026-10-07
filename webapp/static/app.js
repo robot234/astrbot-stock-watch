@@ -668,6 +668,24 @@ function macdStockPanel(d) {
   const values = `<div class="kv"><div>DIF</div><div class="num">${fmt(m.dif, 3)}</div><div>DEA</div><div class="num">${fmt(m.dea, 3)}</div><div>MACD 柱（2 × (DIF − DEA)）</div><div class="num ${tone(m.histogram)}">${fmt(m.histogram, 3)}</div></div>`;
   return panel("MACD 状态", gap + rows + values + `<p class="regime-note">MACD(12, 26, 9)，用前收盘连乘的连续价格计算，除权不会变成假死叉；DIF / DEA 换算到最新收盘价，和软件前复权的数值接近。用本批次 ${fmt(m.sessions, 0)} 个交易日（${esc(m.first_session || "—")} 起）递推。方案 H 回看：金叉 + 不过热持有 5 天比同日股票池少赚 0.09 个百分点，不显著；方案 I 从 10-08 起前瞻检验它在 T+2 / T+3 上的增量。只显示，不改正式门槛。</p>`, `<span class="src">研究参考 · 截至 ${esc(m.trade_date || "日期未知")}</span>`);
 }
+// W14: browse the pools by purpose; the frozen rank stays in every row whatever the order or filter.
+const RESEARCH_FILTERS = [["all", "全部"], ["primary", "只看重点"], ["radar", "只看警戒"], ["hot", "过热"], ["risk_unknown", "风险未知"]];
+const RESEARCH_COLUMNS = [[3, "冻结参考价 / 计划"], [4, "资格 / 确认"], [5, "模拟状态 / 入场"], [6, "D1 / D3 / D5"], [7, "版本 / 缺口"]];
+const researchHidden = () => new Set(saved("stock-watch.research-hide", []).filter(Number.isInteger));
+function researchPick(primary, radar) {
+  const f = state.researchFilter || "all", hot = hotMap(state.ctx.signals);
+  const unknownRisk = r => !r.risk_level || /unknown|missing|未知/.test(String(r.risk_level));
+  const keep = rows => f === "hot" ? rows.filter(r => hot.has(r.code)) : f === "risk_unknown" ? rows.filter(unknownRisk) : rows;
+  const order = rows => state.researchSort === "score" ? [...rows].sort((a, b) => (Number(b.score) || -Infinity) - (Number(a.score) || -Infinity) || Number(a.rank) - Number(b.rank)) : rows;
+  return [f === "radar" ? [] : order(keep(primary)), f === "primary" ? [] : order(keep(radar))];
+}
+function researchTools() {
+  const f = state.researchFilter || "all", hidden = researchHidden();
+  return `<div class="toolbar research-tools"><div class="seg" role="group" aria-label="研究池筛选">${RESEARCH_FILTERS.map(([id, label]) => `<button type="button" data-research-filter="${id}" class="${f === id ? "active" : ""}" aria-pressed="${f === id}">${label}</button>`).join("")}</div>` +
+    `<select id="research-sort" aria-label="研究池排序"><option value="rank"${state.researchSort !== "score" ? " selected" : ""}>按冻结排名</option><option value="score"${state.researchSort === "score" ? " selected" : ""}>按评分（原排名仍显示）</option></select>` +
+    `<details class="col-toggle"><summary>显示列</summary>${RESEARCH_COLUMNS.map(([i, label]) => `<label><input type="checkbox" data-research-col="${i}"${hidden.has(i) ? "" : " checked"}> ${label}</label>`).join("")}</details></div>`;
+}
+const researchPoolsClass = () => ["research-pools", ...[...researchHidden()].map(i => `hide-c${i}`)].join(" ");
 function renderResearch() {
   const rs = state.ctx.research || {status:"unavailable", reason:"research_pool_schema_unavailable"};
   const band = `<div class="lab-band">${ic("flask-conical")}<div><b>未验证 · 不是买入建议</b><br>研究记录独立冻结，不进入历史表现统计。</div></div>`;
@@ -688,9 +706,10 @@ function renderResearch() {
   const gates = panel("留出期检验", `<div class="gates">${GATES.map(g => `<div class="gate"><span>${esc(g)}</span><span>H3 ${badge("unknown")}</span><span>H5 ${badge("unknown")}</span></div>`).join("")}</div>`, `<span class="src">原因代码 holdout_source_unavailable</span>`);
   let left = LIMITS.recommendations;
   const take = arr => {const out = arr.slice(0, Math.max(0, left)); left -= out.length; return out;};
-  const p = take(primary), r = take(radar), h = take(history);
-  return pageHead("研究观察池", "", [`记录上限 ${LIMITS.recommendations}`]) + band + rules + gates +
-    panel(`观察池 · ${p.length}`, researchRows(p)) + panel(`警戒池 · ${r.length}`, researchRows(r)) + panel(`历史模拟记录 · ${h.length}`, paperHistoryRows(h)) + catalogSection();
+  const p0 = take(primary), r0 = take(radar), h = take(history), [p, r] = researchPick(p0, r0);
+  const shown = (rows, all) => rows.length === all.length ? `${rows.length}` : `${rows.length} / ${all.length}`;
+  return pageHead("研究观察池", "", [`记录上限 ${LIMITS.recommendations}`]) + band + rules + gates + researchTools() +
+    `<div class="${researchPoolsClass()}">${panel(`观察池 · ${shown(p, p0)}`, researchRows(p))}${panel(`警戒池 · ${shown(r, r0)}`, researchRows(r))}</div>` + panel(`历史模拟记录 · ${h.length}`, paperHistoryRows(h)) + catalogSection();
 }
 
 // Stock detail.
@@ -839,7 +858,7 @@ function renderStock(d) {
   const evRows = Object.entries({...(ev.financial || {}), ...(ev.risk || {})}).map(([k, v]) => `<tr><td>${esc(EVIDENCE_FIELDS[k] || k)}</td><td class="num">${v?.value === null || v?.value === undefined ? "未知" : typeof v.value === "boolean" ? (v.value ? "是" : "否") : fmt(v.value)}</td><td>${badge(v?.quality)}</td><td class="wrap">${esc(v?.reason || "—")}</td></tr>`);
   const recs = (d.recommendations || []).slice(0, LIMITS.recommendations).map(r => `<tr><td>${esc(r.date)}</td><td>${badge(r.plan_status)}</td><td>${badge(r.comparability)}</td><td class="mono">${esc(r.plan_version || "—")}</td></tr>`);
   return panel("查找个股", stockSearchForm()) + `<section class="panel">${head}${coverage}${tools}${chart}</section>` + stockStatusNotice(d) + quality +
-    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${riskReminderPanel()}${macdStockPanel(d)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
+    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), limitNote((d.recommendations || []).length, LIMITS.recommendations))}${panel("信号历史", signalRows(d.signals || []), limitNote((d.signals || []).length, LIMITS.events))}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${riskReminderPanel()}${macdStockPanel(d)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), limitNote((d.announcements?.items || []).length, LIMITS.announcements))}</div></div>`;
 }
 // Chart settings live in this browser only (localStorage); moving averages are computed from the bars shown.
 const MA_DEFAULT = [5, 13, 34, 55, 120], MA_LIMIT = 8;
@@ -973,9 +992,23 @@ function drawChart(bars, canvas, opts = {}) {
 }
 
 // Performance: mature, pending and unknown stay separate; ratios need enough mature samples.
+// W16: page through what was read, and say so when the read limit cut the list.
+const PAGE_SIZE = 50;
+function pager(key, rows, limit) {
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  const page = Math.min(Math.max(1, state.pages?.[key] || 1), pages);
+  const cut = limit && rows.length >= limit ? ` · 已到读取上限 ${fmt(limit, 0)} 条，更早的记录没有读取` : "";
+  const nav = pages > 1 ? `<button type="button" class="btn sm" data-page="${key}:${page - 1}"${page <= 1 ? " disabled" : ""}>上一页</button><button type="button" class="btn sm" data-page="${key}:${page + 1}"${page >= pages ? " disabled" : ""}>下一页</button>` : "";
+  return {slice: rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    controls: `<div class="toolbar pager"><span class="count">共 ${fmt(rows.length, 0)} 条 · 第 ${page} / ${pages} 页（每页 ${PAGE_SIZE} 条）${cut}</span>${nav}</div>`};
+}
+const limitNote = (count, limit, what = "条") => Number(count) >= limit ? `<span class="src warn-text">已到读取上限 ${fmt(limit, 0)} ${what}，更早的没有读取</span>` : `<span class="src">最多 ${fmt(limit, 0)} ${what}</span>`;
 function renderPerformance(d) {
   state.performance = d;
-  const all = d.records || [], recs = all.slice(0, LIMITS.recommendations);
+  const all = d.records || [], read = all.slice(0, LIMITS.recommendations);
+  const range = state.perfRange || {}, inRange = r => (!range.from || String(r.date) >= range.from) && (!range.to || String(r.date) <= range.to);
+  const filtered = read.filter(inRange), {slice: recs, controls} = pager("performance", filtered, all.length >= LIMITS.recommendations ? LIMITS.recommendations : 0);
+  const dateBar = `<div class="toolbar"><label>从 <input type="date" id="perf-from" value="${esc(range.from || "")}"></label><label>到 <input type="date" id="perf-to" value="${esc(range.to || "")}"></label><span class="count">${range.from || range.to ? `日期范围内 ${fmt(filtered.length, 0)} / 已读 ${fmt(read.length, 0)} 条` : "日期范围只在已读取的记录里筛"}</span></div>`;
   const pending = all.filter(r => r.maturity === "pending").length, unknown = all.filter(r => !["pending", "mature"].includes(r.maturity)).length;
   const enough = n => Number(n) >= MIN_SAMPLE, gated = (n, html) => enough(n) ? html : `<span class="muted">样本不足</span>`;
   const seg = `<div class="toolbar bare"><div class="seg" role="group" aria-label="持有期">${[1, 3, 5, 10].map(n => `<button type="button" data-horizon="${n}" class="${state.horizon === n ? "active" : ""}">T+${n}</button>`).join("")}</div><span class="count">交易日窗口 · 未复权收盘到收盘 · 不含交易成本</span></div>`;
@@ -990,7 +1023,7 @@ function renderPerformance(d) {
   const rows = recs.map(r => `<tr><td>${link(r.code, r.name)}<small>${esc(r.date)}</small></td><td>${badge(r.maturity)}</td><td>${badge(r.status)}</td><td>${badge(r.ai_decision, AI_DECISION)}</td><td class="r num ${tone(r.return_pct)}">${pct(r.return_pct)}</td><td class="r num">${pct(r.max_gain_pct)}</td><td class="r num ${tone(r.drawdown_pct)}">${pct(r.drawdown_pct)}</td><td class="mono">${esc(r.reason || "—")}</td></tr>`);
   return pageHead("历史表现", "", [`记录上限 ${LIMITS.recommendations}`]) + seg + counts + stats + gateNote +
     panel("AI 影子评审分组", table(["分组", {t:"样本", cls:"r"}, {t:"价格可评", cls:"r"}, {t:"正收益比例", cls:"r"}, {t:"中位收益", cls:"r"}], aiRows, 560)) +
-    panel(`推荐记录 · ${recs.length}`, statusBar + table(["推荐日期 / 标的", "到期", "评估状态", "AI 评审", {t:"收益", cls:"r"}, {t:"最大浮盈", cls:"r"}, {t:"收盘回撤", cls:"r"}, "原因代码"], rows, 1000));
+    panel(`推荐记录 · ${filtered.length}`, statusBar + dateBar + controls + table(["推荐日期 / 标的", "到期", "评估状态", "AI 评审", {t:"收益", cls:"r"}, {t:"最大浮盈", cls:"r"}, {t:"收盘回撤", cls:"r"}, "原因代码"], rows, 1000));
 }
 
 // A job row says which attempt this was, why it stopped, and what the screen saw.
@@ -1033,7 +1066,49 @@ function acceptanceFollowUp(r) {
   return lines.map(t => `<small>${esc(t)}</small>`).join("");
 }
 
+// O09: a request failing and stored data still being usable can both be true, so each layer gets its own column.
+function sourceLayers(d) {
+  const live = state.ctx.overview?.data?.live_market, session = state.ctx.overview?.data?.session || {};
+  const active = (d.batches || []).find(b => b.state === "active") || (d.batches || [])[0];
+  const providerRow = p => {
+    const paused = blockedNow(p) || circuitNow(p), streak = Number(p.failure_streak) || 0;
+    const can = p.stale ? kindBadge("unk", "旧遥测", "stale_telemetry") : paused ? kindBadge("warn", "暂停中", "paused") : streak ? kindBadge("warn", `最近连续失败 ${streak} 次`, "failing") : kindBadge("ok", "可请求", "requestable");
+    const until = p.blocked_until ? `${bj(p.blocked_until)}${blockedNow(p) ? "（生效中）" : "（已过期）"}` : p.circuit_open_until ? `${bj(p.circuit_open_until)}${circuitNow(p) ? "（生效中）" : "（已过期）"}` : "—";
+    return [esc(p.name), can, esc(until), rateOnly(p) ? `<span class="muted">未采集</span>` : esc(bj(p.success_at)), rateOnly(p) ? `<span class="muted">不适用</span>` : badge(p.quality),
+      p.stale ? "不代表当前：插件已不再更新这类遥测" : "看下面的数据行：接口失败时已存数据照样能读"];
+  };
+  const rows = [
+    ["日线（插件 raw 批次）", `<span class="muted">按计划请求，见任务表</span>`, "—", esc(active?.date || "未知"), active ? badge(active.state) : badge("unknown"),
+      active ? `可用：读已发布的第 ${esc(active.generation ?? "?")} 代批次（${fmt(active.rows, 0)} 行）` : "不可用：没有已发布批次"],
+    ["盘中报价（插件盯盘文件）", live?.status === "available" ? kindBadge("ok", "在更新", "available") : kindBadge("unk", "未在更新", live?.reason || "live_market_missing"), "—",
+      esc(live?.at ? bj(live.at) : "—"), badge(live?.status || "unknown"), esc(SESSION_HINT[session.phase] || "交易日历未知")],
+    ...(d.providers || []).map(providerRow),
+  ];
+  return panel("数据源分层（O09）", table(["来源", "能不能请求", "暂停 / 熔断到", "最近成功 / 数据日", "质量", "业务能不能用"], rows.map(r => `<tr>${r.map(c => `<td class="wrap">${c}</td>`).join("")}</tr>`), 980),
+    `<span class="src">请求能力、限流、最近成功、质量、业务可用分开看</span>`);
+}
+// W18: a plain-text summary of what the page shows; it holds no keys, tokens or chat ids because the API never sends them.
+function healthSummaryText(d) {
+  const plain = html => String(html ?? "").replace(/<br\s*\/?>/g, "；").replace(/<[^>]+>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&").trim();
+  const acc = d.daily_acceptance || [], findings = state.ctx.overview?.data?.acceptance?.findings || [];
+  const lines = [`# Stock Watch 健康摘要`, `导出时间：${bj(new Date().toISOString())}`, `数据日：${d.data_date || "未知"}`, `Web：${state.ctx.version?.data?.build?.revision || "未知"}`, "",
+    "## 最近验收", ...acc.slice(0, 5).map(r => `- ${r.date} ${r.status}：${r.summary || "—"}（检查 ${bj(r.checked_at)}）`), "",
+    "## 当前发现", ...(findings.length ? findings.map(f => `- ${typeof f === "string" ? f : f.code || f.reason || JSON.stringify(f)}：${plain(reasonText(typeof f === "string" ? f : f.code || ""))}`) : ["- 无"]), "",
+    "## 任务", ...(d.jobs || []).slice(0, 15).map(r => `- ${r.date} ${JOB_NAMES[r.name] || r.name} ${r.status}：${plain(jobExplain(r, d.automatic_close_limits))}`), "",
+    "## 数据源", ...(d.providers || []).map(p => `- ${p.name}：${providerKind(p)}；${plain(providerText(p))}`), "",
+    "## 原始数据批次", ...(d.batches || []).slice(0, 3).map(b => `- ${b.date} 第 ${b.generation} 代 ${b.state} ${b.rows} 行`)];
+  return lines.join("\n") + "\n";
+}
+function exportHealth() {
+  const d = state.health;
+  if (!d) return;
+  const url = URL.createObjectURL(new Blob([healthSummaryText(d)], {type: "text/markdown;charset=utf-8"}));
+  const a = Object.assign(document.createElement("a"), {href: url, download: `stock-watch-health-${d.data_date || "unknown"}.md`});
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 function renderHealth(d) {
+  state.health = d;
   const loop = isLoopback(), chain = chainState(), live = state.ctx.overview?.data?.live_market, acc = (d.daily_acceptance || [])[0];
   const sec = `<div class="secnote ${loop ? "ok" : ""}">${ic(loop ? "lock" : "shield-alert")}<div><b>${esc(accessText())}</b><br>${loop ? "仅本机回环可访问；远程查看请走 SSH 隧道。" : "当前地址可被局域网访问且没有鉴权，建议改为回环绑定并通过 SSH 隧道访问。"}</div></div>`;
   const cell = (k, v, s) => `<div><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`;
@@ -1060,6 +1135,8 @@ function renderHealth(d) {
   const fails = (d.failures || []).map(r => `<tr><td>${esc(r.code)}</td><td>${badge(r.state)}</td><td>${badge(r.risk)}</td><td>${esc(bj(r.at))}</td></tr>`);
   const outbox = (title, o) => panel(title, Object.keys(o || {}).length ? `<div class="status-rows">${Object.entries(o).map(([s, n]) => `<div class="status-row">${badge(s, DELIVERY)}<span class="num">${fmt(n, 0)}</span></div>`).join("")}</div>` : empty("没有投递记录", "no_records"));
   return pageHead("系统健康", "", ["持久状态快照，不代表远端服务探活"]) + sec + svc +
+    `<div class="toolbar"><button type="button" class="btn" data-health-export>${ic("database")}导出摘要（不含密钥 / 会话号）</button><span class="count">把验收、当前发现、任务、数据源整理成一份文本，方便发给别人看</span></div>` +
+    sourceLayers(d) +
     panel("数据源接口", table(["接口 / 遥测", "状态", "最近成功", "最近错误", "质量记录", "错误", "暂停 / 熔断到", "状态更新"], prov, 980), `<span class="src">每类最多 30 条</span>`) +
     panel("原始数据批次", table(["批次", "数据日期", {t:"代", cls:"r"}, "状态", {t:"行数", cls:"r"}, "口径", "发布时间"], batches, 760), `<span class="src">最近 10 批</span>`) +
     panel(`每日链路验收 · 当前数据日 ${esc(current || "未知")}`, table(accHeads, accNow.map(accRow), 900, {empty:empty("当前数据日没有验收记录", "daily_acceptance_missing")}) + findingHelp(state.ctx.overview?.data?.acceptance?.findings) + history(accHeads, accOld.map(accRow), 900), `<span class="src">最近 10 次 · 原验收记录不改写</span>`) +
@@ -1083,6 +1160,62 @@ function capsPanel(items) {
   const rows = CAP_CHAIN.map(([key, second, label, help], i) => `<div class="status-row"><span>${i + 1}. ${label}<small>${help}</small></span><span class="num">${second ? `${show(key)} – ${show(second)}` : show(key)}<small class="mono">${esc(second ? `${key} / ${second}` : key)}</small></span></div>`).join("");
   return panel("筛选上限怎么串起来（C10）", `<div class="status-rows">${rows}</div><p class="regime-note">顺序就是插件实际执行的顺序；每一步只在上一步留下的股票里做。候选页的“筛选漏斗”显示每次筛选在每一步还剩多少只。</p>`, `<span class="src">只读 · 来自插件加载时的配置快照</span>`);
 }
+// C06: groups by what the setting is for; the first matching group wins, so the order matters.
+const SETTING_GROUPS = [
+  ["push", "启停与推送", /^(enabled|paper_trading_only|push_|allow_self_whitelist|automatic_delivery_|daily_acceptance_alert|web_watch_)/],
+  ["source", "数据源与快照", /^(tushare_|daily_cache_|daily_snapshot_|daily_market_url|market_min_snapshot_size|calendar_|realtime_backup_|request_timeout|max_concurrency|universe_codes|factor_source|factor_data_url)/],
+  ["screen", "选股与收盘任务", /^(price_|min_score|deep_screen_limit|factor_screen_limit|screen_|candidate_|report_candidate_limit|fallback_limit|degraded_watch_|daily_scan_time|daily_acceptance|automatic_close_|factor_mode)/],
+  ["research", "研究与证据", /^(official_evidence_|market_comparison_|research_)/],
+  ["intraday", "盘中盯盘", /^(intraday_|quote_|minute_|watchlist_limit|auto_watch_candidates|confirmation_|cost_)/],
+  ["model", "模型与新闻", /^(llm_|news_)/],
+];
+const settingGroup = key => (SETTING_GROUPS.find(([, , re]) => re.test(key)) || ["ops"])[0];
+function settingGroupsHtml(items, heads, row) {
+  return [...SETTING_GROUPS, ["ops", "其它 / 运维"]].map(([id, label]) => {
+    const rows = items.filter(r => settingGroup(r.key) === id);
+    if (!rows.length) return "";
+    const changed = rows.filter(r => r.differs).length;
+    return `<details class="history setting-group" data-group="${id}"><summary>${esc(label)} · ${fmt(rows.length, 0)} 项${changed ? ` · 已改 ${fmt(changed, 0)}` : ""}</summary>${table(heads, rows.map(row), 760)}</details>`;
+  }).join("");
+}
+const settingValue = (items, key) => { const r = items.find(x => x.key === key); return r && r.state === "shown" ? r.effective : null; };
+// C08: orders of magnitude from the effective settings, not measurements.
+function budgetPanel(items) {
+  const v = key => settingValue(items, key), n = (x, d = 0) => x === null || x === undefined ? "未知" : fmt(x, d);
+  const per = (seconds, span) => finite(seconds) && seconds > 0 ? Math.floor(span / seconds) : null;
+  const rows = [
+    ["盘中报价", `每 ${n(v("quote_interval_seconds"))} 秒一轮，4 小时交易时段约 ${n(per(v("quote_interval_seconds"), 14400))} 轮；每轮把盯盘名单（自选 + 候选 + 重点关注，重点最多 ${n(v("intraday_focus_limit"))} 只）分批请求新浪`, "quote_interval_seconds"],
+    ["全市场盘中环境", `每 ${n(v("intraday_market_refresh_seconds"))} 秒一次，交易时段约 ${n(per(v("intraday_market_refresh_seconds"), 14400))} 次`, "intraday_market_refresh_seconds"],
+    ["Tushare 日线", `保留 ${n(v("tushare_raw_session_count"))} 个交易日；每个交易日的全市场日线按每页 ${n(v("tushare_bulk_page_size"))} 条分页（约 5,500 只 → ${n(finite(v("tushare_bulk_page_size")) && v("tushare_bulk_page_size") > 0 ? Math.ceil(5500 / v("tushare_bulk_page_size")) : null)} 页），失败重试 ${n(v("tushare_retry_attempts"))} 次；平时每天只新增 1 个交易日`, "tushare_raw_session_count"],
+    ["官方证据", v("official_evidence_enabled") === false ? "已关闭" : `每次收盘最多核验 ${n(v("official_evidence_candidate_limit"))} 只候选，结果缓存 ${n(v("official_evidence_cache_seconds"))} 秒`, "official_evidence_enabled"],
+    ["模型", v("llm_enabled") === false ? "已关闭" : `每天最多 ${n(v("llm_daily_request_limit"))} 次，两次间隔 ≥ ${n(v("llm_min_interval_seconds"))} 秒；盘中解释${v("llm_annotation_enabled") === false ? "已关闭" : `每 ${n(v("llm_annotation_interval_seconds"))} 秒最多 ${n(v("llm_annotation_limit"))} 条`}`, "llm_daily_request_limit"],
+    ["新闻", `每 ${n(v("news_interval_seconds"))} 秒拉一次 RSS，每天约 ${n(per(v("news_interval_seconds"), 86400))} 次`, "news_interval_seconds"],
+  ];
+  return panel("请求量与额度预估（C08）", `<div class="status-rows">${rows.map(([label, text, key]) => `<div class="status-row"><span>${label}<small class="mono">${esc(key)}</small></span><span class="wrap">${esc(text)}</span></div>`).join("")}</div><p class="regime-note">按当前生效配置推算的上限和量级，不是实测。“5 秒”是轮询间隔，不保证 5 秒内拿到行情：请求本身要时间，失败会退避。改动这些参数前先看这里会多出多少请求。</p>`, `<span class="src">只读 · 估算</span>`);
+}
+// C09: a clock time is when a job starts, not when the data is complete.
+function arrivalPanel(items) {
+  const v = key => settingValue(items, key), n = x => x === null || x === undefined ? "未知" : esc(String(x));
+  const rows = [
+    ["盘后扫描开始", n(v("daily_scan_time")), "插件到点开始取当天全市场日线并筛选；数据没齐会按下面的重试窗口再试"],
+    ["当日验收", v("daily_acceptance_enabled") === false ? "已关闭" : n(v("daily_acceptance_time")), "到点核对当天任务的实际运行状态（完成 / 仍在重试 / 超时），不是到点就算失败"],
+    ["自动收盘重试", `${n(v("automatic_close_max_attempts"))} 次 · 每 ${n(v("automatic_close_retry_seconds"))} 秒 · 最长 ${n(v("automatic_close_retry_window_seconds"))} 秒`, "风险门槛在当前代码下不可能通过时首轮就停（O04），只有临时取数失败才重试"],
+    ["Tushare 日线", "交易日 15:00—16:00 入库", "Tushare 文档说明的入库时间，个别日子更晚；扫描时间晚于它才不必等"],
+    ["两融明细", "沪市当晚 · 深市常到下一交易日", "所以“两融拥挤”用最近一个沪深都已发布的交易日"],
+    ["解禁事件", "东财晚间陆续补登", "10-07 实测 18:13 / 18:41 / 19:12 三次各多出新登记的事件；研究信号 21:40 那次可以补上"],
+  ];
+  return panel("数据什么时候到（C09）", `<div class="status-rows">${rows.map(([label, value, help]) => `<div class="status-row"><span>${label}<small>${esc(help)}</small></span><span class="num">${value}</span></div>`).join("")}</div>`, `<span class="src">时间为北京时间；外部数据时间是经验值，不保证</span>`);
+}
+// C11: only whether a credential is filled in, never its content.
+const CREDENTIALS = [["tushare_token", "Tushare 日线与交易日历", "只需要日线、交易日历的读取权限"], ["llm_api_key", "模型解释与研究摘要（llm_*）", "只需要对话补全；建议单独开一个低额度的 key"]];
+function credentialPanel(items) {
+  const rows = CREDENTIALS.map(([key, use, scope]) => {
+    const r = items.find(x => x.key === key), filled = r && r.state === "custom";
+    const state = !r || r.state === "unknown" ? kindBadge("unk", "未知", "snapshot_missing") : filled ? kindBadge("info", "已填写 · 未验证", "configured_unverified") : kindBadge("warn", "未填写", "empty");
+    return `<div class="status-row"><span>${esc(use)}<small class="mono">${esc(key)}</small></span><span>${state}<small>${esc(scope)}</small></span></div>`;
+  }).join("");
+  return panel("凭据状态（C11）", `<div class="status-rows">${rows}</div><p class="regime-note">只显示有没有填写，不显示内容，也不代表能用：能不能用看健康页的接口状态。默认关闭的功能保持关闭。</p>`, `<span class="src">只读</span>`);
+}
 function renderSettings(d) {
   const names = {min_score:"最低技术分", price_min:"最低价格", price_max:"最高价格", deep_screen_limit:"技术深筛上限", factor_screen_limit:"因子筛选上限", screen_min_indicator_coverage:"最低指标覆盖", intraday_confirmation_periods:"连续确认次数", intraday_cooldown_seconds:"信号冷却（秒）", intraday_min_amount:"最低成交额", market_comparison_enabled:"量价对照", market_comparison_benchmark:"指定基准指数", paper_trading_only:"仅研究 / 模拟", price_plan_close_tolerance_pct:"收盘计划偏差容限", official_evidence_enabled:"官方证据核验", official_evidence_candidate_limit:"官方证据候选上限", official_evidence_cache_seconds:"官方证据缓存（秒）"};
   const s = d.snapshot || {}, items = d.items || [];
@@ -1104,9 +1237,10 @@ function renderSettings(d) {
   const issues = (s.setting_issues || []).map(i => notice(i.level === "error" ? "crit" : "warn", "triangle-alert",
     `配置检查：${esc(i.message)}。${esc(i.effect)}。<small class="mono">${esc((i.keys || []).join(" · "))}</small>`)).join("");
   return pageHead("策略设置", "", ["只读"]) + head + deprecated + issues + capsPanel(items) +
+    `<div class="grid g-1-1">${budgetPanel(items)}${arrivalPanel(items)}</div>` + credentialPanel(items) +
     (changed.length ? panel(`与默认值不同 · ${fmt(changed.length, 0)} 项`, table(heads, changed.map(row), 760)) : "") +
     panel("常用参数", table(heads, common.map(row), 760)) +
-    panel(`全部参数 · ${fmt(items.length, 0)} 项`, `<details class="history"><summary>展开其余 ${fmt(others.length, 0)} 项（高级）</summary>${table(heads, others.map(row), 760)}</details>`) +
+    panel(`全部参数 · ${fmt(items.length, 0)} 项`, settingGroupsHtml(others, heads, row), `<span class="src">按用途分组（C06）；常用参数已在上面单列</span>`) +
     notice("info", "lock", "令牌、密钥、地址、推送白名单、路径等字段只显示“未填写 / 与默认相同 / 已修改”，不显示内容。");
 }
 
@@ -1226,12 +1360,20 @@ document.addEventListener("change",event=>{
   if(event.target.id==="signal-filter")$("#signal-rows").innerHTML=signalRows(state.signals.filter(r=>!event.target.value || r.state===event.target.value));
   if(event.target.id==="ma-toggle" && state.stock){state.ma=event.target.checked;redrawChart();}
   if(event.target.id==="macd-toggle" && state.stock){state.macdOn=event.target.checked;save("stock-watch.macd",state.macdOn);redrawChart();}
+  if(event.target.id==="research-sort"){state.researchSort=event.target.value;$("#content").innerHTML=renderResearch();finalize();}
+  if(event.target.dataset?.researchCol){const i=Number(event.target.dataset.researchCol),hidden=researchHidden();event.target.checked?hidden.delete(i):hidden.add(i);save("stock-watch.research-hide",[...hidden]);const box=$(".research-pools");if(box)box.className=researchPoolsClass();}
+  if(["perf-from","perf-to"].includes(event.target.id) && state.performance){state.perfRange={...(state.perfRange||{}),[event.target.id==="perf-from"?"from":"to"]:event.target.value};state.pages={...(state.pages||{}),performance:1};$("#content").innerHTML=renderPerformance(state.performance);finalize();}
   if(event.target.id==="adjust-toggle" && state.stock){state.adjusted=event.target.checked;save("stock-watch.adjust",state.adjusted);redrawChart();}
 });
 document.addEventListener("click",event=>{
   const t=event.target;
   const watchAdd=t.closest("[data-watch-add]");
   if(watchAdd){if(!watchAdd.disabled)addToWatch(watchAdd);return;}
+  if(t.closest("[data-health-export]")){exportHealth();return;}
+  const researchFilter=t.closest("[data-research-filter]");
+  if(researchFilter){state.researchFilter=researchFilter.dataset.researchFilter;$("#content").innerHTML=renderResearch();finalize();return;}
+  const pageBtn=t.closest("[data-page]");
+  if(pageBtn && !pageBtn.disabled && state.performance){const [key,page]=pageBtn.dataset.page.split(":");state.pages={...(state.pages||{}),[key]:Number(page)};$("#content").innerHTML=renderPerformance(state.performance);finalize();return;}
   const horizon=t.closest("[data-horizon]"), period=t.closest("[data-period]"), sort=t.closest("[data-sort]"), board=t.closest("[data-board]"), chip=t.closest("[data-chip]"), row=t.closest("tr.click");
   if(horizon){state.horizon=Number(horizon.dataset.horizon);load();return;}
   if(period && state.stock){state.period=Number(period.dataset.period);document.querySelectorAll("[data-period]").forEach(b=>b.classList.toggle("active",Number(b.dataset.period)===state.period));redrawChart();return;}

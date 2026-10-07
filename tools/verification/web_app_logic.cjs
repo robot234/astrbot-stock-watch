@@ -26,7 +26,8 @@ vm.runInContext(source + `
   dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice,
   hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel, funnelPanel, auditPanel, funnelVerdict, stockScreenLine,
   maSet, movingAverage, chartTools, chartSeries, chartCaption, liveQuoteHtml, limitText, riskReminderPanel,
-  watchButton, watchNote, watchReady};`, context, {filename: "app.js"});
+  watchButton, watchNote, watchReady, settingGroup, budgetPanel, arrivalPanel, credentialPanel, pager, researchPick,
+  sourceLayers, healthSummaryText};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -294,6 +295,32 @@ check("watch_ambiguous_scope", app.watchNote(watch({scope: {status: "ambiguous",
 check("watch_inbox_missing", app.watchNote(watch({inbox: "missing"})).includes("收件箱") && app.watchButton("600857", watch({inbox: "missing"})).includes(" disabled"));
 check("watch_plugin_not_reloaded", app.watchNote(watch({plugin: null})).includes("重载"));
 check("watch_rejects_non_codes", app.watchButton("DEMO01", watch()) === "");
+
+const setting = (key, effective, extra) => ({key, state: "shown", effective, default: effective, ...extra});
+check("setting_groups", app.settingGroup("daily_acceptance_alert_enabled") === "push" && app.settingGroup("daily_acceptance_time") === "screen"
+  && app.settingGroup("factor_source") === "source" && app.settingGroup("intraday_min_amount") === "intraday" && app.settingGroup("llm_model") === "model" && app.settingGroup("web_watch_scope") === "push" && app.settingGroup("odd_key") === "ops");
+const budget = app.budgetPanel([setting("quote_interval_seconds", 5), setting("intraday_market_refresh_seconds", 120), setting("tushare_bulk_page_size", 3000), setting("llm_enabled", false)]);
+check("budget_estimates", budget.includes("约 2,880 轮") && budget.includes("约 120 次") && budget.includes("2 页") && budget.includes("已关闭") && budget.includes("不是实测"));
+check("budget_unknown_values", app.budgetPanel([]).includes("未知"));
+const arrival = app.arrivalPanel([setting("daily_scan_time", "18:10"), setting("daily_acceptance_time", "18:40"), setting("automatic_close_max_attempts", 6)]);
+check("arrival_times", arrival.includes("18:10") && arrival.includes("18:40") && arrival.includes("6 次") && arrival.includes("不是到点就算失败"));
+const creds = app.credentialPanel([{key: "tushare_token", state: "custom"}, {key: "llm_api_key", state: "empty"}]);
+check("credential_states", creds.includes("已填写 · 未验证") && creds.includes("未填写") && !creds.includes("custom\""));
+const many = Array.from({length: 120}, (_, i) => ({i}));
+app.state.pages = {perf: 3};
+const paged = app.pager("perf", many, 120);
+check("pager_slices_and_flags_limit", paged.slice.length === 20 && paged.slice[0].i === 100 && paged.controls.includes("第 3 / 3 页") && paged.controls.includes("已到读取上限 120 条"));
+check("pager_no_limit_note", !app.pager("other", many.slice(0, 10), 0).controls.includes("读取上限"));
+app.state.researchFilter = "radar"; app.state.researchSort = "score";
+const [onlyP, onlyR] = app.researchPick([{code: "600000", rank: 1, score: 5}], [{code: "000001", rank: 1, score: 3}, {code: "000002", rank: 2, score: 9}]);
+check("research_filter_and_sort", onlyP.length === 0 && onlyR.map(r => r.code).join() === "000002,000001" && onlyR[0].rank === 2);
+app.state.researchFilter = "risk_unknown"; app.state.researchSort = "rank";
+check("research_risk_unknown", app.researchPick([{code: "1", risk_level: "unknown"}, {code: "2", risk_level: "eligible"}], [])[0].map(r => r.code).join() === "1");
+app.state.researchFilter = "all";
+const layers = app.sourceLayers({batches: [{state: "active", date: "2026-09-30", generation: 21, rows: 660000}], providers: [rate({blocked_active: true, blocked_until: new Date((now + 3600) * 1000).toISOString()})]});
+check("source_layers", layers.includes("数据源分层") && layers.includes("可用：读已发布的第 21 代批次") && layers.includes("暂停中") && layers.includes("2026-09-30"));
+const summary = app.healthSummaryText({data_date: "2026-09-30", daily_acceptance: [{date: "2026-09-30", status: "failed", summary: "缺候选冻结", checked_at: "2026-09-30T10:40:00Z"}], jobs: [], providers: [], batches: []});
+check("health_summary_text", summary.startsWith("# Stock Watch 健康摘要") && summary.includes("2026-09-30 failed：缺候选冻结") && !summary.includes("<"));
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));
