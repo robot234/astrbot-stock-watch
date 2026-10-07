@@ -851,11 +851,11 @@ class Snapshot:
                 add(row["code"], row.get("name"), "research_pool")
         active = self.active_raw()
         if active and re.fullmatch(r"\d{1,6}", text):
+            # A code range (not LIKE) keeps the lookup on the (batch_id, trade_date) and (partition_id, code) keys.
             for row in self.db.execute(
-                    "SELECT DISTINCT pb.code FROM partition_bars pb JOIN batch_days bd"
-                    " ON bd.batch_id=? AND bd.trade_date=pb.trade_date AND bd.partition_id=pb.partition_id"
-                    " WHERE pb.trade_date=? AND pb.code LIKE ? ORDER BY pb.code LIMIT 20",
-                    (active["batch_id"], active["trade_date"], text + "%")):
+                    "SELECT DISTINCT pb.code FROM batch_days bd JOIN partition_bars pb ON pb.partition_id=bd.partition_id"
+                    " WHERE bd.batch_id=? AND bd.trade_date=? AND pb.code>=? AND pb.code<? ORDER BY pb.code LIMIT 20",
+                    (active["batch_id"], active["trade_date"], text, text[:-1] + chr(ord(text[-1]) + 1))):
                 add(row["code"], (self.symbol(row["code"]) or {}).get("name"), "active_raw")
         return {"query": text, "items": list(found.values()), "limit": 20}
 
