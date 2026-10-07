@@ -572,6 +572,17 @@ function overheatStockPanel(code, payload = state.ctx.signals) {
   const rows = Object.entries(s.indicators || {}).map(([k, v]) => `<div>${esc(FACTOR_TEXT[k] || k)}</div><div class="num">${factorValue(k, v)}</div>`).join("");
   return panel("过热标签", stale + `<div class="status-rows"><div class="status-row"><span>状态</span><span>${label}</span></div><div class="status-row"><span>过热综合分位</span><span>${fmt(Number(s.pct) * 100, 1)}%<small>最热的 10% 标为过热 · ${fmt(oh.evaluated, 0)} 只参与排名</small></span></div></div><div class="kv">${rows}</div><p class="regime-note">2021—2023 回看：最热的 10% 之后 5 日平均跑输股票池 0.55%、20 日跑输 1.43%，三年都为负。只做提醒，不改正式门槛；换手比值用成交量代替，ST 按当前名称判断。</p>`, head);
 }
+const MACD_TEXT = {no_active_raw:"没有 active raw 日线，旧日线表缺前收盘，算不了连续价格", insufficient_history:"行情不足 60 个交易日"};
+function macdStockPanel(d) {
+  const m = d?.macd;
+  if (m?.status !== "available") return panel("MACD 状态", empty(MACD_TEXT[m?.reason] || MACD_TEXT[m?.status] || "MACD 暂不可用", m?.reason || m?.status || "macd_unavailable"), `<span class="src">研究参考 · 未验证</span>`);
+  const golden = m.state === "golden", side = golden ? "上穿" : "下穿";
+  const since = m.cross_date ? `${esc(m.cross_date)} DIF ${side} DEA · ${m.sessions_since_cross === 0 ? "当天" : `${fmt(m.sessions_since_cross, 0)} 个交易日前`}` : `本批次内 DIF 一直在 DEA ${golden ? "上方" : "下方"}`;
+  const gap = m.last_bar_date && m.last_bar_date !== m.trade_date ? notice("", "triangle-alert", `最近一根日线是 ${esc(m.last_bar_date)}，之后的交易日按价格不变计算`) : "";
+  const rows = `<div class="status-rows"><div class="status-row"><span>状态</span><span><b class="num ${golden ? "up" : "down"}">${golden ? "金叉" : "死叉"}</b> ${kindBadge("lab", "未验证", "方案 I 从 10-08 起前瞻检验，2027 年 4 月终点判定")}<small>${since}</small></span></div><div class="status-row"><span>近 3 日新金叉<small>方案 I 的金叉条件</small></span><span>${m.recent_golden_cross ? "是" : "否"}</span></div></div>`;
+  const values = `<div class="kv"><div>DIF</div><div class="num">${fmt(m.dif, 3)}</div><div>DEA</div><div class="num">${fmt(m.dea, 3)}</div><div>MACD 柱（2 × (DIF − DEA)）</div><div class="num ${tone(m.histogram)}">${fmt(m.histogram, 3)}</div></div>`;
+  return panel("MACD 状态", gap + rows + values + `<p class="regime-note">MACD(12, 26, 9)，用前收盘连乘的连续价格计算，除权不会变成假死叉；DIF / DEA 换算到最新收盘价，和软件前复权的数值接近。用本批次 ${fmt(m.sessions, 0)} 个交易日（${esc(m.first_session || "—")} 起）递推。方案 H 回看：金叉 + 不过热持有 5 天比同日股票池少赚 0.09 个百分点，不显著；方案 I 从 10-08 起前瞻检验它在 T+2 / T+3 上的增量。只显示，不改正式门槛。</p>`, `<span class="src">研究参考 · 截至 ${esc(m.trade_date || "日期未知")}</span>`);
+}
 function renderResearch() {
   const rs = state.ctx.research || {status:"unavailable", reason:"research_pool_schema_unavailable"};
   const band = `<div class="lab-band">${ic("flask-conical")}<div><b>未验证 · 不是买入建议</b><br>研究记录独立冻结，不进入历史表现统计。</div></div>`;
@@ -649,7 +660,7 @@ function renderStock(d) {
   const evRows = Object.entries({...(ev.financial || {}), ...(ev.risk || {})}).map(([k, v]) => `<tr><td>${esc(EVIDENCE_FIELDS[k] || k)}</td><td class="num">${v?.value === null || v?.value === undefined ? "未知" : typeof v.value === "boolean" ? (v.value ? "是" : "否") : fmt(v.value)}</td><td>${badge(v?.quality)}</td><td class="wrap">${esc(v?.reason || "—")}</td></tr>`);
   const recs = (d.recommendations || []).slice(0, LIMITS.recommendations).map(r => `<tr><td>${esc(r.date)}</td><td>${badge(r.plan_status)}</td><td>${badge(r.comparability)}</td><td class="mono">${esc(r.plan_version || "—")}</td></tr>`);
   return panel("查找个股", stockSearchForm()) + `<section class="panel">${head}${coverage}${tools}${chart}</section>` + stockStatusNotice(d) + quality +
-    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
+    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${macdStockPanel(d)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
 }
 function movingAverage(bars, n) {
   const out = []; let sum = 0;

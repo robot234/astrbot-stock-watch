@@ -32,6 +32,11 @@ Mobile acceptance here means a responsive browser viewport, not LAN access.
 - Stock: unadjusted OHLC from the published active raw generation (legacy
   `daily_bars` only as a labelled fallback), volume, MA5/10/20, plan, research
   membership and event history. `/api/search?q=` finds codes by code or name.
+  `macd` is a display-only, unverified MACD(12, 26, 9) side (golden / dead) over
+  the active raw generation's sessions, on a price chained by `close / pre_close`
+  so ex-rights days are not crosses; the cross rule is research schemes H / I
+  (`docs/research/NEW_SCHEME_I_PREREG_20261007.md`). Fewer than 60 sessions or
+  the legacy fallback (no `pre_close`) is reported as unavailable.
 - Performance: verified trading-day T+1/3/5/10 windows, gross close returns,
   MFE, close-series drawdown and distinct price/path denominators.
 - Health: provider success telemetry and API rate-limit deadlines kept apart,

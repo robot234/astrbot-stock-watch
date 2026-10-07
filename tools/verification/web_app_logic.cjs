@@ -24,7 +24,7 @@ vm.createContext(context);
 vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
   dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice,
-  hotBadge, indexTrendPanel, overheatStockPanel};`, context, {filename: "app.js"});
+  hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -182,6 +182,21 @@ check("stock_panel_hot", hotPanel.includes("过热综合分位") && hotPanel.inc
 const excluded = app.overheatStockPanel("600002", signals({stock: {code: "600002", status: "excluded", reason: "corporate_action_60d", indicators: {}}}));
 check("stock_panel_excluded", excluded.includes("不在评估范围") && excluded.includes("近 60 日有除权除息"));
 check("stock_panel_job_error", app.overheatStockPanel("600010", signals({overheat: {status: "unavailable", reason: "job_error"}})).includes("研究信号任务这次没算出来"));
+
+// Stock MACD state: golden or dead side from the server, always marked unverified.
+const macd = extra => ({code: "600010", macd: {status: "available", state: "golden", trade_date: "2026-09-30", last_bar_date: "2026-09-30",
+  sessions: 120, first_session: "2026-04-09", cross_date: "2026-09-28", sessions_since_cross: 2, recent_golden_cross: true,
+  dif: 0.1234, dea: 0.0987, histogram: 0.0494, verified: false, ...extra}});
+const golden = app.macdStockPanel(macd());
+check("macd_golden", golden.includes('up">金叉') && golden.includes("未验证") && golden.includes("2026-09-28 DIF 上穿 DEA · 2 个交易日前")
+  && golden.includes("0.123") && golden.includes("120 个交易日（2026-04-09 起）") && !golden.includes("按价格不变计算"));
+const dead = app.macdStockPanel(macd({state: "dead", cross_date: "2026-09-30", sessions_since_cross: 0, recent_golden_cross: false,
+  last_bar_date: "2026-09-29", histogram: -0.02}));
+check("macd_dead", dead.includes('down">死叉') && !dead.includes('up">金叉') && dead.includes("下穿 DEA · 当天") && dead.includes("之后的交易日按价格不变计算"));
+check("macd_no_cross", app.macdStockPanel(macd({state: "dead", cross_date: null, sessions_since_cross: null})).includes("本批次内 DIF 一直在 DEA 下方"));
+check("macd_short", app.macdStockPanel({macd: {status: "insufficient_history", sessions: 20, min_sessions: 60}}).includes("行情不足 60 个交易日"));
+check("macd_legacy", app.macdStockPanel({macd: {status: "unavailable", reason: "no_active_raw"}}).includes("旧日线表缺前收盘"));
+check("macd_missing", app.macdStockPanel({}).includes("MACD 暂不可用"));
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

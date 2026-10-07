@@ -47,6 +47,8 @@ SIGNALS_MAX_BYTES = 8 * 1024 * 1024
 SIGNAL_FACTORS = ("R20", "C_MA20", "IVOL20", "VOLR5_60", "MAX20", "TURN5_20", "ABTURN", "RSI14")
 SIGNAL_EXCLUSIONS = frozenset({"not_main_or_chinext", "st_name", "no_bar_today", "history_lt_60",
                                "corporate_action_60d", "price_above_50", "amount_below_20m", "indicator_missing"})
+# Stock-page MACD uses the research schemes H / I definition and stays unverified until scheme I's endpoint.
+MACD_SPANS, MACD_CROSS_LOOKBACK, MACD_MIN_SESSIONS = (12, 26, 9), 3, 60
 SIGNAL_APPROXIMATIONS = frozenset({"turnover_ratio_from_volume", "st_from_current_name"})
 SIGNAL_INDICES = ("000905", "000852")
 # Offline research freezes shown read-only; stages are curated from each study's own delivery documents.
@@ -270,6 +272,49 @@ def ohlc(row, basis_key="price_basis"):
     return values
 
 
+def macd_state(days, rows):
+    """MACD(12, 26, 9) side on the last session, from a price chained by close / pre_close.
+
+    Chaining keeps ex-rights gaps from looking like crosses; sessions after the first usable bar that have
+    no usable bar keep the price unchanged. DIF and DEA are rescaled to the latest close, so they read like
+    a forward-adjusted chart.
+    """
+    by_date = {row.get("trade_date"): row for row in rows}
+    series, level, last_bar = [], 1.0, None
+    for day in days:
+        row = by_date.get(day)
+        values = ohlc(row, "basis") if row else None
+        previous = number(row.get("pre_close")) if values else None
+        if values and series and previous and previous > 0:
+            level *= values[3] / previous
+        if values:
+            last_bar = (day, values[3])
+        if values or series:
+            series.append((day, level))
+    if len(series) < MACD_MIN_SESSIONS:
+        return {"status": "insufficient_history", "sessions": len(series), "min_sessions": MACD_MIN_SESSIONS}
+    alphas = [2 / (span + 1) for span in MACD_SPANS]
+    fast = slow = series[0][1]
+    dea, above = None, []
+    for _, price in series:
+        fast += alphas[0] * (price - fast)
+        slow += alphas[1] * (price - slow)
+        dif = fast - slow
+        dea = dif if dea is None else dea + alphas[2] * (dif - dea)
+        above.append(dif > dea)
+    t = k = len(series) - 1
+    while k > 0 and above[k - 1] == above[t]:
+        k -= 1
+    recent = above[t] and any(above[j] and not above[j - 1]
+                              for j in range(max(1, t - MACD_CROSS_LOOKBACK + 1), t + 1))
+    scale = last_bar[1] / series[t][1]
+    return {"status": "available", "rule": "MACD_12_26_9_CHAINED", "state": "golden" if above[t] else "dead",
+            "trade_date": series[t][0], "last_bar_date": last_bar[0], "sessions": len(series),
+            "first_session": series[0][0], "cross_date": series[k][0] if k else None,
+            "sessions_since_cross": t - k if k else None, "recent_golden_cross": bool(recent),
+            "dif": round(dif * scale, 4), "dea": round(dea * scale, 4), "histogram": round(2 * (dif - dea) * scale, 4)}
+
+
 class Unavailable(RuntimeError):
     pass
 
@@ -390,6 +435,17 @@ class Snapshot:
             " ON bd.batch_id=? AND bd.trade_date=pb.trade_date AND bd.partition_id=pb.partition_id"
             " WHERE pb.code=? AND pb.trade_date<=? ORDER BY pb.trade_date DESC LIMIT ?",
             (active["batch_id"], code, today, min(max(int(limit), 1), 500)))]
+
+    def stock_macd(self, code):
+        """Display-only MACD state over the active raw generation's sessions (at most 500)."""
+        active = self.active_raw()
+        if not active:
+            return {"status": "unavailable", "reason": "no_active_raw"}
+        today = self.now.astimezone(CHINA).date().isoformat()
+        days = [row[0] for row in self.db.execute(
+            "SELECT DISTINCT trade_date FROM batch_days WHERE batch_id=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 500",
+            (active["batch_id"], today))][::-1]
+        return {**macd_state(days, self.active_raw_rows(code, limit=500)), "verified": False, "display_only": True}
 
     def raw_evidence(self, row, code):
         active = self.active_raw() or {}
@@ -970,6 +1026,8 @@ class Snapshot:
                                  "comparability": r.get("comparability_status", "unknown")} for r in recommendations[:30]],
             "announcements": evidence["announcements"], "data_evidence": evidence,
             "technical_history": {"bars": len(bars), "status": "available" if len(bars) >= 20 else "insufficient"},
+            "macd": (self.stock_macd(code) if bar_source["kind"] == "active_raw"
+                     else {"status": "unavailable", "reason": "no_active_raw", "verified": False, "display_only": True}),
             "data_quality": {"status": data_status, "missing_reason": missing_reason,
                              "source_timestamp": source_timestamp.isoformat() if source_timestamp else None},
         }
