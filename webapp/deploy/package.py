@@ -1,4 +1,5 @@
 """Build an allowlisted runtime archive and SHA-256 manifest, not a plugin release."""
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -28,6 +29,9 @@ def main():
     )]
     paths += sorted(p for p in (ROOT / "webapp/static").rglob("*") if p.is_file())
     payload = {p.relative_to(ROOT).as_posix(): p.read_bytes() for p in paths}
+    payload["webapp/build_info.json"] = json.dumps({
+        "release": release, "revision": revision or None,
+        "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, sort_keys=True).encode()
     manifest = {"release": release, "files": {
         name: hashlib.sha256(data).hexdigest() for name, data in payload.items()}}
     encoded = json.dumps(manifest, indent=2, sort_keys=True).encode()

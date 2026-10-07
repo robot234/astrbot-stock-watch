@@ -240,6 +240,7 @@ select{height:32px;border:1px solid var(--line);border-radius:5px;background:var
 .signal-tail{font-size:12px;color:var(--muted);margin-top:6px;overflow-wrap:anywhere}
 .signal-status{display:grid;gap:4px;justify-items:end;font-size:12px;color:var(--muted)}
 .closed-band{display:flex;gap:12px;align-items:flex-start;padding:14px 16px;background:var(--unk-soft);border-radius:var(--r);margin-bottom:16px;color:var(--ink-2)}
+.closed-band.warn{background:var(--warn-soft)}
 .closed-band>div{min-width:0;overflow-wrap:anywhere}
 .closed-band b{display:block;font-size:14px;color:var(--ink)}
 
@@ -277,6 +278,12 @@ select{height:32px;border:1px solid var(--line);border-radius:5px;background:var
 .status-row{display:flex;justify-content:space-between;gap:10px;padding:8px 16px;border-bottom:1px solid var(--line-2);align-items:center}
 .status-row:last-child{border-bottom:0}
 .status-row>span:first-child{min-width:0;overflow-wrap:anywhere}
+.status-row small{display:block;color:var(--muted);font-weight:400}
+.status-row>span:last-child{text-align:right;overflow-wrap:anywhere}
+details.history{border-top:1px solid var(--line-2)}
+details.history summary{cursor:pointer;padding:8px 16px;font-size:12px;color:var(--muted)}
+.search-results{display:grid;gap:2px;padding:0 16px 12px}
+.search-results a{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line-2)}
 
 .foot{padding:0 24px 24px;color:var(--muted);font-size:11px}
 

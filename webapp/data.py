@@ -31,7 +31,17 @@ TABLES = {
     "data_evidence_records", "factor_snapshots", "evidence_fetch_cache",
     "research_pool_runs", "research_pool_picks", "paper_qualification_events", "paper_simulated_entries",
     "paper_freeze_contracts", "paper_entry_terms", "paper_no_action_evidence",
+    "partition_bars", "day_partitions", "batch_days", "stock_symbols", "schema_meta",
 }
+API_VERSION = 2
+CAPABILITIES = (
+    "overview", "signals", "candidates", "research_pools", "research_parameters", "stock_detail",
+    "stock_active_raw_bars", "stock_search", "performance", "health", "provider_state_v2",
+    "session_calendar", "coverage_breakdown", "settings", "intraday", "revision",
+    "snapshot_check_status", "version",
+)
+TRADING_PHASES = ((9 * 60 + 15, "pre_open"), (9 * 60 + 30, "call_auction"), (11 * 60 + 30, "trading"),
+                  (13 * 60, "lunch_break"), (15 * 60, "trading"))
 PUBLIC_SETTINGS = {
     "min_score", "price_min", "price_max", "deep_screen_limit", "factor_screen_limit",
     "screen_min_indicator_coverage", "intraday_confirmation_periods",
@@ -89,6 +99,29 @@ def instant(value):
         return None
 
 
+def epoch_instant(value):
+    """Provider rate-limit deadlines are stored as Unix seconds; 0 means no deadline."""
+    if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
+        return None
+    seconds = number(value)
+    if seconds is None:
+        return instant(value)
+    if seconds <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def trading_phase(local):
+    minute = local.hour * 60 + local.minute
+    for end, phase in TRADING_PHASES:
+        if minute < end:
+            return phase
+    return "after_close"
+
+
 def error_category(value):
     text = str(value or "").lower()
     for token, label in (("permission", "permission_denied"), ("rate", "rate_limited"),
@@ -100,6 +133,15 @@ def error_category(value):
 
 def safe_text(value, limit=120):
     return re.sub(r"[\x00-\x1f\x7f]", "", str(value or ""))[:limit]
+
+
+def ohlc(row, basis_key="price_basis"):
+    """Positive, internally consistent unadjusted OHLC, else None."""
+    values = [number(row.get(key)) for key in ("open", "high", "low", "close")]
+    if (any(v is None or v <= 0 for v in values) or values[1] < max(values[0], values[3])
+            or values[2] > min(values[0], values[3]) or row.get(basis_key) != "unadjusted"):
+        return None
+    return values
 
 
 class Unavailable(RuntimeError):
@@ -178,6 +220,86 @@ class Snapshot:
             params.append(code)
         return self.rows("recommendation_records", required=("visibility", "origin", "recommended_date", "code"),
                          where=where, params=params, order="recommended_date DESC,code", limit=1000)
+
+    def active_raw(self):
+        """The published active daily generation as recorded; display-only, not revalidated here."""
+        if hasattr(self, "_active_raw"):
+            return self._active_raw
+        self._active_raw = None
+        if not {"batches", "active_generations", "datasets", "partition_bars", "batch_days"}.issubset(self.tables):
+            return None
+        batch_columns, generation_columns = self.columns("batches"), self.columns("active_generations")
+        dataset_columns, bar_columns = self.columns("datasets"), self.columns("partition_bars")
+        if not ({"batch_id", "dataset_id", "actual_trade_date", "status", "source", "published_at"}.issubset(batch_columns)
+                and {"dataset_id", "active_batch_id", "generation"}.issubset(generation_columns)
+                and {"dataset_id", "dataset_key"}.issubset(dataset_columns)
+                and {"partition_id", "trade_date", "code", "open", "high", "low", "close"}.issubset(bar_columns)
+                and {"batch_id", "trade_date", "partition_id"}.issubset(self.columns("batch_days"))):
+            return None
+        where = ["b.status='published'", "d.dataset_key='tushare_daily'"]
+        if "shadow" in batch_columns:
+            where.append("b.shadow=0")
+        if "publication_mode" in batch_columns:
+            where.append("b.publication_mode='active'")
+        quality = ",b.quality" if "quality" in batch_columns else ",NULL AS quality"
+        row = self.db.execute(
+            "SELECT b.batch_id,b.actual_trade_date,b.source,b.published_at,a.generation" + quality +
+            " FROM active_generations a JOIN batches b ON b.batch_id=a.active_batch_id"
+            " JOIN datasets d ON d.dataset_id=a.dataset_id WHERE " + " AND ".join(where) + " LIMIT 1"
+        ).fetchone()
+        if row and row["actual_trade_date"]:
+            self._active_raw = {"batch_id": safe_text(row["batch_id"]), "trade_date": str(row["actual_trade_date"]),
+                                "source": safe_text(row["source"]) or "unknown", "published_at": row["published_at"],
+                                "generation": number(row["generation"]), "quality": safe_text(row["quality"]) or "unknown",
+                                "dataset_key": "tushare_daily"}
+        return self._active_raw
+
+    def active_raw_rows(self, code, limit=120):
+        active = self.active_raw()
+        if not active:
+            return []
+        today = self.now.astimezone(CHINA).date().isoformat()
+        return [dict(r) for r in self.db.execute(
+            "SELECT pb.* FROM partition_bars pb JOIN batch_days bd"
+            " ON bd.batch_id=? AND bd.trade_date=pb.trade_date AND bd.partition_id=pb.partition_id"
+            " WHERE pb.code=? AND pb.trade_date<=? ORDER BY pb.trade_date DESC LIMIT ?",
+            (active["batch_id"], code, today, min(max(int(limit), 1), 500)))]
+
+    def raw_evidence(self, row, code):
+        active = self.active_raw() or {}
+        published = instant(active.get("published_at"))
+        return {"code": code, "business_date": row.get("trade_date"), "announcement_date": None,
+                "collected_at": published.isoformat() if published else None,
+                "source": safe_text(row.get("source")) or active.get("source") or "unknown",
+                "evidence": f"sqlite:partition_bars:{active.get('batch_id') or 'unknown'}:{code}:{row.get('trade_date') or 'unknown'}",
+                "quality": "active_published_raw"}
+
+    def primary_source(self):
+        """The dataset that the main pages actually show, so legacy tables cannot set the headline date."""
+        active = self.active_raw()
+        if active:
+            return {"dataset": "raw_active_generation", "date": active["trade_date"], "batch_id": active["batch_id"],
+                    "generation": active["generation"], "source": active["source"], "collected_at": active["published_at"]}
+        snapshots = self.rows("daily_snapshot_meta", required=("trade_date",), order="trade_date DESC", limit=1)
+        if snapshots:
+            row = snapshots[0]
+            return {"dataset": "daily_snapshot_meta", "date": row.get("trade_date"), "batch_id": None, "generation": None,
+                    "source": safe_text(row.get("source")) or "unknown", "collected_at": row.get("fetched_at")}
+        return {"dataset": None, "date": None, "batch_id": None, "generation": None, "source": None, "collected_at": None}
+
+    def session(self):
+        """Closed only when the calendar says so; a missing intraday artifact is not a holiday."""
+        local = self.now.astimezone(CHINA)
+        today = local.date().isoformat()
+        calendar = "unknown"
+        rows = self.rows("trading_calendar", required=("trade_date", "is_open"), where="trade_date=?", params=(today,), limit=1)
+        if rows:
+            row = rows[0]
+            status = str(row.get("status") or ("open" if row.get("is_open") else "closed")).lower()
+            if status in ("open", "closed") and bool(row.get("is_open")) == (status == "open"):
+                calendar = status
+        phase = "closed_day" if calendar == "closed" else trading_phase(local) if calendar == "open" else "unknown"
+        return {"date": today, "calendar": calendar, "phase": phase, "local_time": local.strftime("%H:%M")}
 
     def research_pools(self):
         """Show one immutable research freeze without joining it to formal candidates."""
@@ -337,11 +459,18 @@ class Snapshot:
                 item.get("fill_status") in {"simulated_fill", "unfilled"}),
             key=lambda item: (item.get("confirmed_at") or "", item["record_id"]), reverse=True,
         )[:50]
+        diagnostics = obj(run.get("diagnostics"))
+        recorded = obj(diagnostics.get("parameters"))
+        parameters = {key: number(recorded.get(key)) for key in ("deep_limit", "primary_limit", "radar_limit", "price_min", "price_max")
+                      if number(recorded.get(key)) is not None} or None
         return {"status": status, "reason": reason, "run_id": safe_text(run["run_id"]),
                 "batch_id": safe_text(run["batch_id"]), "trade_date": trade_date,
                 "source": safe_text(run["source"]), "basis": safe_text(run["basis"]),
                 "frozen_at": frozen.isoformat() if frozen else None,
                 "published_at": published.isoformat() if published else None,
+                "selection_policy": safe_text(diagnostics.get("selection_policy")) or None,
+                "parameters": parameters,
+                "independent_of": [safe_text(v, 60) for v in arr(recorded.get("independent_of"))[:8]],
                 "paper_history": paper_history, **pools}
 
     def ai_review_maps(self, run_ids):
@@ -510,6 +639,8 @@ class Snapshot:
             "data_date": snapshot.get("trade_date") or latest.get("actual_trade_date"),
             "requested_date": snapshot.get("requested_date"), "quality": snapshot.get("quality", "unknown"),
             "complete": snapshot.get("complete") == 1, "coverage": number(latest.get("coverage")),
+            "coverage_breakdown": self.coverage_breakdown(snapshot, latest, market, contexts[0]["as_of"] if contexts else None, len(candidates)),
+            "session": self.session(),
             "market": {key: market.get(key) for key in ("regime", "breadth", "advancing", "declining", "flat", "median_return", "total_amount")},
             "market_date": contexts[0]["as_of"] if contexts else None,
             "candidate_count": len(candidates), "candidates": candidates[:5],
@@ -527,53 +658,167 @@ class Snapshot:
                       "error": error_category(r.get("error"))} for r in runs],
         }
 
+    def coverage_breakdown(self, snapshot, run, market, market_date, visible_candidates):
+        """Each measure keeps its own denominator; complete prices and unknown risk can both be true."""
+        diagnostics = obj(run.get("diagnostics"))
+        count = lambda key: int(number(diagnostics.get(key))) if number(diagnostics.get(key)) is not None else None
+        targets, enriched = count("indicator_targets"), count("enriched")
+        stored = number(run.get("coverage"))
+        if targets is None:
+            indicator = {"status": "denominator_unrecorded" if stored is not None else "unknown", "coverage": stored}
+        elif targets == 0:
+            indicator = {"status": "not_applicable", "coverage": None}
+        else:
+            indicator = {"status": "measured", "coverage": enriched / targets if enriched is not None else stored}
+        sides = [number(market.get(key)) for key in ("advancing", "declining", "flat")]
+        active = self.active_raw()
+        confirmed = count("risk_confirmed")
+        return {
+            "market": {"date": snapshot.get("trade_date"), "complete": snapshot.get("complete") == 1 if snapshot else None,
+                       "quality": snapshot.get("quality") or "unknown",
+                       "count": int(sum(sides)) if all(v is not None for v in sides) and sum(sides) > 0 else None,
+                       "count_date": market_date, "raw_batch_id": active["batch_id"] if active else None,
+                       "raw_date": active["trade_date"] if active else None},
+            "risk": {"known": count("risk_tuple_complete"), "total": count("input")},
+            "indicator": {**indicator, "enriched": enriched, "targets": targets},
+            "formal": {"risk_confirmed": confirmed if confirmed is not None else count("tradable"),
+                       "candidates": int(number(run.get("candidate_count"))) if number(run.get("candidate_count")) is not None else None,
+                       "visible": visible_candidates},
+            "run_id": safe_text(run.get("run_id")) or None, "run_date": run.get("actual_trade_date"),
+            "run_status": safe_text(run.get("status")) or None,
+        }
+
+    def active_raw_bars(self, code):
+        active, result = self.active_raw(), []
+        for row in reversed(self.active_raw_rows(code)):
+            values = ohlc(row, "basis")
+            if values is None:
+                self.notices.add("partition_bars:unusable_rows_excluded")
+                continue
+            result.append({"date": row["trade_date"], "open": values[0], "high": values[1], "low": values[2], "close": values[3],
+                           "volume": number(row.get("volume")), "source": safe_text(row.get("source")) or active["source"],
+                           "data_evidence": self.raw_evidence(row, code)})
+        return result
+
     def bars(self, code):
+        """Prefer the published active raw generation; the old daily_bars table is a labelled fallback."""
+        raw = self.active_raw_bars(code)
+        if raw:
+            active = self.active_raw()
+            return raw, {"kind": "active_raw", "batch_id": active["batch_id"], "generation": active["generation"],
+                         "trade_date": active["trade_date"], "source": active["source"]}
         rows = self.rows("daily_bars", required=("code", "trade_date", "open", "high", "low", "close"),
                          where="code=? AND trade_date<=?", params=(code, self.now.astimezone(CHINA).date().isoformat()),
                          order="trade_date DESC", limit=120)
         result = []
         for row in reversed(rows):
-            values = [number(row[k]) for k in ("open", "high", "low", "close")]
-            if (any(v is None or v <= 0 for v in values) or values[1] < max(values[0], values[3])
-                    or values[2] > min(values[0], values[3]) or row.get("price_basis") != "unadjusted"):
+            values = ohlc(row)
+            if values is None:
                 self.notices.add("daily_bars:unusable_rows_excluded")
                 continue
             result.append({"date": row["trade_date"], "open": values[0], "high": values[1], "low": values[2], "close": values[3],
                            "volume": number(row.get("volume")), "source": row.get("source") or "unknown",
                            "data_evidence": self.price_evidence(row, code, "daily_bars")})
-        return result
+        kind = "legacy_daily_bars" if result else "none"
+        return result, {"kind": kind, "batch_id": None, "generation": None,
+                        "trade_date": result[-1]["date"] if result else None, "source": result[-1]["source"] if result else None}
 
     def attach_latest_closes(self, items):
-        """Read-only display fields: latest two valid unadjusted daily closes per candidate."""
+        """Read-only display fields: latest valid unadjusted close per candidate, active raw first."""
         today = self.now.astimezone(CHINA).date().isoformat()
         for item in items:
-            item.update({"close": None, "close_date": None, "prev_close": None, "pct_change": None})
+            item.update({"close": None, "close_date": None, "prev_close": None, "pct_change": None, "close_source": None})
+            raw = next((row for row in self.active_raw_rows(item["code"], limit=3) if ohlc(row, "basis")), None)
+            if raw:
+                previous = number(raw.get("pre_close"))
+                item.update(close=number(raw["close"]), close_date=raw["trade_date"], close_source="active_raw",
+                            prev_close=previous if previous and previous > 0 else None,
+                            pct_change=number(raw.get("pct_change")))
+                continue
             rows = self.rows("daily_bars", required=("code", "trade_date", "open", "high", "low", "close"),
                              where="code=? AND trade_date<=?", params=(item["code"], today),
                              order="trade_date DESC", limit=6)
             valid = []
             for row in rows:
-                values = [number(row[k]) for k in ("open", "high", "low", "close")]
-                if (any(v is None or v <= 0 for v in values) or values[1] < max(values[0], values[3])
-                        or values[2] > min(values[0], values[3]) or row.get("price_basis") != "unadjusted"):
+                values = ohlc(row)
+                if values is None:
                     continue
                 valid.append((row["trade_date"], values[3]))
                 if len(valid) == 2:
                     break
             if valid:
                 item["close_date"], item["close"] = valid[0]
+                item["close_source"] = "legacy_daily_bars"
             if len(valid) == 2 and valid[1][1]:
                 item["prev_close"] = valid[1][1]
                 item["pct_change"] = round((valid[0][1] / valid[1][1] - 1) * 100, 4)
         return items
 
+    def symbol(self, code):
+        if "stock_symbols" not in self.tables:
+            return None
+        rows = self.rows("stock_symbols", required=("code", "name"), where="code=?", params=(code,), limit=1)
+        return {"name": safe_text(rows[0]["name"], 40), "source": safe_text(rows[0].get("source"))} if rows and rows[0].get("name") else None
+
+    def latest_research_picks(self):
+        if not {"research_pool_runs", "research_pool_picks"}.issubset(self.tables):
+            return None, []
+        runs = self.rows("research_pool_runs", required=("run_id", "trade_date", "frozen_at"),
+                         order="trade_date DESC,frozen_at DESC", limit=1)
+        if not runs:
+            return None, []
+        return runs[0], self.rows("research_pool_picks", required=("run_id", "pool", "code", "rank"), where="run_id=?",
+                                  params=(runs[0]["run_id"],), order="pool,rank", limit=500)
+
+    def research_membership(self, code):
+        """Latest research freeze membership only; never a formal candidate or recommendation."""
+        run, picks = self.latest_research_picks()
+        pick = next((row for row in picks if row["code"] == code), None)
+        if not pick:
+            return None
+        return {"run_id": safe_text(run["run_id"]), "trade_date": run["trade_date"], "pool": safe_text(pick["pool"]),
+                "rank": pick.get("rank"), "name": safe_text(pick.get("name"), 40), "score": number(pick.get("score")),
+                "risk_level": safe_text(pick.get("risk_level")) or "unknown", "eligibility": "research_only"}
+
+    def search(self, query):
+        text = re.sub(r"[\x00-\x1f\x7f%_\\]", "", str(query or "")).strip()[:16]
+        if not text:
+            raise Unavailable("search_query_invalid")
+        found = {}
+        def add(code, name, source):
+            code = safe_text(code, 12)
+            if re.fullmatch(r"(?:\d{6}|DEMO\d{2})", code) and code not in found and len(found) < 20:
+                found[code] = {"code": code, "name": safe_text(name, 40) or None, "source": source}
+        if "stock_symbols" in self.tables and {"code", "name"}.issubset(self.columns("stock_symbols")):
+            for row in self.db.execute("SELECT code,name FROM stock_symbols WHERE code LIKE ? OR name LIKE ?"
+                                       " ORDER BY (code=?) DESC,(name=?) DESC,code LIMIT 20",
+                                       (text + "%", "%" + text + "%", text, text)):
+                add(row["code"], row["name"], "stock_symbols")
+        lowered = text.lower()
+        for row in self.candidates():
+            if row["code"].lower().startswith(lowered) or lowered in str(row.get("name") or "").lower():
+                add(row["code"], row.get("name"), "formal_candidate")
+        for row in self.latest_research_picks()[1]:
+            if str(row["code"]).startswith(text) or text in str(row.get("name") or ""):
+                add(row["code"], row.get("name"), "research_pool")
+        active = self.active_raw()
+        if active and re.fullmatch(r"\d{1,6}", text):
+            for row in self.db.execute(
+                    "SELECT DISTINCT pb.code FROM partition_bars pb JOIN batch_days bd"
+                    " ON bd.batch_id=? AND bd.trade_date=pb.trade_date AND bd.partition_id=pb.partition_id"
+                    " WHERE pb.trade_date=? AND pb.code LIKE ? ORDER BY pb.code LIMIT 20",
+                    (active["batch_id"], active["trade_date"], text + "%")):
+                add(row["code"], (self.symbol(row["code"]) or {}).get("name"), "active_raw")
+        return {"query": text, "items": list(found.values()), "limit": 20}
+
     def stock(self, code):
         if not re.fullmatch(r"(?:\d{6}|DEMO\d{2})", code):
             raise Unavailable("invalid_stock_code")
         candidate = next((r for r in self.candidates() if r["code"] == code), None)
-        bars = self.bars(code)
+        bars, bar_source = self.bars(code)
         recommendations = self.recommendations(code)
-        if not candidate and not bars and not recommendations:
+        research, symbol = self.research_membership(code), self.symbol(code)
+        if not candidate and not bars and not recommendations and not research and not symbol:
             raise Unavailable("stock_unavailable")
         closes = [r["close"] for r in bars]
         indicators = {"MA" + str(n): statistics.fmean(closes[-n:]) if len(closes) >= n else None for n in (5, 10, 20)}
@@ -585,9 +830,13 @@ class Snapshot:
             data_status, missing_reason = ("available", None) if len(bars) >= 20 else ("pending", "insufficient_history")
         else:
             data_status, missing_reason = "unknown", "daily_bars_not_collected"
+        name = ((candidate or {}).get("name") or (research or {}).get("name") or (symbol or {}).get("name")
+                or (recommendations[0].get("name") if recommendations else None) or code)
         return {
-            "code": code, "name": (candidate or {}).get("name") or (recommendations[0].get("name") if recommendations else code),
-            "candidate": candidate, "bars": bars, "indicators": indicators,
+            "code": code, "name": name, "candidate": candidate, "research": research,
+            "formal_status": "formal_candidate" if candidate else "no_formal_candidate",
+            "recommendation_status": "recorded" if recommendations else "no_recommendation",
+            "bars": bars, "bar_source": bar_source, "indicators": indicators,
             "last_close": closes[-1] if closes else None, "bar_date": bars[-1]["date"] if bars else None,
             "signals": self.signals(code),
             "recommendations": [{"date": r.get("recommended_date"), "plan_version": r.get("plan_version"),
@@ -774,10 +1023,37 @@ class Snapshot:
             "records": evaluations, "basis": "gross_unadjusted_close_to_close",
         }
 
+    def providers(self):
+        """Provider success telemetry and per-API rate-limit state are different tables; never mix their meanings."""
+        result = []
+        for row in self.rows("provider_health", required=("provider",), order="provider", limit=30):
+            success, failure = instant(row.get("last_success_at")), instant(row.get("last_error_at"))
+            result.append({"name": safe_text(row.get("provider")), "telemetry": "provider_health",
+                           "success_at": success.isoformat() if success else None,
+                           "error_at": failure.isoformat() if failure else None,
+                           "quality": safe_text(row.get("last_quality")) or "unknown",
+                           "error": error_category(row.get("last_error")),
+                           "success_count": number(row.get("success_count")), "error_count": number(row.get("error_count")),
+                           "blocked_until": None, "blocked_active": False, "circuit_open_until": None, "circuit_active": False,
+                           "failure_streak": None, "state_updated_at": None})
+        for row in self.rows("provider_api_state", required=("api_name",), order="api_name", limit=30):
+            blocked, circuit = epoch_instant(row.get("blocked_until")), epoch_instant(row.get("circuit_open_until"))
+            updated = instant(row.get("updated_at"))
+            streak = number(row.get("failure_streak"))
+            result.append({"name": safe_text(row.get("api_name")), "telemetry": "api_rate_limit_state",
+                           "success_at": None, "error_at": None, "quality": None,
+                           "error": error_category(row.get("last_error")),
+                           "success_count": None, "error_count": None,
+                           "blocked_until": blocked.isoformat() if blocked else None,
+                           "blocked_active": bool(blocked and blocked > self.now),
+                           "circuit_open_until": circuit.isoformat() if circuit else None,
+                           "circuit_active": bool(circuit and circuit > self.now),
+                           "failure_streak": int(streak) if streak is not None else None,
+                           "state_updated_at": updated.isoformat() if updated else None})
+        return result
+
     def health(self):
-        providers = self.rows("provider_api_state", required=("api_name",), limit=30)
-        if not providers:
-            providers = self.rows("provider_health", required=("provider",), limit=30)
+        providers = self.providers()
         batches = self.rows("batches", required=("actual_trade_date",), order="actual_trade_date DESC,created_at DESC", limit=10)
         jobs = self.rows("job_runs", required=("job_key",), order="started_at DESC", limit=15)
         failures = self.rows("risk_events", required=("code",), order="event_at DESC", limit=20)
@@ -787,9 +1063,8 @@ class Snapshot:
         acceptance_alerts = self.rows("daily_acceptance_alerts", required=("state",), order="created_at DESC", limit=100)
         return {
             "database": "readable", "integrity": "not_checked", "tables": len(self.tables),
-            "providers": [{"name": r.get("api_name") or r.get("provider"), "success_at": r.get("last_success_at"),
-                           "error_at": r.get("last_error_at"), "quality": r.get("last_quality") or "unknown",
-                           "error": error_category(r.get("last_error")), "blocked_until": r.get("blocked_until")} for r in providers],
+            "data_date": self.primary_source().get("date"),
+            "providers": providers,
             "batches": [{"id": r.get("batch_id"), "date": r.get("actual_trade_date"), "generation": r.get("generation"),
                          "state": r.get("status", "unknown"), "rows": r.get("row_count"), "basis": r.get("basis", "unknown"),
                          "published_at": r.get("published_at")} for r in batches],
@@ -866,12 +1141,56 @@ class Snapshot:
         return sources
 
 class Dashboard:
-    def __init__(self, database: Path, *, origin="", settings=None, artifact_path=None, now=None):
+    def __init__(self, database: Path, *, origin="", settings=None, artifact_path=None, snapshot_status_path=None, now=None):
         self.database = Path(database).absolute()
         self.origin, self.settings = origin, settings
         self.artifact_configured = artifact_path is not None
         self.artifact_path = Path(artifact_path).absolute() if artifact_path else self.database.with_name("intraday_quotes.json")
+        self.snapshot_status_path = (Path(snapshot_status_path).absolute() if snapshot_status_path
+                                     else self.database.with_name("snapshot_status.json"))
+        self.build_info_path = ROOT / "webapp" / "build_info.json"
         self.clock = now or (lambda: datetime.now(timezone.utc))
+
+    def snapshot_check(self):
+        """The refresh timer's last check; it can be recent while an unchanged copy stays old."""
+        unknown = {"status": "unknown", "checked_at": None, "result": None, "age_seconds": None,
+                   "last_published_at": None, "failure_category": None}
+        try:
+            values = json.loads(self.snapshot_status_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {**unknown, "reason": "snapshot_status_missing"}
+        except (OSError, UnicodeError, ValueError):
+            return {**unknown, "reason": "snapshot_status_unreadable"}
+        if not isinstance(values, dict):
+            return {**unknown, "reason": "snapshot_status_unreadable"}
+        checked, published = instant(values.get("checked_at")), instant(values.get("last_published_at"))
+        result = values.get("result") if values.get("result") in ("published", "unchanged", "failed") else None
+        age = (self.clock() - checked).total_seconds() if checked else None
+        if checked is None or result is None or age < 0:
+            return {**unknown, "reason": "snapshot_status_invalid"}
+        return {"status": "failed" if result == "failed" else "stale" if age > 7200 else "recent",
+                "reason": None, "checked_at": checked.isoformat(), "result": result, "age_seconds": int(age),
+                "last_published_at": published.isoformat() if published else None,
+                "failure_category": safe_text(values.get("category"), 60) or None}
+
+    def version(self):
+        """Which features this deployed backend actually contains, independent of plugin version numbers."""
+        try:
+            recorded = obj(self.build_info_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            recorded = {}
+        build = {key: safe_text(recorded.get(key), 80) or None for key in ("release", "revision", "built_at")}
+        build["status"] = "recorded" if build["release"] or build["revision"] else "unknown"
+        schema_version = None
+        try:
+            with self.snapshot() as snapshot:
+                if "schema_meta" in snapshot.tables:
+                    row = snapshot.db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+                    schema_version = int(row[0]) if row and str(row[0]).isdigit() else None
+        except (Unavailable, sqlite3.Error, OSError, ValueError):
+            schema_version = None
+        return {"api_version": API_VERSION, "capabilities": list(CAPABILITIES), "build": build,
+                "database_schema_version": schema_version}
 
     @contextmanager
     def snapshot(self):
@@ -1007,6 +1326,12 @@ class Dashboard:
             except Exception:
                 return {"meta": {"status": "unavailable", "reason": "artifact_unavailable", "read_only": True,
                                  "dataset_kind": "intraday_artifact", "at": self.clock().isoformat()}, "data": None}
+        if route == "version":
+            data = self.version()
+            return {"meta": {"status": "available" if data["build"]["status"] == "recorded" else "partial", "read_only": True,
+                             "dataset_kind": "web_build", "database": self.database.name, "at": self.clock().isoformat(),
+                             "sources": [], "notices": [] if data["build"]["status"] == "recorded" else ["build_info:unavailable"]},
+                    "data": data}
         try:
             with self.snapshot() as snapshot:
                 artifact = self.intraday()
@@ -1031,6 +1356,8 @@ class Dashboard:
                     data = {"items": snapshot.attach_latest_closes(snapshot.candidates()), "research": snapshot.research_pools()}
                 elif route.startswith("stocks/"):
                     data = snapshot.stock(route.split("/", 1)[1])
+                elif route == "search":
+                    data = snapshot.search(params.get("q", ""))
                 elif route == "performance":
                     data = snapshot.performance(int(params.get("horizon", "5")))
                 elif route == "health":
@@ -1048,10 +1375,12 @@ class Dashboard:
                                      "data_revision": data.get("data_revision"),
                                      "artifact_revision": data.get("artifact_revision"),
                                      "snapshot_revision": data.get("snapshot_revision"),
-                                     "snapshot": snapshot.snapshot_metadata(), "sources": [], "notices": sorted(snapshot.notices)},
+                                     "snapshot": {**snapshot.snapshot_metadata(), "check": self.snapshot_check()},
+                                     "sources": [], "notices": sorted(snapshot.notices)},
                             "data": data}
                 sources = snapshot.source_summary()
-                snapshot_metadata = snapshot.snapshot_metadata()
+                primary_source = snapshot.primary_source()
+                snapshot_metadata = {**snapshot.snapshot_metadata(), "check": self.snapshot_check()}
                 artifact_revision = artifact.get("revision")
                 data_revision = stable_data_revision(snapshot_metadata.get("revision"), artifact.get("effective_revision"))
                 return {"meta": {"status": "partial" if snapshot.notices else "available", "read_only": True,
@@ -1060,6 +1389,7 @@ class Dashboard:
                                  "data_revision": data_revision, "artifact_revision": artifact_revision,
                                  "snapshot_revision": snapshot_metadata.get("revision"),
                                  "snapshot": snapshot_metadata,
+                                 "primary_source": primary_source,
                                  "sources": sources,
                                  "notices": sorted(snapshot.notices)}, "data": data}
         except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, Unavailable) as exc:

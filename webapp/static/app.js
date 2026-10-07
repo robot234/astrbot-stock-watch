@@ -52,6 +52,7 @@ function toDate(value) {
   if (!value) return null;
   const text = String(value).trim();
   if (DATE_ONLY.test(text)) return null;
+  if (/^\d{9,}(?:\.\d+)?$/.test(text)) return new Date(Number(text) * 1000);
   const iso = text.replace(" ", "T");
   const date = new Date(/(?:Z|[+-]\d{2}:?\d{2})$/.test(iso) ? iso : `${iso}Z`);
   return Number.isNaN(date.getTime()) ? null : date;
@@ -80,7 +81,8 @@ const STATUS = {
   watch_only:["需复核","warn"], data_unverified:["数据未核验","warn"], trading_flags_clear_only:["交易状态字段已核","warn"],
   critical:["严重","crit"], unavailable:["不可用","crit"], missing:["不可用","crit"], failed:["失败","crit"], blocked:["已拦截","crit"],
   pending:["待到期","info"], running:["运行中","info"], valuation_in_progress:["估值中","info"], stored_not_live:["已存非实时","info"],
-  unknown:["未知","unk"], unknown_order:["未知","unk"], not_checked:["未检查","unk"], closed:["休市","unk"], live_market_missing:["休市","unk"],
+  unknown:["未知","unk"], unknown_order:["未知","unk"], not_checked:["未检查","unk"], closed:["休市","unk"], closed_day:["休市","unk"], live_market_missing:["无盘中行情","unk"],
+  not_applicable:["不适用","unk"], recent:["近期","ok"], unchanged:["源未变化","ok"],
   empty:["暂无冻结","unk"], not_comparable:["不可比","unk"], plan_expired:["计划过期","unk"], not_entered:["未入场","unk"],
   unfilled:["模拟未成交","unk"], not_filled:["未成交","unk"], not_executable:["不可执行","unk"],
   unverified:["未验证","lab"], research_only:["未验证","lab"], simulated_fill:["模拟成交","lab"], entered:["已模拟入场","lab"]
@@ -101,7 +103,11 @@ const REASONS = {
   database_missing:"数据库文件不存在或不可读", database_busy_or_schema_unavailable:"数据库被占用或表结构不可用",
   input_or_source_unavailable:"输入或数据源不可用", route_not_found:"页面路由不存在", stock_unavailable:"没有这只股票的已存数据",
   invalid_stock_code:"股票代码格式无效", research_pool_schema_unavailable:"研究池表或字段不可用", artifact_missing:"盘中报价文件不存在",
-  research_not_exposed:"当前 Web 后端没有提供研究观察池数据",
+  research_not_exposed:"当前 Web 后端版本没有研究池接口；需部署与 main 对应的 Web 后端，不需要重新生成名单",
+  no_research_freeze:"研究池表已存在，但还没有任何冻结批次", superseded_by_newer_market_snapshot:"已有更新交易日的行情，这是旧批次研究池",
+  old_business_date:"研究池业务日已超过 7 天，属于旧批次", freeze_identity_or_time_unverified:"冻结身份或时间无法核实，按未知处理",
+  search_query_invalid:"请输入股票代码或名称", daily_bars_not_collected:"没有这只股票的已存日线（active raw 与旧日线表都没有）",
+  no_formal_samples:"暂无正式推荐样本，无法计算；不等于 0%", insufficient_history:"已存日线少于 20 根，均线不完整",
   live_market_missing:"没有可用的盘中行情", filters_excluded_all:"当前筛选条件排除了全部候选", snapshot_metadata_missing:"快照元数据缺失",
   daily_acceptance_missing:"尚无每日链路验收记录", daily_acceptance_stale:"链路验收日期与数据日期不一致", no_candidates:"当前有效批次没有可见候选",
   no_records:"当前数据源下没有记录", no_signal_records:"当前 origin 下没有已存信号", bars_unavailable:"缺少可用的未复权 OHLC 数据",
@@ -133,7 +139,7 @@ const kpi = (label, value, sub = "", opts = {}) => `<div class="kpi ${opts.cls |
 const notice = (kind, icon, body) => `<div class="notice ${kind}">${ic(icon)}<div>${body}</div></div>`;
 const titleMap = {overview:"今日总览",signals:"盯盘",intraday:"盯盘",candidates:"候选池",stock:"个股详情",research:"研究观察池",performance:"历史表现",health:"系统健康",settings:"策略设置"};
 const defaultFilter = () => ({query:"", risk:"", sort:"desc", board:"all", cheap:false, noSt:false});
-const state = {view:"overview", watchSeg:"signals", selectedCode:null, horizon:5, period:60, ma:true, candidates:[], signals:[], performance:null, stock:null, request:0, chartCleanup:null, controller:null, dataRevision:null, snapshotRevision:null, artifactRevision:null, polling:false, meta:null, ctx:{overview:null, health:null, research:null, perf3:null}, filter:defaultFilter()};
+const state = {view:"overview", watchSeg:"signals", selectedCode:null, horizon:5, period:60, ma:true, candidates:[], signals:[], performance:null, stock:null, request:0, chartCleanup:null, controller:null, dataRevision:null, snapshotRevision:null, artifactRevision:null, polling:false, meta:null, ctx:{overview:null, health:null, research:null, perf3:null, version:null}, filter:defaultFilter()};
 
 async function api(route, signal) {
   const response = await fetch(`/api/${route}`, {signal, cache:"no-store"});
@@ -158,11 +164,26 @@ function capturedAt(meta) {
   const times = (meta.sources || []).map(s => s.collected_at).filter(v => toDate(v)).sort((a, b) => toDate(b) - toDate(a));
   return times[0] || null;
 }
+// The headline date follows the dataset the pages show; the legacy daily_bars table never sets it.
+function primaryDate(meta) {
+  const p = meta?.primary_source;
+  if (p?.date) return p.dataset === "raw_active_generation" ? `${p.date} · active raw 第 ${fmt(p.generation, 0)} 代` : `${p.date} · 日快照`;
+  return (meta?.sources || []).find(s => s.date && s.dataset !== "daily_bars")?.date || "未知";
+}
 function srcSpans(meta = state.meta, extra = []) {
   if (!meta) return `<div class="src"><span>来源 不可用</span><span>数据日 未知</span><span>采集 未知</span></div>`;
   const kind = isDemo(meta) ? "合成数据" : meta.dataset_kind === "intraday_artifact" ? "盘中报价文件" : "本地只读快照";
-  const date = (meta.sources || []).find(s => s.date)?.date || "未知";
-  return `<div class="src"><span>来源 ${esc(kind)}</span><span>数据日 ${esc(date)}</span><span>采集 ${esc(bj(capturedAt(meta)))}</span>${extra.map(x => `<span>${esc(x)}</span>`).join("")}</div>`;
+  return `<div class="src"><span>来源 ${esc(kind)}</span><span>数据日 ${esc(primaryDate(meta))}</span><span>采集 ${esc(bj(capturedAt(meta)))}</span>${extra.map(x => `<span>${esc(x)}</span>`).join("")}</div>`;
+}
+const DATASET_LABEL = {daily_bars:"daily_bars（旧日线表 · 兼容）", raw_active_generation:"active raw 日线", daily_snapshot_meta:"日快照元数据"};
+function snapshotAgeText(s) {
+  const c = s.check || {};
+  if (s.status === "stale") {
+    if (c.status === "recent" && c.result === "unchanged") return `源数据未变化，最后检查 ${bj(c.checked_at)}`;
+    if (c.status === "failed") return `最近一次检查失败 ${bj(c.checked_at)}`;
+    return c.checked_at ? `快照超过两小时，最后检查 ${bj(c.checked_at)}` : "快照超过两小时，没有检查记录";
+  }
+  return ["unknown", "unavailable"].includes(s.status) ? "快照采集时间未知" : `快照按 ${s.refresh_interval_seconds || 3600} 秒发布`;
 }
 const pageHead = (title, sub = "", extra = []) => `<div class="page-head"><div><h1>${esc(title)}</h1>${sub ? `<p>${esc(sub)}</p>` : ""}</div>${srcSpans(state.meta, extra)}</div>`;
 function metaDisplay(meta) {
@@ -178,11 +199,11 @@ function metaDisplay(meta) {
   $("#updated").textContent = captured ? `快照 ${bj(captured)}` : `读取 ${bj(meta.at)}`;
   if (meta.snapshot) {
     const s = meta.snapshot;
-    banner.textContent += ` · 每 ${s.poll_interval_seconds || 5} 秒检查更新 · ${s.status === "stale" ? "快照超过两小时" : ["unknown", "unavailable"].includes(s.status) ? "快照采集时间未知" : `快照按 ${s.refresh_interval_seconds || 3600} 秒发布`} · 非实时行情`;
+    banner.textContent += ` · 每 ${s.poll_interval_seconds || 5} 秒检查更新 · ${snapshotAgeText(s)} · 非实时行情`;
   }
   $("#connection-state").textContent = meta.status === "partial" ? "部分数据不可用" : "快照可读";
   $(".conn-dot").classList.remove("bad");
-  const lines = (meta.sources || []).map(s => `<div class="source-line"><strong>${esc(s.dataset)}</strong><span>${esc(s.source || "来源未知")}</span><span>业务 ${esc(s.date || "未知")}</span><span>采集 ${esc(bj(s.collected_at))}</span><span>${fmt(s.count, 0)} 条</span>${badge(s.status)}</div>`);
+  const lines = (meta.sources || []).map(s => `<div class="source-line"><strong>${esc(DATASET_LABEL[s.dataset] || s.dataset)}</strong><span>${esc(s.source || "来源未知")}</span><span>业务 ${esc(s.date || "未知")}</span><span>采集 ${esc(bj(s.collected_at))}</span><span>${fmt(s.count, 0)} 条</span>${badge(s.status)}</div>`);
   const notes = (meta.notices || []).map(n => `<div class="source-line"><strong>提示</strong><span class="mono">${esc(n)}</span></div>`);
   $("#source-details-content").innerHTML = [...lines, ...notes].join("") || "来源不可用";
 }
@@ -192,13 +213,35 @@ function finalize() {
   hydrateIcons();
 }
 
-// Status strip.
+// Status strip. Rate-limit rows carry deadlines but no success telemetry; an expired deadline is not a pause.
+const blockedNow = p => p.blocked_active === true || (p.blocked_active === undefined && toDate(p.blocked_until) > new Date());
+const circuitNow = p => p.circuit_active === true;
+const rateOnly = p => p.telemetry === "api_rate_limit_state";
 function providerKind(p) {
+  if (blockedNow(p) || circuitNow(p)) return "warn";
+  if (rateOnly(p)) return Number(p.failure_streak) > 0 || p.error ? "warn" : "unk";
   const err = toDate(p.error_at), ok = toDate(p.success_at);
-  if (p.blocked_until || (err && (!ok || err > ok))) return "warn";
+  if (err && (!ok || err > ok)) return "warn";
   if (!ok) return "unk";
   if (p.quality && !["good", "ok"].includes(p.quality)) return "warn";
   return "ok";
+}
+function providerText(p) {
+  if (blockedNow(p)) return `${p.name} 接口限流暂停到 ${bj(p.blocked_until)}`;
+  if (circuitNow(p)) return `${p.name} 接口熔断到 ${bj(p.circuit_open_until)}`;
+  if (rateOnly(p)) return Number(p.failure_streak) > 0 || p.error ? `${p.name} 接口最近连续失败 ${fmt(p.failure_streak, 0)} 次` : `${p.name} 只有限流状态，未采集成功记录`;
+  if (!toDate(p.success_at)) return `${p.name} 接口没有成功记录`;
+  return toDate(p.error_at) > toDate(p.success_at) ? `${p.name} 接口最近一次请求失败` : `${p.name} 接口数据质量未达正常`;
+}
+const SESSION_HINT = {closed_day:"休市", pre_open:"未开盘", call_auction:"集合竞价", trading:"交易中", lunch_break:"午间休市", after_close:"已收盘", unknown:"交易日历未知"};
+function sessionBand(live, session = state.ctx.overview?.data?.session || {}) {
+  if (live?.status === "available") return "";
+  const inSession = session.calendar === "open" && ["trading", "call_auction"].includes(session.phase);
+  const [title, detail] = session.calendar === "closed" ? ["休市日，没有实时行情", "交易日历确认今天休市"]
+    : inSession ? ["交易时段，但没有可用的盘中行情", "盘中报价未取得或已过期，不是休市"]
+    : session.calendar === "open" ? [`${SESSION_HINT[session.phase] || "非交易时段"}，没有实时行情`, "今天是交易日，当前不在连续竞价时段"]
+    : ["交易日历未知，无法判断是否休市", "没有今天的已确认交易日历记录"];
+  return `<div class="closed-band ${inSession ? "warn" : ""}">${ic("clock")}<div><b>${esc(title)}</b>${esc(detail)} · 原因代码 ${esc(live?.reason || "live_market_missing")}</div></div>`;
 }
 function dataState() {
   const o = state.ctx.overview, h = state.ctx.health;
@@ -211,13 +254,14 @@ function dataState() {
   if (!providers) reasons.push({kind:"warn", label:"部分可用", text:"数据接口状态读取失败", code:h?.meta?.reason || "health_unavailable"});
   else providers.forEach(p => {
     const kind = providerKind(p);
-    if (kind === "ok") return;
-    const text = p.blocked_until ? `${p.name} 接口暂停到 ${bj(p.blocked_until)}` : kind === "unk" ? `${p.name} 接口没有成功记录` : toDate(p.error_at) ? `${p.name} 接口最近一次请求失败` : `${p.name} 接口数据质量未达正常`;
-    reasons.push({kind:"warn", label:"部分可用", text, code:p.error || p.quality || "provider_unverified"});
+    if (kind === "ok" || (kind === "unk" && rateOnly(p))) return;
+    const code = blockedNow(p) ? "rate_limited" : circuitNow(p) ? "breaker_open" : p.error || p.quality || "provider_unverified";
+    reasons.push(kind === "warn" ? {kind:"warn", label:"部分可用", text:providerText(p), code} : {kind:"unk", label:"未知", text:providerText(p), code});
   });
   if (o.data.quality && o.data.quality !== "good") reasons.push({kind:"warn", label:"部分可用", text:"最新快照质量未达正常", code:o.data.quality});
   if (o.data.complete === false) reasons.push({kind:"warn", label:"部分可用", text:"快照完整性未确认", code:"snapshot_incomplete"});
-  return reasons.length ? {kind:"warn", text:"部分可用", reasons} : {kind:"ok", text:"正常", reasons:[{kind:"ok", label:"正常", text:`原始批次已发布 · 数据日 ${o.data.data_date || "未知"}`, code:"published"}]};
+  if (reasons.some(r => r.kind === "warn")) return {kind:"warn", text:"部分可用", reasons};
+  return reasons.length ? {kind:"unk", text:"未知", reasons} : {kind:"ok", text:"正常", reasons:[{kind:"ok", label:"正常", text:`原始批次已发布 · 数据日 ${o.data.data_date || "未知"}`, code:"published"}]};
 }
 function chainState() {
   const o = state.ctx.overview?.data, a = o?.acceptance;
@@ -251,13 +295,14 @@ function updateStrip() {
   setChip("#chip-data", "数据", data.kind, data.text, data.reasons.map(r => r.code).join(", "));
   setChip("#chip-chain", "链路", chain.kind, chain.text, chain.reasons.map(r => r.code).join(", "));
   setChip("#chip-strategy", "策略", "lab", "未验证", "unverified");
-  const live = state.ctx.overview?.data?.live_market;
-  $("#market-hint").textContent = live?.status === "available" ? `盘中 · ${LIVE_REGIME[live.regime] || "未知"}` : "无实时行情";
+  const live = state.ctx.overview?.data?.live_market, session = state.ctx.overview?.data?.session;
+  $("#market-hint").textContent = live?.status === "available" ? `盘中 · ${LIVE_REGIME[live.regime] || "未知"}` : `${SESSION_HINT[session?.phase] || "交易日历未知"} · 无实时行情`;
 }
 function liveMarketCard(live = {}) {
   const status = live?.status || "unknown", available = status === "available";
   const coverage = finite(live?.coverage) ? `${fmt(Number(live.coverage) * 100, 1)}%` : "—";
-  const sub = available ? `${bj(live.source_timestamp)} · ${live.source || "来源未知"} · ${fmt(live.sample_size, 0)}/${fmt(live.expected_size, 0)} · 覆盖 ${coverage}` : `${status === "pending" ? "盘中状态待确认" : "没有可用的盘中行情"} · 原因代码 ${live?.reason || "live_market_missing"}`;
+  const phase = SESSION_HINT[state.ctx.overview?.data?.session?.phase] || "交易日历未知";
+  const sub = available ? `${bj(live.source_timestamp)} · ${live.source || "来源未知"} · ${fmt(live.sample_size, 0)}/${fmt(live.expected_size, 0)} · 覆盖 ${coverage}` : `${status === "pending" ? "盘中状态待确认" : "没有可用的盘中行情"} · ${phase} · 原因代码 ${live?.reason || "live_market_missing"}`;
   const value = available ? esc(LIVE_REGIME[live.regime] || "未知") : status === "pending" ? kindBadge("info", "待确认", "pending") : badge("live_market_missing");
   return `<div class="live-card" id="live-market-card"><div class="lbl">盘中市场状态</div><div class="val">${value}</div><div class="sub">${esc(sub)}</div></div>`;
 }
@@ -281,7 +326,8 @@ function renderOverview(d) {
   reasons.sort((a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind]);
   const verdict = `<section class="verdict ${can ? "ok" : ""}"><span class="vi">${ic(can ? "circle-check" : "ban")}</span><div><h2>${can ? "今天可以生成候选名单" : "今天不生成候选名单"}</h2><ul>${reasons.map(r => `<li>${kindBadge(r.kind, r.label, r.code)}<span>${esc(r.src)}：${esc(r.text)}</span></li>`).join("")}</ul></div><div class="act"><a class="btn primary" href="#health">${ic("triangle-alert")}查看异常</a><a class="btn" href="#research">${ic("flask-conical")}研究进度</a></div></section>`;
   const m = d.market || {}, count = (m.advancing || 0) + (m.declining || 0) + (m.flat || 0);
-  const kpis = `<div class="kpis">${kpi("数据日期", `${esc(d.data_date || "未知")}`, `${weekday(d.data_date)} · 请求日 ${esc(d.requested_date || "未知")}`)}${kpi("市场覆盖", finite(d.coverage) ? `${fmt(d.coverage * 100, 1)}%` : "—", d.complete ? "完整快照标记已记录" : "快照完整性未确认")}${kpi("涨 / 跌 / 平", count ? `<span class="up">${fmt(m.advancing, 0)}</span><small>/</small><span class="down">${fmt(m.declining, 0)}</span><small>/</small><span class="flat">${fmt(m.flat, 0)}</span>` : "—", `最近收盘样本 ${fmt(count, 0)} 只`, {cls:"span-m"})}${kpi("涨跌幅中位数", `<span class="${tone(m.median_return)}">${pct(m.median_return)}</span>`, "最近收盘 · 未复权")}${kpi("成交额", finite(m.total_amount) ? `${fmt(m.total_amount / 1e8)}<small>亿元</small>` : "—", `收盘记录 ${esc(d.market_date || "未知")}`)}</div>`;
+  const mk = d.coverage_breakdown?.market || {};
+  const kpis = `<div class="kpis">${kpi("数据日期", `${esc(d.data_date || "未知")}`, `${weekday(d.data_date)} · 请求日 ${esc(d.requested_date || "未知")}`)}${kpi("行情覆盖", finite(mk.count) ? `${fmt(mk.count, 0)}<small>只</small>` : "—", `${d.complete ? "完整快照标记已记录" : "快照完整性未确认"} · 不代表风险已核实`)}${kpi("涨 / 跌 / 平", count ? `<span class="up">${fmt(m.advancing, 0)}</span><small>/</small><span class="down">${fmt(m.declining, 0)}</span><small>/</small><span class="flat">${fmt(m.flat, 0)}</span>` : "—", `最近收盘样本 ${fmt(count, 0)} 只`, {cls:"span-m"})}${kpi("涨跌幅中位数", `<span class="${tone(m.median_return)}">${pct(m.median_return)}</span>`, "最近收盘 · 未复权")}${kpi("成交额", finite(m.total_amount) ? `${fmt(m.total_amount / 1e8)}<small>亿元</small>` : "—", `收盘记录 ${esc(d.market_date || "未知")}`)}</div>`;
   const w = v => percentWidth(count ? Number(v || 0) / count * 100 : 0);
   const current = Object.keys(CLOSE_REGIME).includes(m.regime) ? m.regime : "unknown";
   const states = Object.entries(CLOSE_REGIME).map(([k, t]) => `<div class="state ${current === k ? "on" : ""}" title="${k}"><b>${t}</b>${current === k ? "当前" : "&nbsp;"}</div>`).join("");
@@ -290,7 +336,20 @@ function renderOverview(d) {
   const topPanel = panel("排名前列", top ? `<div class="mini-list">${top}</div>` : empty("没有可见候选", "no_candidates"), `<a class="more" href="#candidates">全部候选</a>`);
   const rs = state.ctx.research;
   const research = panel("研究进度", !rs || ["unavailable", "missing"].includes(rs.status) ? empty("研究进度不可用", rs?.reason || "research_pool_schema_unavailable") : `<div class="status-rows"><div class="status-row"><span>冻结状态</span>${badge(rs.status)}</div><div class="status-row"><span>业务日</span><span>${esc(rs.trade_date || "未知")}</span></div><div class="status-row"><span>冻结时间</span><span>${esc(bj(rs.frozen_at))}</span></div><div class="status-row"><span>发布时间</span><span>${esc(bj(rs.published_at))}</span></div></div>`, `<a class="more" href="#research">研究观察池</a>`);
-  return pageHead("今日总览") + verdict + kpis + `<div class="grid g-2-1"><div class="col">${market}${pipeline(d, chain)}</div><div class="col">${topPanel}${research}</div></div>`;
+  return pageHead("今日总览") + verdict + kpis + `<div class="grid g-2-1"><div class="col">${coveragePanel(d.coverage_breakdown)}${market}${pipeline(d, chain)}</div><div class="col">${topPanel}${research}</div></div>`;
+}
+// Each measure keeps its own denominator: complete prices and unknown risk can both be true.
+function coveragePanel(cb = {}) {
+  const m = cb.market || {}, r = cb.risk || {}, i = cb.indicator || {}, f = cb.formal || {};
+  const ratio = (a, b) => !finite(a) || !finite(b) ? "未记录" : Number(b) > 0 ? `${fmt(a, 0)} / ${fmt(b, 0)}（${fmt(a / b * 100, 1)}%）` : `${fmt(a, 0)} / ${fmt(b, 0)}`;
+  const indicator = i.status === "not_applicable" ? "不适用：没有股票通过风险门槛" : i.status === "measured" ? ratio(i.enriched, i.targets)
+    : i.status === "denominator_unrecorded" && finite(i.coverage) ? `${fmt(Number(i.coverage) * 100, 1)}%（分母未记录）` : "未记录";
+  const rows = [
+    ["行情", finite(m.count) ? `${fmt(m.count, 0)} 只 · ${m.complete ? "完整快照" : "完整性未确认"}` : "未记录", `数据日 ${m.raw_date || m.date || "未知"}${m.raw_batch_id ? ` · 批次 ${m.raw_batch_id}` : ""}`],
+    ["风险四项已知", ratio(r.known, r.total), "停牌、涨停、跌停、ST 四项都明确才算已知；未知不当作安全"],
+    ["指标可计算", indicator, "只对通过风险门槛的股票计算技术指标"],
+    ["正式通过", finite(f.candidates) ? `${fmt(f.candidates, 0)} 只` : "未记录", `风险门槛通过 ${finite(f.risk_confirmed) ? fmt(f.risk_confirmed, 0) : "未记录"} · 当前可见 ${fmt(f.visible, 0)}`]];
+  return panel(`覆盖与门槛 · 最新筛选 ${esc(cb.run_date || "无记录")}`, `<div class="status-rows">${rows.map(([k, v, s]) => `<div class="status-row"><span>${esc(k)}<small>${esc(s)}</small></span><span class="num">${esc(v)}</span></div>`).join("")}</div>`);
 }
 function pipeline(d, chain) {
   const step = (kind, title, status, desc, time) => `<div class="step"><span class="dot ${kind}"></span><div><div class="t">${esc(title)} ${status}</div><div class="d">${esc(desc)}</div></div><time>${esc(time)}</time></div>`;
@@ -298,9 +357,10 @@ function pipeline(d, chain) {
   const steps = [];
   if (!providers) steps.push(step("unk", "抓取", badge("unknown"), `接口状态读取失败 · 原因代码 ${health?.meta?.reason || "health_unavailable"}`, "—"));
   else {
-    const kinds = providers.map(providerKind), bad = kinds.filter(k => k !== "ok").length;
+    const kinds = providers.map(providerKind), bad = kinds.filter(k => k === "warn").length, unknown = kinds.filter(k => k === "unk").length;
     const latest = providers.map(p => p.success_at).filter(v => toDate(v)).sort((a, b) => toDate(b) - toDate(a))[0];
-    steps.push(step(bad ? "warn" : "ok", "抓取", badge(bad ? "partial" : "ok"), `${providers.length} 个接口 · ${bad ? `${bad} 个失败、暂停或没有成功记录` : "最近请求均成功"}`, latest ? bj(latest) : "未知"));
+    const kind = bad ? "warn" : unknown === providers.length ? "unk" : "ok";
+    steps.push(step(kind, "抓取", badge(bad ? "partial" : kind === "unk" ? "unknown" : "ok"), `${providers.length} 个接口/来源 · ${bad ? `${bad} 个暂停中或最近失败` : "没有生效中的暂停或最近失败"}${unknown ? ` · ${unknown} 个没有成功遥测` : ""}`, latest ? bj(latest) : "未知"));
   }
   const pub = (d.batches || []).find(b => b.state === "published");
   const pubAt = (h?.batches || []).find(b => b.state === "published")?.published_at;
@@ -309,7 +369,8 @@ function pipeline(d, chain) {
   steps.push(step(chain.kind, "验收", kindBadge(chain.kind, chain.text, a.status || "unknown"), a.summary || chain.reasons[0]?.text || "", a.checked_at ? bj(a.checked_at) : "—"));
   const run = (d.runs || [])[0];
   const JOBS = {automatic_close:"自动收盘筛选"};
-  steps.push(run ? step(kindOf(run.status), "筛选", badge(run.status), `${JOBS[run.job] || "筛选任务"} · ${run.date} · ${fmt(run.count, 0)} 只 · 覆盖 ${finite(run.coverage) ? `${fmt(run.coverage * 100, 1)}%` : "未知"}${run.error ? ` · 原因代码 ${run.error}` : ""}`, run.date) : step("unk", "筛选", badge("unknown"), "没有筛选任务记录 · 原因代码 screen_run_missing", "—"));
+  const indicator = d.coverage_breakdown?.indicator?.status === "not_applicable" ? "不适用（无股票通过风险门槛）" : finite(run?.coverage) ? `${fmt(run.coverage * 100, 1)}%` : "未知";
+  steps.push(run ? step(kindOf(run.status), "筛选", badge(run.status), `${JOBS[run.job] || "筛选任务"} · ${run.date} · ${fmt(run.count, 0)} 只 · 指标覆盖 ${indicator}${run.error ? ` · 原因代码 ${run.error}` : ""}`, run.date) : step("unk", "筛选", badge("unknown"), "没有筛选任务记录 · 原因代码 screen_run_missing", "—"));
   const outbox = h?.automatic_outbox;
   const total = outbox ? Object.values(outbox).reduce((s, n) => s + Number(n || 0), 0) : 0;
   if (!outbox || !total) steps.push(step("unk", "推送", badge("unknown"), outbox ? "没有自动收盘推送记录" : `推送状态读取失败 · 原因代码 ${health?.meta?.reason || "health_unavailable"}`, "—"));
@@ -326,8 +387,7 @@ const JOB_NAMES = {automatic_close:"自动收盘筛选"};
 function watchHead(view) {
   const live = state.ctx.overview?.data?.live_market;
   const seg = `<div class="toolbar bare"><div class="seg" role="group" aria-label="盯盘视图"><a href="#watch/signals" class="${view === "signals" ? "active" : ""}">信号记录</a><a href="#watch/intraday" class="${view === "intraday" ? "active" : ""}">盘中报价</a></div></div>`;
-  const closed = live?.status === "available" ? "" : `<div class="closed-band">${ic("clock")}<div><b>休市中，没有实时行情</b>恢复时间 未知 · 原因代码 live_market_missing${live?.reason ? ` · 来源原因 ${esc(live.reason)}` : ""}</div></div>`;
-  return seg + closed;
+  return seg + sessionBand(live);
 }
 function signalRows(rows) {
   if (!rows.length) return empty("暂无可见信号", "no_signal_records");
@@ -426,11 +486,19 @@ function renderResearch() {
   const rs = state.ctx.research || {status:"unavailable", reason:"research_pool_schema_unavailable"};
   const band = `<div class="lab-band">${ic("flask-conical")}<div><b>未验证 · 不是买入建议</b><br>研究记录独立冻结，不进入历史表现统计。</div></div>`;
   const primary = rs.primary || [], radar = rs.radar || [], history = rs.paper_history || [];
+  if (rs.status === "empty") {
+    return pageHead("研究观察池") + band + panel("研究观察池", empty("暂无研究冻结", rs.reason || "no_research_freeze", ["收盘后由插件 /观察选股 或自动收盘冻结", "冻结后等待下一次只读快照发布"]));
+  }
   if (["unavailable", "missing"].includes(rs.status) || (!primary.length && !radar.length && !history.length && !rs.trade_date)) {
-    return pageHead("研究观察池") + band + panel("研究观察池", empty("不可用", rs.reason || "research_pool_schema_unavailable", ["确认研究冻结任务已在插件侧运行", "确认研究池表已同步到只读快照"]));
+    const steps = rs.reason === "research_not_exposed" ? ["部署与 main 对应的 Web 后端（含研究池接口）", "部署后到系统健康页核对 Web 版本能力列表"] : ["确认研究冻结任务已在插件侧运行", "确认研究池表已同步到只读快照"];
+    return pageHead("研究观察池") + band + panel("研究观察池", empty("不可用", rs.reason || "research_pool_schema_unavailable", steps));
   }
   const rule = (k, v) => `<div class="rule"><div class="k">${k}</div><div class="v">${v}</div></div>`;
-  const rules = `<section class="panel"><div class="rules">${rule("冻结状态", badge(rs.status))}${rule("业务日", esc(rs.trade_date || "未知"))}${rule("冻结 / 发布", `${esc(bj(rs.frozen_at))}<br>${esc(bj(rs.published_at))}`)}${rule("批次 / 来源", `${esc(rs.batch_id || rs.run_id || "未知")} · ${esc(rs.source || "未知")}`)}</div></section>`;
+  const rp = rs.parameters;
+  const params = rp ? `深筛前 ${fmt(rp.deep_limit, 0)} · 重点 ${fmt(rp.primary_limit, 0)} · 警戒 ${fmt(rp.radar_limit, 0)} · 价格 ${fmt(rp.price_min)}–${fmt(rp.price_max)} 元<br><small>研究独立固定参数，不读取正式筛选的 ${esc((rs.independent_of || []).join(" / ") || "价格与深筛设置")}</small>` : `<span class="muted">冻结记录未包含参数（旧版本冻结）</span>`;
+  const rules = `<section class="panel"><div class="rules">${rule("冻结状态", badge(rs.status))}${rule("业务日", esc(rs.trade_date || "未知"))}${rule("冻结 / 发布", `${esc(bj(rs.frozen_at))}<br>${esc(bj(rs.published_at))}`)}${rule("批次 / 来源", `${esc(rs.batch_id || rs.run_id || "未知")} · ${esc(rs.source || "未知")}`)}</div></section>` +
+    (rs.reason ? notice("", "triangle-alert", `${esc(reasonText(rs.reason))} · 原因代码 ${esc(rs.reason)}`) : "") +
+    panel(`选股参数 · ${esc(rs.selection_policy || "策略版本未记录")}`, pb(params));
   const gates = panel("留出期检验", `<div class="gates">${GATES.map(g => `<div class="gate"><span>${esc(g)}</span><span>H3 ${badge("unknown")}</span><span>H5 ${badge("unknown")}</span></div>`).join("")}</div>`, `<span class="src">原因代码 holdout_source_unavailable</span>`);
   let left = LIMITS.recommendations;
   const take = arr => {const out = arr.slice(0, Math.max(0, left)); left -= out.length; return out;};
@@ -445,6 +513,32 @@ function renderAnnouncements(data) {
   const items = (data?.items || []).slice(0, LIMITS.announcements);
   if (!items.length) return empty("没有可验证的公告", data?.status === "unavailable" ? "announcements_unavailable" : "no_announcements");
   return items.map(r => `<article class="announcement"><strong>${esc(r.title || "公告")}</strong><p>${esc(r.quote)}</p><small>${esc(r.source || "来源未知")} · 业务 ${esc(r.business_date || "未知")} · 公告 ${esc(r.announcement_date || "未知")} · 采集 ${esc(bj(r.collected_at))}</small></article>`).join("");
+}
+// Any code or name can be opened from the daily index; formal candidates are not required.
+const stockSearchForm = (value = "") => `<form class="toolbar" id="stock-search-form" role="search"><label class="search">${ic("search")}<input id="stock-search" value="${esc(value)}" maxlength="16" placeholder="代码或名称，如 600857 / 宁波中百" aria-label="查找个股"></label><button type="submit" class="btn">查找</button><span class="count">无正式候选也可查看已存价格与研究记录</span></form><div id="stock-search-results"></div>`;
+function renderStockSearch() {
+  return pageHead("个股详情") + panel("查找个股", stockSearchForm());
+}
+async function searchStocks() {
+  const input = $("#stock-search"), out = $("#stock-search-results"), q = (input?.value || "").trim();
+  if (!out) return;
+  if (/^(?:\d{6}|DEMO\d{2})$/i.test(q)) {location.hash = `#stock/${encodeURIComponent(q.toUpperCase())}`; return;}
+  try {
+    const payload = await api(`search?q=${encodeURIComponent(q)}`);
+    const items = payload.data?.items || [];
+    const SOURCE = {stock_symbols:"名称索引", formal_candidate:"正式候选", research_pool:"研究池", active_raw:"active raw 日线"};
+    out.innerHTML = items.length ? `<div class="search-results">${items.map(r => `<a href="${stockHref(r.code)}"><span>${esc(r.name || "名称未知")} <small class="mono">${esc(r.code)}</small></span><small>${esc(SOURCE[r.source] || "来源未知")}</small></a>`).join("")}</div>` : empty("没有匹配的股票", "no_records");
+  } catch (error) {
+    out.innerHTML = empty("查找失败", error.message);
+  }
+  finalize();
+}
+function stockStatusNotice(d) {
+  const s = d.bar_source || {};
+  const source = s.kind === "active_raw" ? `active raw 第 ${fmt(s.generation, 0)} 代 · 批次 ${s.batch_id || "未知"} · 截至 ${s.trade_date || "未知"}` : s.kind === "legacy_daily_bars" ? `旧日线表（兼容路径）· 截至 ${s.trade_date || "未知"}` : "没有已存日线";
+  const r = d.research;
+  const research = r ? `研究池：${r.pool === "primary" ? "重点观察" : "警戒"} 第 ${esc(r.rank)} 名（${esc(r.trade_date)} 冻结，仅研究，不是正式推荐）` : "研究池：最新冻结批次中没有这只股票";
+  return notice("info", "database", `行情来源 ${esc(source)}<br>正式身份：${d.formal_status === "formal_candidate" ? "当前有效正式候选" : "不是当前正式候选"} · 推荐记录：${d.recommendation_status === "recorded" ? "有" : "无"}<br>${research}`);
 }
 function renderStock(d) {
   const bars = (d.bars || []).slice(-LIMITS.bars);
@@ -462,7 +556,7 @@ function renderStock(d) {
   const keyData = panel("关键数据", `<div class="kv">${kv("综合评分", `${fmt(c.score, 0)} / ${fmt(c.score_max, 0)}`)}${kv("技术 / 行业 / 基本面", `${fmt(c.technical_score, 0)} / ${fmt(c.industry_score, 0)} / ${fmt(c.fundamental_score, 0)}`)}${kv("市场修正", fmt(c.market_adjustment, 0))}${kv("风险区间", `${fmt(c.attention_low)} – ${fmt(c.attention_high)}`)}${kv("建议买入价", fmt(c.confirmation))}${kv("失效", fmt(c.invalidation))}${kv("目标区", `${fmt(c.target_low)} – ${fmt(c.target_high)}`)}${kv("涨跌停价", "未知")}${kv("计划验证", badge(c.plan_validated ? "validated" : "unknown"))}${kv("覆盖率", finite(c.coverage) ? `${fmt(c.coverage * 100, 1)}%` : "—")}${Object.entries(d.indicators || {}).map(([k, v]) => kv(esc(k), fmt(v))).join("")}</div>`);
   const evRows = Object.entries({...(ev.financial || {}), ...(ev.risk || {})}).map(([k, v]) => `<tr><td>${esc(EVIDENCE_FIELDS[k] || k)}</td><td class="num">${v?.value === null || v?.value === undefined ? "未知" : typeof v.value === "boolean" ? (v.value ? "是" : "否") : fmt(v.value)}</td><td>${badge(v?.quality)}</td><td class="wrap">${esc(v?.reason || "—")}</td></tr>`);
   const recs = (d.recommendations || []).slice(0, LIMITS.recommendations).map(r => `<tr><td>${esc(r.date)}</td><td>${badge(r.plan_status)}</td><td>${badge(r.comparability)}</td><td class="mono">${esc(r.plan_version || "—")}</td></tr>`);
-  return `<section class="panel">${head}${coverage}${tools}${chart}</section>` + quality +
+  return panel("查找个股", stockSearchForm()) + `<section class="panel">${head}${coverage}${tools}${chart}</section>` + stockStatusNotice(d) + quality +
     `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
 }
 function movingAverage(bars, n) {
@@ -531,7 +625,9 @@ function renderPerformance(d) {
   const seg = `<div class="toolbar bare"><div class="seg" role="group" aria-label="持有期">${[1, 3, 5, 10].map(n => `<button type="button" data-horizon="${n}" class="${state.horizon === n ? "active" : ""}">T+${n}</button>`).join("")}</div><span class="count">交易日窗口 · 未复权收盘到收盘 · 不含交易成本</span></div>`;
   const counts = `<div class="kpis k4">${kpi("已到期", fmt(d.mature_count, 0), `价格可评 ${fmt(d.price_evaluable_count, 0)} · 路径可证 ${fmt(d.order_evaluable_count, 0)}`)}${kpi("待到期", fmt(pending, 0), "未到期不进入统计")}${kpi("未知", fmt(unknown, 0), "缺数据或交易日窗口未核验")}${kpi("样本", fmt(d.sample_count, 0), `T+${esc(d.horizon ?? state.horizon)}`)}</div>`;
   const stats = `<div class="kpis k4">${kpi("中位收益", gated(d.price_evaluable_count, `<span class="${tone(d.median_return_pct)}">${pct(d.median_return_pct)}</span>`), `已到期价格完备 ${fmt(d.price_evaluable_count, 0)} 例`)}${kpi("正收益比例", gated(d.price_evaluable_count, pct(d.positive_return_rate, true)), "只用已到期样本")}${kpi("目标触及率", gated(d.target_denominator, pct(d.target_hit_rate, true)), `顺序可证分母 ${fmt(d.target_denominator, 0)}`)}${kpi("基准对比", badge(d.benchmark?.status || "unavailable"), `原因代码 ${esc(d.benchmark?.reason || "no_verified_same_window_benchmark")}`, {val:"sm"})}</div>`;
-  const gateNote = enough(d.price_evaluable_count) ? "" : notice("info", "clock", `已到期可评样本少于 ${MIN_SAMPLE} 例，比例与收益显示为样本不足；${MIN_SAMPLE} 是展示门槛，不是统计检验。`);
+  const legend = "待到期 = 还没到评估日；未知 = 缺价格、交易日历或可比性证据；顺序未知 = 同一日线同时触及目标和失效，无法判断先后。";
+  const gateNote = !Number(d.sample_count) ? notice("info", "inbox", `暂无正式推荐样本，无法计算收益、正收益比例或触及率；这不等于 0%。正式名单为空时不会产生样本。<br>${legend}`)
+    : enough(d.price_evaluable_count) ? notice("info", "clock", legend) : notice("info", "clock", `已到期可评样本少于 ${MIN_SAMPLE} 例，比例与收益显示为样本不足；${MIN_SAMPLE} 是展示门槛，不是统计检验。<br>${legend}`);
   const AI_LABEL = {all:"规则全集", keep:"AI 保留", watch:"AI 观察", veto:"AI 否决"}, ai = d.ai_groups || {};
   const aiRows = Object.entries(AI_LABEL).map(([k, t]) => {const g = ai[k] || {}, ok = enough(g.price_evaluable_count); return `<tr><td>${t}</td><td class="r num">${fmt(g.sample_count, 0)}</td><td class="r num">${fmt(g.price_evaluable_count, 0)}</td><td class="r num">${ok ? pct(g.positive_return_rate, true) : "样本不足"}</td><td class="r num">${ok ? pct(g.median_return_pct) : "样本不足"}</td></tr>`;});
   const statusBar = `<div class="toolbar">${Object.entries(d.status_counts || {}).map(([s, n]) => `${badge(s)}<span class="muted num">${fmt(n, 0)}</span>`).join("") || `<span class="muted">没有状态计数</span>`}<span class="count">失效率 ${enough(d.invalidation_denominator) ? pct(d.invalidation_rate, true) : "样本不足"} · 分母 ${fmt(d.invalidation_denominator, 0)}</span></div>`;
@@ -545,19 +641,33 @@ function renderHealth(d) {
   const loop = isLoopback(), chain = chainState(), live = state.ctx.overview?.data?.live_market, acc = (d.daily_acceptance || [])[0];
   const sec = `<div class="secnote ${loop ? "ok" : ""}">${ic(loop ? "lock" : "shield-alert")}<div><b>${esc(accessText())}</b><br>${loop ? "仅本机回环可访问；远程查看请走 SSH 隧道。" : "当前地址可被局域网访问且没有鉴权，建议改为回环绑定并通过 SSH 隧道访问。"}</div></div>`;
   const cell = (k, v, s) => `<div><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`;
-  const svc = `<section class="panel"><div class="svc">${cell("数据库", `${badge(d.database)}${badge(d.integrity)}`, `${fmt(d.tables, 0)} 张表`)}${cell("Web 版本", kindBadge("unk", "未知", "schema_gap_unknown"), "schema 差距 未知 · 原因代码 schema_gap_unknown")}${cell("链路验收", kindBadge(chain.kind, chain.text), esc(acc ? `${acc.date} · 检查 ${bj(acc.checked_at)}` : chain.reasons[0]?.text || ""))}${cell("盘中行情", live?.status === "available" ? badge("available") : badge("live_market_missing"), `原因代码 ${esc(live?.reason || "live_market_missing")}`)}</div></section>`;
-  const PK = {ok:"正常", warn:"部分可用", unk:"未知"};
-  const prov = (d.providers || []).map(p => {const k = providerKind(p); return `<tr><td>${esc(p.name)}</td><td>${kindBadge(k, PK[k], p.quality || "")}</td><td>${esc(bj(p.success_at))}</td><td>${esc(p.error_at ? bj(p.error_at) : "—")}</td><td>${badge(p.quality)}</td><td class="mono">${esc(p.error || "—")}</td><td>${esc(p.blocked_until ? bj(p.blocked_until) : "—")}</td></tr>`;});
+  const check = state.meta?.snapshot?.check || {}, CHECK = {published:"已发布新快照", unchanged:"源未变化", failed:"检查失败"};
+  const checkText = check.checked_at ? `快照检查 ${bj(check.checked_at)} · ${CHECK[check.result] || "结果未知"}` : "快照检查 无记录";
+  const v = state.ctx.version?.data, build = v?.build || {};
+  const webValue = !v ? kindBadge("unk", "未知", "version_unavailable") : build.status === "recorded" ? kindBadge("ok", build.revision || build.release, build.release || "") : kindBadge("unk", "构建未记录", "build_info_missing");
+  const webSub = !v ? "后端没有版本接口（旧版） · 原因代码 version_unavailable"
+    : `API v${esc(v.api_version)} · ${fmt((v.capabilities || []).length, 0)} 项能力 · 库 schema ${esc(v.database_schema_version ?? "未知")}${(v.capabilities || []).includes("research_pools") ? "" : " · 缺研究池能力"}`;
+  const session = state.ctx.overview?.data?.session || {};
+  const svc = `<section class="panel"><div class="svc">${cell("数据库", `${badge(d.database)}${badge(d.integrity)}`, `${fmt(d.tables, 0)} 张表 · ${esc(checkText)}`)}${cell("Web 版本", webValue, webSub)}${cell("链路验收", kindBadge(chain.kind, chain.text), esc(acc ? `${acc.date} · 检查 ${bj(acc.checked_at)}` : chain.reasons[0]?.text || ""))}${cell("盘中行情", live?.status === "available" ? badge("available") : badge("live_market_missing"), `${esc(SESSION_HINT[session.phase] || "交易日历未知")} · 原因代码 ${esc(live?.reason || "live_market_missing")}`)}</div></section>`;
+  const PK = {ok:"正常", warn:"部分可用", unk:"未知"}, TELEMETRY = {provider_health:"成功/失败遥测", api_rate_limit_state:"限流状态"};
+  const deadline = p => p.blocked_until ? `${bj(p.blocked_until)}${blockedNow(p) ? "（生效中）" : "（已过期）"}` : p.circuit_open_until ? `熔断 ${bj(p.circuit_open_until)}${circuitNow(p) ? "（生效中）" : "（已过期）"}` : "—";
+  const prov = (d.providers || []).map(p => {const k = providerKind(p), rate = rateOnly(p); return `<tr><td>${esc(p.name)}<small>${esc(TELEMETRY[p.telemetry] || "来源未知")}</small></td><td>${kindBadge(k, PK[k], p.quality || "")}</td><td>${rate ? `<span class="muted">未采集</span>` : esc(bj(p.success_at))}</td><td>${esc(p.error_at ? bj(p.error_at) : "—")}</td><td>${rate ? `<span class="muted">不适用</span>` : badge(p.quality)}</td><td class="mono">${esc(p.error || (Number(p.failure_streak) > 0 ? `连续失败 ${p.failure_streak}` : "—"))}</td><td>${esc(deadline(p))}</td><td>${esc(p.state_updated_at ? bj(p.state_updated_at) : "—")}</td></tr>`;});
   const batches = (d.batches || []).map(b => `<tr><td class="mono">${esc(b.id)}</td><td>${esc(b.date)}</td><td class="r num">${fmt(b.generation, 0)}</td><td>${badge(b.state)}</td><td class="r num">${fmt(b.rows, 0)}</td><td>${esc(b.basis === "unadjusted" ? "未复权" : b.basis || "未知")}</td><td>${esc(bj(b.published_at))}</td></tr>`);
-  const accRows = (d.daily_acceptance || []).map(r => `<tr><td>${esc(r.date)}</td><td>${esc(bj(r.checked_at))}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.summary || "—")}</td></tr>`);
-  const jobs = (d.jobs || []).map(r => `<tr><td>${esc(r.date)}</td><td>${esc(JOB_NAMES[r.name] || r.name)}</td><td>${badge(r.state)}</td><td class="mono">${esc(r.error || "—")}</td></tr>`);
+  // Older records stay visible but folded, so a past failure is not read as today's outage.
+  const current = d.data_date || acc?.date;
+  const split = (rows, key) => {const now = rows.filter(r => !current || !r[key] || r[key] >= current); return [now, rows.filter(r => !now.includes(r))];};
+  const history = (heads, rows, min) => rows.length ? `<details class="history"><summary>更早记录 ${rows.length} 条 · 保留原始证据，不代表当前问题</summary>${table(heads, rows, min)}</details>` : "";
+  const accHeads = ["交易日", "检查时间", "状态", "摘要"], jobHeads = ["日期", "任务", "状态", "错误代码"];
+  const accRow = r => `<tr><td>${esc(r.date)}</td><td>${esc(bj(r.checked_at))}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.summary || "—")}</td></tr>`;
+  const jobRow = r => `<tr><td>${esc(r.date)}</td><td>${esc(JOB_NAMES[r.name] || r.name)}</td><td>${badge(r.state)}</td><td class="mono">${esc(r.error || "—")}</td></tr>`;
+  const [accNow, accOld] = split(d.daily_acceptance || [], "date"), [jobsNow, jobsOld] = split(d.jobs || [], "date");
   const fails = (d.failures || []).map(r => `<tr><td>${esc(r.code)}</td><td>${badge(r.state)}</td><td>${badge(r.risk)}</td><td>${esc(bj(r.at))}</td></tr>`);
   const outbox = (title, o) => panel(title, Object.keys(o || {}).length ? `<div class="status-rows">${Object.entries(o).map(([s, n]) => `<div class="status-row">${badge(s, DELIVERY)}<span class="num">${fmt(n, 0)}</span></div>`).join("")}</div>` : empty("没有投递记录", "no_records"));
   return pageHead("系统健康", "", ["持久状态快照，不代表远端服务探活"]) + sec + svc +
-    panel("数据源接口", table(["接口", "状态", "最近成功", "最近错误", "质量记录", "错误代码", "暂停到"], prov, 820)) +
+    panel("数据源接口", table(["接口 / 遥测", "状态", "最近成功", "最近错误", "质量记录", "错误", "暂停 / 熔断到", "状态更新"], prov, 980)) +
     panel("原始数据批次", table(["批次", "数据日期", {t:"代", cls:"r"}, "状态", {t:"行数", cls:"r"}, "口径", "发布时间"], batches, 760)) +
-    panel("每日链路验收", table(["交易日", "检查时间", "状态", "摘要"], accRows, 640, {empty:empty("尚无每日验收记录", "daily_acceptance_missing")})) +
-    `<div class="grid g-1-1"><div class="col">${panel("任务", table(["日期", "任务", "状态", "错误代码"], jobs, 520))}${panel("失败与风险标的", table(["标的", "状态", "风险", "时间"], fails, 480))}</div><div class="col">${outbox("盘中信号投递", d.outbox)}${outbox("自动收盘推送", d.automatic_outbox)}${outbox("每日验收推送", d.daily_acceptance_outbox)}</div></div>`;
+    panel(`每日链路验收 · 当前数据日 ${esc(current || "未知")}`, table(accHeads, accNow.map(accRow), 640, {empty:empty("当前数据日没有验收记录", "daily_acceptance_missing")}) + history(accHeads, accOld.map(accRow), 640)) +
+    `<div class="grid g-1-1"><div class="col">${panel(`任务 · 当前数据日 ${esc(current || "未知")}`, table(jobHeads, jobsNow.map(jobRow), 520, {empty:empty("当前数据日没有任务记录", "no_records")}) + history(jobHeads, jobsOld.map(jobRow), 520))}${panel("失败与风险标的", table(["标的", "状态", "风险", "时间"], fails, 480))}</div><div class="col">${outbox("盘中信号投递", d.outbox)}${outbox("自动收盘推送", d.automatic_outbox)}${outbox("每日验收推送", d.daily_acceptance_outbox)}</div></div>`;
 }
 function renderSettings(d) {
   const names = {min_score:"最低技术分", price_min:"最低价格", price_max:"最高价格", deep_screen_limit:"技术深筛上限", factor_screen_limit:"因子筛选上限", screen_min_indicator_coverage:"最低指标覆盖", intraday_confirmation_periods:"连续确认次数", intraday_cooldown_seconds:"信号冷却（秒）", intraday_min_amount:"最低成交额", market_comparison_enabled:"量价对照", market_comparison_benchmark:"指定基准指数", paper_trading_only:"仅研究 / 模拟", price_plan_close_tolerance_pct:"收盘计划偏差容限", official_evidence_enabled:"官方证据核验", official_evidence_candidate_limit:"官方证据候选上限", official_evidence_cache_seconds:"官方证据缓存（秒）"};
@@ -588,6 +698,7 @@ async function contextJobs(view, signal) {
   const jobs = {};
   if (view !== "overview") jobs.overview = soft("overview", signal);
   if (view !== "health") jobs.health = soft("health", signal);
+  if (view === "health") jobs.version = soft("version", signal);
   if (view === "overview") jobs.candidates = soft("candidates", signal);
   if (view === "candidates") jobs.perf3 = soft("performance?horizon=3", signal);
   const keys = Object.keys(jobs), values = await Promise.all(Object.values(jobs));
@@ -600,6 +711,7 @@ function applyContext(view, payload, ctx) {
   if ((view === "candidates" || view === "research") && payload) state.ctx.research = researchOf(payload);
   else if (ctx.candidates) state.ctx.research = researchOf(ctx.candidates);
   if (ctx.perf3) state.ctx.perf3 = ctx.perf3.data || null;
+  if (ctx.version) state.ctx.version = ctx.version.data ? ctx.version : null;
 }
 
 async function load({silent=false} = {}) {
@@ -619,8 +731,16 @@ async function load({silent=false} = {}) {
     if(view==="performance")path+=`?horizon=${state.horizon}`;
     if(view==="stock"){
       let code=parts[1] || state.selectedCode;
-      if(!code){const choices=await api("candidates",signal);code=choices.data.items[0]?.code;}
-      if(!code)throw new Error("没有可见标的，请先检查候选数据");
+      if(!code){const choices=await soft("candidates",signal);code=choices.data?.items?.[0]?.code;}
+      if(!code){
+        const ctx=await ctxJob;
+        if(request!==state.request)return false;
+        applyContext(view,null,ctx);
+        if(ctx.overview?.meta && ctx.overview.meta.status!=="unavailable")metaDisplay(ctx.overview.meta);
+        updateStrip();
+        $("#content").innerHTML=renderStockSearch();finalize();
+        return true;
+      }
       path=`stocks/${encodeURIComponent(code)}`;
     }
     const payload=await api(path,signal);
@@ -656,6 +776,7 @@ async function load({silent=false} = {}) {
   } finally {if(!silent && request===state.request)$("#refresh").disabled=false;}
 }
 document.addEventListener("input",event=>{if(event.target.id==="candidate-search")filterCandidates();});
+document.addEventListener("submit",event=>{if(event.target.id==="stock-search-form"){event.preventDefault();searchStocks();}});
 document.addEventListener("change",event=>{
   if(["candidate-risk","candidate-sort"].includes(event.target.id))filterCandidates();
   if(event.target.id==="signal-filter")$("#signal-rows").innerHTML=signalRows(state.signals.filter(r=>!event.target.value || r.state===event.target.value));

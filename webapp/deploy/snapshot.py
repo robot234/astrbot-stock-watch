@@ -11,6 +11,7 @@ import time
 
 SOURCE = Path("/home/pi/astrbot/data/plugin_data/astrbot_stock_watch/stock_watch.sqlite3")
 TARGET = Path("/var/lib/stock-watch-web-snapshot/stock_watch.sqlite3")
+STATUS_NAME = "snapshot_status.json"
 
 
 def fingerprint(path):
@@ -90,16 +91,55 @@ def publish(source, target, budget=240):
                 item.unlink()
 
 
+def record_check(target, result, category=None, now=None):
+    """Record every timer check beside the snapshot; an unchanged copy keeps its old captured_at."""
+    status_path = Path(target).with_name(STATUS_NAME)
+    try:
+        previous = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    previous = previous if isinstance(previous, dict) else {}
+    state = result.get("status") if isinstance(result, dict) else None
+    record = {"checked_at": (now or datetime.now(timezone.utc)).isoformat(),
+              "result": state if state in ("published", "unchanged") else "failed",
+              "last_published_at": result.get("captured_at") if state == "published" else previous.get("last_published_at")}
+    if record["result"] == "failed":
+        record["category"] = str(category or "unknown")[:60]
+    fd, temporary = tempfile.mkstemp(prefix=".status-", suffix=".json", dir=status_path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            os.chmod(temporary, 0o440)
+        os.replace(temporary, status_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return record
+
+
+def _record_check_quietly(target, result, category=None):
+    try:
+        record_check(target, result, category)
+    except (OSError, ValueError):
+        pass
+
+
 def main():
     import fcntl
 
     with (TARGET.parent / ".refresh.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            print(json.dumps(publish(SOURCE, TARGET)), flush=True)
+            result = publish(SOURCE, TARGET)
         except Exception as exc:
+            _record_check_quietly(TARGET, {"status": "failed"}, type(exc).__name__)
             print(json.dumps({"status": "failed", "category": type(exc).__name__}), flush=True)
             raise SystemExit(1) from None
+        _record_check_quietly(TARGET, result)
+        print(json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":
