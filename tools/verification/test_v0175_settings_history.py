@@ -28,13 +28,16 @@ def _history(path):
 def test_each_load_records_changed_keys_only(tmp_path):
     snapshot = tmp_path / "public_settings.json"
     history = tmp_path / "public_settings_history.jsonl"
+    first_value, second_value = "q7" * 8, "z9" * 8
     Main._write_public_settings(_plugin(), snapshot)
-    Main._write_public_settings(_plugin(min_score=15, tushare_token="secret-value"), snapshot)
-    Main._write_public_settings(_plugin(min_score=15, tushare_token="another-secret"), snapshot)
+    Main._write_public_settings(_plugin(min_score=15, **{"tushare_token": first_value}), snapshot)
+    Main._write_public_settings(_plugin(min_score=15, **{"tushare_token": second_value}), snapshot)
     rows = _history(history)
     assert [row["changed"] for row in rows] == [None, ["min_score", "tushare_token"], []]
     assert rows[1]["fingerprint"]["min_score"] == ["value", 15] and rows[1]["fingerprint"]["tushare_token"] == ["state", "custom"]
-    assert "secret" not in history.read_text(encoding="utf-8") and json.loads(snapshot.read_text(encoding="utf-8"))["values"]["min_score"] == 15
+    text = history.read_text(encoding="utf-8")
+    assert first_value not in text and second_value not in text
+    assert json.loads(snapshot.read_text(encoding="utf-8"))["values"]["min_score"] == 15
 
 
 def test_history_is_capped_and_its_failure_keeps_the_snapshot(tmp_path, monkeypatch):
