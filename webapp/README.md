@@ -23,14 +23,27 @@ Mobile acceptance here means a responsive browser viewport, not LAN access.
 
 ## Views And Data
 
-- Overview: stored market date/quality/coverage, candidates and recent runs.
+- Overview: market date/quality, a coverage breakdown with separate denominators
+  (quotes, four risk fields known, indicators computable, formal passes), today's
+  trading-calendar session, candidates and recent runs.
 - Monitor: fixed-origin outbox events, original plan identity and stored quotes.
+  "Closed" is shown only when the stored calendar says so.
 - Candidates: score/risk search, sorting, levels and stock links.
-- Stock: stored unadjusted OHLC, volume, MA5/10/20, plan and event history.
+- Stock: unadjusted OHLC from the published active raw generation (legacy
+  `daily_bars` only as a labelled fallback), volume, MA5/10/20, plan, research
+  membership and event history. `/api/search?q=` finds codes by code or name.
 - Performance: verified trading-day T+1/3/5/10 windows, gross close returns,
   MFE, close-series drawdown and distinct price/path denominators.
-- Health: provider errors by sanitized category, batches, jobs and outboxes.
+- Health: provider success telemetry and API rate-limit deadlines kept apart,
+  batches, jobs and outboxes; records older than the current data date are folded.
 - Settings: allowlisted public effective values and separate schema defaults.
+- `/api/version`: API version, capability list, build release/revision (written
+  into `webapp/build_info.json` by `deploy/package.py`) and database schema.
+
+The snapshot timer writes `snapshot_status.json` beside the snapshot on every
+check (`published`, `unchanged` or `failed`). The dashboard reads it from next
+to `--database` and reports it as `meta.snapshot.check`, so an unchanged but old
+copy during a holiday is distinguishable from a timer that stopped checking.
 
 Only public recommendations and the server's fixed `--origin` are visible.
 The API ignores client attempts to change origin. Without `--origin`, private
@@ -64,6 +77,7 @@ so aggregates describe the returned local sample, not unlimited lifetime history
 ```powershell
 py -m pytest tools/verification/test_v0144_web_dashboard.py -q
 node --check webapp/static/app.js
+node tools/verification/web_app_logic.cjs
 node tools/verification/web_dashboard_browser.cjs http://127.0.0.1:8765
 py -m py_compile webapp/data.py webapp/server.py webapp/demo.py
 py -m pytest -q

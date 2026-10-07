@@ -9,7 +9,7 @@
 - Tushare 当天暂无数据时自动寻找最近有数据的交易日
 - 盘中轮询自选股，触发信号后推送提醒
 - 盘中行情按会话合并抓取，信号冷却状态持久化到 SQLite
-- SQLite 使用可重复执行的 v7→v20 迁移；交易日、快照请求、候选运行、价位来源、每日验收、告警投递和研究双池均保留状态
+- SQLite 使用可重复执行的 v7→v24 迁移；交易日、快照请求、候选运行、价位来源、每日验收、告警投递和研究双池均保留状态
 - v0.13.3 的 Tushare 日线采用 append-only raw 批次、活动 generation 和读取 provenance；未完成或校验失败的批次不会切换活动数据，默认切换已校验批次为 active；跨进程快照使用带 fence 的持久租约，租约丢失时不会发布旧 owner 的批次
 - 技术指标只使用明确标记为未复权的日线；只有通过交易日、收盘价偏差和价位顺序校验的收盘计划才会用于告警和回放
 - 股票代码和名称共享本地索引；`/行情`、`/自选` 支持已同步名称，名称有歧义时会要求改用更完整名称或代码
@@ -90,7 +90,7 @@
 - `minute_enabled`：是否记录盘中一分钟聚合行情，默认开启；只用于观测和后续指标，不改变现有评分。成交量/额按行情源累计值计算为分钟增量，开始监听前的累计部分不会回溯。
 - `minute_bar_history`：每只股票保留的已完成分钟线数量，默认 120 根。
 - `minute_bar_keep_days`：SQLite 保留已完成分钟线的天数，默认 7 天。
-- `deep_screen_limit` / `factor_screen_limit`：技术深筛和因子终评上限，默认 300/100。
+- `deep_screen_limit` / `factor_screen_limit`：技术深筛和因子终评上限，默认 300/100。研究双池不读取这两项和 `price_min`/`price_max`，固定使用成交额前 300 只深筛、重点 7、警戒 20、价格 2–80 元，并把这些参数写入每次冻结记录；`/观察池` 和 Web 研究页会显示。
 - `screen_min_indicator_coverage`：完整空结果允许清理候选池所需的技术指标覆盖率，默认 0.8。
 - `minute_trigger_enabled`：是否启用分钟线突破提醒，默认关闭。开启后要求连续上涨并突破近几根分钟线高点，只发研究提醒，不自动下单。
 - `minute_trigger_lookback`、`minute_trigger_min_bars`：突破参考窗口和最少分钟线数量，默认都是 5 根。
@@ -105,9 +105,9 @@
 - `factor_source`：因子来源。`auto`/`eastmoney` 使用东方财富公开字段；`tushare` 会在权限允许时补估值、ROE、营收增速和经营现金流字段；`custom` 使用自定义 JSON 接口。
 - `factor_data_url`：可选自定义因子接口。留空时使用 `factor_source` 指定的内置来源。接口返回 `data` 数组，每项至少包含 `code`，可选 `industry`、`industry_score`、`fundamental_score`；也可直接给原始 `roe`、`profit_growth`、`cash_quality`、`pe`、`pb`、`st_flag`、`audit_flag`，插件会计算基本面分。
 - `market_min_snapshot_size`：只有本地快照达到该数量才按“完整市场”计算大盘环境，默认 4000；不足时报告会标为 `partial`。
-- `confirmation_enabled`：启用连续信号确认，默认关闭；开启后需连续满足条件才推送技术信号，确认进度会保存到 SQLite。
-- `confirmation_periods`：连续确认次数，默认 2 次。
-- `confirmation_max_gap_seconds`：连续确认最大间隔，默认 90 秒。
+- `confirmation_enabled` / `confirmation_periods` / `confirmation_max_gap_seconds`：**已废弃且不生效**，只为旧配置保留。盘中连续确认的次数和间隔由 `intraday_confirmation_periods`（默认 2，弱市额外加 1）和 `intraday_confirmation_max_gap_seconds`（默认 90 秒）控制，确认进度保存到 SQLite。旧键不是旧默认值时，插件加载会写一条 warning。
+- 【高级】`automatic_close_max_attempts` / `automatic_close_retry_window_seconds` / `automatic_close_retry_seconds`：自动收盘筛选的最多尝试次数、恢复窗口和重试间隔，默认 6 次 / 14400 秒 / 300 秒；`automatic_delivery_lease_seconds`、`automatic_delivery_max_attempts`、`automatic_delivery_retry_window_seconds`、`automatic_delivery_retry_seconds` 控制自动报告投递的租约与重试（默认 120 秒 / 5 次 / 3600 秒 / 60 秒）；`intraday_risk_delivery_max_age_seconds` 是盘中风险失效提醒的最大补发年龄（默认 900 秒）。这些默认值与此前代码内置值相同。
+- 配置缺键时，代码统一回退到 `_conf_schema.json` 的默认值（例如 `quote_interval_seconds` 5 秒、`max_concurrency` 5）。
 
 自定义快照接口的返回格式示例：
 
@@ -178,6 +178,12 @@
 - Tushare Pro 更适合每日和历史数据，不建议用于高频盘中监听。Token 只填入 AstrBot 配置或环境变量，不要放进 URL 或提交到 GitHub。
 
 公开接口可能出现限流、延迟或临时不可用。未配置 Tushare Token 时，快照失败仍会退回 `universe_codes` 或自选股扫描；配置 Token 时，全市场命令按上文规则提供隔离的东方财富临时预览。若明确关闭 `tushare_raw_publish_enabled`，命令会报告 shadow-only 状态并停止，不调用东方财富。
+
+## 版本与验收状态
+
+- 插件版本 0.13.3，数据库迁移版本 24（`storage.py` 的 `LATEST_SCHEMA_VERSION`）。
+- 只读 Web（`webapp/`）与插件分开打包、分开部署。插件版本号相同不代表线上 Web 后端已包含当前 main 的功能；部署后用 `/api/version` 核对构建修订、能力列表（例如 `research_pools`）和数据库 schema 版本。
+- 本地 `tools/verification` 通过只说明代码检查通过，不等于已安装、已加载或通过生产验收。正式候选还取决于停牌、涨停、跌停、ST 四项风险证据的独立验收，见 `docs/FORMAL_RISK_*`。
 
 ## 免责声明
 
