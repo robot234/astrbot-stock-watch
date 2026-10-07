@@ -101,6 +101,23 @@ def test_unverified_risk_funnel_says_where_everything_stopped(tmp_path, monkeypa
     assert stage(funnel, "candidates")["count"] == 0 and result.diagnostics["screen_audit"] == []
 
 
+def test_degraded_watch_copy_leaves_out_the_audit_rows(tmp_path):
+    as_of = datetime.now(core.CHINA_TZ).date().isoformat()
+    main, _quotes = _raw_main(tmp_path, as_of)
+    saved = {}
+
+    def saver(job_key, trade_date, reason, missing, diagnostics, items):
+        saved.update(diagnostics)
+        return 1
+
+    main.store.save_degraded_watch_list = saver
+    diagnostics = {"screen_audit": [{"code": "600001"}], "screen_funnel": {"version": 1}, "input": 4}
+    result = asyncio.run(main._save_and_push_degraded_watch("job", as_of, "risk_evidence_missing", [], diagnostics, [],
+                                                            terminal=False))
+    assert result == {"state": "saved", "pushed": 0}
+    assert saved == {"screen_funnel": {"version": 1}, "input": 4}
+
+
 def run_row(db, run_id, date, finished, diagnostics):
     db.execute("INSERT INTO screen_runs(run_id,job_name,requested_date,actual_trade_date,source,started_at,finished_at,"
                "quote_count,candidate_count,status,quality,diagnostics) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",

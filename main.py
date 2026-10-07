@@ -6357,7 +6357,9 @@ class Main(Star):
             "risk_level": item.risk_level,
         } for item in observations]
         try:
-            saved = await self._store_call(saver, job_key, trade_date, reason, missing, dict(diagnostics), items)
+            # The run row already keeps the per-stock audit rows; each attempt copy stays small.
+            kept = {key: value for key, value in diagnostics.items() if key != "screen_audit"}
+            saved = await self._store_call(saver, job_key, trade_date, reason, missing, kept, items)
         except (sqlite3.Error, TypeError, ValueError, RuntimeError):
             logger.warning("[%s] 降级观察名单持久化失败：%s", PLUGIN_NAME, job_key)
             return {"state": "save_failed"}
