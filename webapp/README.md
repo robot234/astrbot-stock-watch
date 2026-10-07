@@ -28,7 +28,11 @@ Mobile acceptance here means a responsive browser viewport, not LAN access.
   trading-calendar session, candidates and recent runs.
 - Monitor: fixed-origin outbox events, original plan identity and stored quotes.
   "Closed" is shown only when the stored calendar says so.
-- Candidates: score/risk search, sorting, levels and stock links.
+- Candidates: score/risk search, sorting, levels and stock links. Below them,
+  the newest recorded screen's funnel (count and exclusion reasons after each
+  step) and up to 60 deep-screen rows (rank, outcome, score used only for
+  ranking, reasons, comparability), read from `screen_runs.diagnostics` as
+  written by the plugin's `screen_audit.py`; the stock page shows that stock's row.
 - Stock: unadjusted OHLC from the published active raw generation (legacy
   `daily_bars` only as a labelled fallback), volume, MA5/10/20, plan, research
   membership and event history. `/api/search?q=` finds codes by code or name.

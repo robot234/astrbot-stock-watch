@@ -462,6 +462,62 @@ function candidateTable(rows) {
   return table(["股票", {t:"收盘价", cls:"r"}, {t:"涨跌幅", cls:"r"}, "评分", "风险", "理由", "D3 结果"], body, 900, {cls:"mlist"});
 }
 const sortText = sort => `评分${sort === "asc" ? "从低到高" : "从高到低"}`;
+// Screening funnel (S04) and per-stock audit rows (S03) from the plugin's latest recorded screen; display only.
+const FUNNEL_STAGE = {input:"原池（当日行情）", price:"价格区间", risk_state:"停牌 / 涨跌停 / ST 已核验为否", deep_screen:"深筛名额（按成交额）",
+  indicators:"指标可算", risk_review:"风险复核", min_score:"达到最低分", candidates:"候选（数量上限）"};
+const FUNNEL_REASON = {price_out_of_range:"价格不在区间", suspended:"停牌", limit_up:"涨停", limit_down:"跌停", st:"ST", risk_state_unknown:"风险状态未核验",
+  beyond_deep_limit:"超出深筛名额", history_failed:"历史行情不可用", failed:"指标获取失败", not_computed:"未计算", risk_blocked:"风险阻断",
+  technical_incomplete:"技术数据不完整", factor_not_checked:"不在因子名额内，没查 ST / 审计", st_audit_unknown:"ST / 审计状态未知",
+  risk_unknown:"风险未知", below_min_score:"低于最低分", beyond_candidate_limit:"超出候选上限"};
+const AUDIT_STATUS = {candidate:["ok", "入选"], fallback_candidate:["warn", "观察候选（未达最低分）"], beyond_candidate_limit:["info", "达标，超出上限"],
+  risk_blocked:["crit", "风险阻断"], technical_incomplete:["unk", "技术数据不完整"], factor_not_checked:["unk", "没查 ST / 审计"],
+  st_audit_unknown:["unk", "ST / 审计未知"], risk_unknown:["unk", "风险未知"], below_min_score:["unk", "低于最低分"], not_selected:["unk", "未入选"], unknown:["unk", "未知"]};
+const INDICATOR_OK = ["network", "memory_cache", "persistent_cache", "raw_batch"];
+const reasonList = excluded => Object.entries(excluded || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${esc(FUNNEL_REASON[k] || k)} ${fmt(n, 0)}`).join(" · ");
+function funnelVerdict(stages) {
+  if (!stages.length) return "";
+  if (stages[0].count === 0) return "当日行情为空，后面各步都没有数据。";
+  const gates = stages.filter(s => s.gate !== false), last = gates[gates.length - 1];
+  const stop = gates.find((s, i) => i > 0 && s.count === 0 && gates[i - 1].count > 0);
+  if (!stop) return "";
+  if (stop.key === "min_score" && last?.fallback) return `没有股票达到最低分，列出 ${fmt(last.fallback, 0)} 只未达最低分的观察候选。`;
+  const top = Object.entries(stop.excluded || {}).sort((a, b) => b[1] - a[1])[0];
+  return `在「${FUNNEL_STAGE[stop.key] || stop.key}」这一步全部被拦下${top ? `，主要原因：${FUNNEL_REASON[top[0]] || top[0]}` : ""}。`;
+}
+function funnelPanel(screen) {
+  if (screen?.status !== "available") {
+    const recorded = screen?.status === "not_recorded";
+    return panel("筛选漏斗", empty(recorded ? "最近的筛选没有记录漏斗" : "筛选漏斗不可用", screen?.status || "screen_audit_unavailable", recorded ? ["插件更新到带筛选漏斗的版本后，下一次筛选开始记录"] : []), `<span class="src">S04</span>`);
+  }
+  const stages = screen.funnel?.stages || [], first = stages[0]?.count;
+  const rows = stages.map(s => {
+    const share = finite(first) && first > 0 ? `占原池 ${fmt(s.count / first * 100, 1)}%` : "";
+    const extra = s.key === "price" ? `${fmt(s.price_min)}–${fmt(s.price_max)} 元` : s.key === "deep_screen" ? `上限 ${fmt(s.limit, 0)}` : s.key === "min_score" ? `最低分 ${fmt(s.min_score, 0)}` : s.key === "candidates" ? `上限 ${fmt(s.limit, 0)}${s.fallback ? ` · 观察候选 ${fmt(s.fallback, 0)}` : ""}` : "";
+    const why = Object.keys(s.excluded || {}).length ? `<small>排除：${reasonList(s.excluded)}</small>` : "";
+    const aside = s.gate === false ? `<small>只统计、不单独拦截；缺指标的股票在风险复核里出局</small>` : "";
+    return `<div class="status-row"><span>${esc(FUNNEL_STAGE[s.key] || s.key)}${aside}${why}</span><span class="num">${fmt(s.count, 0)}<small>${[share, extra].filter(Boolean).join(" · ")}</small></span></div>`;
+  }).join("");
+  const verdict = funnelVerdict(stages);
+  const older = screen.is_latest ? "" : notice("", "triangle-alert", `最新一次筛选（${esc(screen.latest_run_id || "未知")}）没有记录漏斗，下面是更早的一次`);
+  return panel("筛选漏斗", older + (verdict ? notice("info", "list-filter", esc(verdict)) : "") + `<div class="status-rows">${rows}</div>`, `<span class="src">${esc(screen.date || "日期未知")} · ${esc(screen.job_name || "筛选")} · ${badge(screen.run_status)}</span>`);
+}
+function auditPanel(screen) {
+  if (screen?.status !== "available") return "";
+  const rows = (screen.audit || []).map(r => {
+    const [kind, text] = AUDIT_STATUS[r.status] || AUDIT_STATUS.unknown, ind = r.indicators || {}, missing = r.missing_inputs || [];
+    const why = [...(r.reasons || []), ...(r.risk_flags || []).map(f => `风险：${f}`)].map(esc).join("；") || "—";
+    const comp = r.comparable ? "同口径" : `缺 ${fmt(missing.length, 0)} 项${INDICATOR_OK.includes(r.indicator_status) ? "" : " · 指标不可用"}`;
+    return `<tr><td class="num">${fmt(r.rank, 0)}</td><td>${link(r.code, r.name)}</td><td>${kindBadge(kind, text, r.status)}</td><td class="num">${fmt(r.base_score, 0)}${finite(r.score) && r.score !== r.base_score ? `<small>综合 ${fmt(r.score, 0)}</small>` : ""}</td><td>${badge(r.risk_level)}</td><td class="wrap">${why}</td><td class="num">${fmt(ind.rsi6, 1)}<small>5 日 ${pct(ind.momentum5)} · 20 日 ${pct(ind.momentum20)}</small></td><td title="${esc(missing.join(", "))}">${comp}</td></tr>`;
+  });
+  return panel(`深筛明细 · 前 ${fmt(rows.length, 0)} / 共 ${fmt(screen.audit_total, 0)}`, `<p class="regime-note">技术分只用来排序，不是胜率或上涨概率；同分时按风险、数据完整度和成交额排。缺评分输入的股票，缺的那项按 0 分算，和数据齐全的不是同一口径。</p>` + table(["排名", "股票", "去向", "技术分", "风险", "加减分与风险标记", "RSI6 / 动量", "可比性"], rows, 980), `<span class="src">S03 · 全部最终候选 + 排名靠前的其他股票</span>`);
+}
+function stockScreenLine(d) {
+  const s = d.screen_audit;
+  if (s?.status === "not_listed") return `最近一次筛选（${esc(s.date || "未知")}）：不在深筛明细前 ${fmt(s.audit_shown, 0)} 名里（共 ${fmt(s.audit_total, 0)} 只进入深筛，其余原因看候选页漏斗）`;
+  if (s?.status !== "listed" || !s.row) return "";
+  const r = s.row, [, text] = AUDIT_STATUS[r.status] || AUDIT_STATUS.unknown;
+  return `最近一次筛选（${esc(s.date || "未知")}）：深筛第 ${fmt(r.rank, 0)} / ${fmt(s.audit_total, 0)} 名 · ${esc(text)} · 技术分 ${fmt(r.base_score, 0)}（只用于排序）${(r.reasons || []).length ? ` · ${r.reasons.map(esc).join("；")}` : ""}`;
+}
 function renderCandidates(d) {
   state.candidates = (d.items || []).slice(0, LIMITS.candidates);
   const f = state.filter, chain = chainState(), rows = applyFilter();
@@ -469,7 +525,7 @@ function renderCandidates(d) {
   const boards = [["all", "全部"], ["main", "主板"], ["gem", "创业板"], ["star", "科创板"]];
   const toolbar = `<div class="toolbar"><label class="search">${ic("search")}<input id="candidate-search" value="${esc(f.query)}" placeholder="代码、名称或行业" aria-label="筛选候选"></label><div class="seg" role="group" aria-label="板块">${boards.map(([k, t]) => `<button type="button" data-board="${k}" class="${f.board === k ? "active" : ""}" aria-pressed="${f.board === k}">${t}</button>`).join("")}</div><button type="button" class="fchip ${f.cheap ? "on" : ""}" data-chip="cheap" aria-pressed="${f.cheap}">股价 0-50</button><button type="button" class="fchip ${f.noSt ? "on" : ""}" data-chip="nost" aria-pressed="${f.noSt}">排除 ST</button><button type="button" class="fchip on" data-sort="score" aria-label="切换评分排序">${ic("arrow-up-down")}<span id="sort-label">${sortText(f.sort)}</span></button><select id="candidate-risk" aria-label="风险筛选">${opt("", "全部风险", f.risk)}${opt("eligible", "可跟踪", f.risk)}${opt("watch_only", "需复核", f.risk)}${opt("blocked", "已拦截", f.risk)}</select><select id="candidate-sort" aria-label="候选排序">${opt("desc", "评分从高到低", f.sort)}${opt("asc", "评分从低到高", f.sort)}</select><span class="count" id="candidate-count">${rows.length} / ${LIMITS.candidates}</span></div>`;
   const warn = chain.kind === "ok" ? "" : notice(chain.kind === "crit" ? "crit" : "", "triangle-alert", `链路${esc(chain.text)}：名单只用于排查，不作为当日候选。原因代码 ${esc(chain.reasons.map(r => r.code).join("、"))}`);
-  return pageHead("候选池", "", [`上限 ${LIMITS.candidates}`]) + warn + panel("正式候选 · 当前有效批次", toolbar + `<div id="candidate-table">${candidateTable(rows)}</div>`);
+  return pageHead("候选池", "", [`上限 ${LIMITS.candidates}`]) + warn + panel("正式候选 · 当前有效批次", toolbar + `<div id="candidate-table">${candidateTable(rows)}</div>`) + funnelPanel(d.screen) + auditPanel(d.screen);
 }
 function filterCandidates() {
   const f = state.filter;
@@ -641,7 +697,8 @@ function stockStatusNotice(d) {
   const research = r ? `研究池：${r.pool === "primary" ? "重点观察" : "警戒"} 第 ${esc(r.rank)} 名（${esc(r.trade_date)} 冻结，仅研究，不是正式推荐）` : "研究池：最新冻结批次中没有这只股票";
   const offline = (state.ctx.catalog?.data?.entries || []).flatMap(e => (e.items || []).filter(i => i.code === d.code)
     .map(i => `${esc(e.id)} 第 ${esc(i.rank)} 名（${esc(e.label || "研究观察")}）`));
-  return notice("info", "database", `行情来源 ${esc(source)}<br>正式身份：${d.formal_status === "formal_candidate" ? "当前有效正式候选" : "不是当前正式候选"} · 推荐记录：${d.recommendation_status === "recorded" ? "有" : "无"}<br>${research}${offline.length ? `<br>离线研究名单：${offline.join("；")}` : ""}`);
+  const screen = stockScreenLine(d);
+  return notice("info", "database", `行情来源 ${esc(source)}<br>正式身份：${d.formal_status === "formal_candidate" ? "当前有效正式候选" : "不是当前正式候选"} · 推荐记录：${d.recommendation_status === "recorded" ? "有" : "无"}<br>${research}${offline.length ? `<br>离线研究名单：${offline.join("；")}` : ""}${screen ? `<br>${screen}` : ""}`);
 }
 function renderStock(d) {
   const bars = (d.bars || []).slice(-LIMITS.bars);

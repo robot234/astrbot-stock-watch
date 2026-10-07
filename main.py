@@ -33,6 +33,7 @@ from .research_selector import radar_crossed, select_pools
 from .research_risk import evidence_label, load_evidence
 from . import formal_source_policy
 from . import config_checks
+from . import screen_audit
 
 PLUGIN_NAME = "astrbot_stock_watch"
 
@@ -4554,6 +4555,13 @@ class Main(Star):
                             item.factor_overlay = FactorOverlay(current_industry_name=current)
                         else:
                             item.factor_overlay.current_industry_name = current
+        statuses = screen_audit.scored_statuses(scored, minimum=minimum, factor_codes=set(factor_codes),
+                                                qualified=qualified, final=final_candidates, fallback=fallback)
+        diagnostics["screen_funnel"] = screen_audit.screen_funnel(
+            quotes, scored, statuses, price_min=price_min, price_max=price_max, deep_limit=deep_limit,
+            indicator_status=indicator_status, minimum=minimum, limit=limit)
+        diagnostics["screen_audit"] = screen_audit.audit_rows(scored, statuses, indicator_status, final=final_candidates)
+        diagnostics["screen_audit_total"] = len(scored)
         diagnostics["candidate_count"] = len(final_candidates)
         observations = self._degraded_observations(
             scored,

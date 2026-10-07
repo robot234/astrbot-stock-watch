@@ -24,7 +24,7 @@ vm.createContext(context);
 vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
   dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice,
-  hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel};`, context, {filename: "app.js"});
+  hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel, funnelPanel, auditPanel, funnelVerdict, stockScreenLine};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -197,6 +197,35 @@ check("macd_no_cross", app.macdStockPanel(macd({state: "dead", cross_date: null,
 check("macd_short", app.macdStockPanel({macd: {status: "insufficient_history", sessions: 20, min_sessions: 60}}).includes("行情不足 60 个交易日"));
 check("macd_legacy", app.macdStockPanel({macd: {status: "unavailable", reason: "no_active_raw"}}).includes("旧日线表缺前收盘"));
 check("macd_missing", app.macdStockPanel({}).includes("MACD 暂不可用"));
+
+// Screening funnel (S04) and audit rows (S03): every step keeps its count and reasons; scores only rank.
+const stages = [{key: "input", count: 5561, gate: true, excluded: {}}, {key: "price", count: 5200, gate: true, excluded: {price_out_of_range: 361}, price_min: 2, price_max: 80},
+  {key: "risk_state", count: 4800, gate: true, excluded: {risk_state_unknown: 300, st: 100}}, {key: "deep_screen", count: 300, gate: true, excluded: {beyond_deep_limit: 4500}, limit: 300},
+  {key: "indicators", count: 290, gate: false, excluded: {history_failed: 10}}, {key: "risk_review", count: 0, gate: true, excluded: {factor_not_checked: 200, st_audit_unknown: 100}},
+  {key: "min_score", count: 0, gate: true, excluded: {}, min_score: 10}, {key: "candidates", count: 0, gate: true, excluded: {}, limit: 30, fallback: 0}];
+const screen = {status: "available", run_id: "r1", latest_run_id: "r1", is_latest: true, date: "2026-10-08", job_name: "automatic_close", run_status: "completed",
+  funnel: {version: 1, stages}, audit_total: 300, audit: [
+    {code: "600001", name: "<b>甲</b>", rank: 1, status: "factor_not_checked", base_score: 30, score: 30, risk_level: "unknown", risk_flags: ["ST/审计状态未知"],
+     reasons: ["均线多头趋势+12"], indicators: {rsi6: 55.2, momentum5: 3.4, momentum20: -1.2}, indicator_status: "raw_batch", comparable: false, missing_inputs: ["volume_ratio"]}]};
+const funnel = app.funnelPanel(screen);
+check("funnel_rows", funnel.includes("5,561") && funnel.includes("价格不在区间 361") && funnel.includes("2.00–80.00 元") && funnel.includes("超出深筛名额 4,500"));
+check("funnel_indicator_aside", funnel.includes("只统计、不单独拦截"));
+check("funnel_verdict", funnel.includes("在「风险复核」这一步全部被拦下，主要原因：不在因子名额内，没查 ST / 审计"));
+check("funnel_valid_empty", app.funnelVerdict(stages.map(s => s.key === "risk_review" ? {...s, count: 290, excluded: {}} : s.key === "min_score" ? {...s, excluded: {below_min_score: 290}} : s))
+  === "在「达到最低分」这一步全部被拦下，主要原因：低于最低分。");
+check("funnel_fallback", app.funnelVerdict(stages.map(s => s.key === "risk_review" ? {...s, count: 290} : s.key === "candidates" ? {...s, count: 5, fallback: 5} : s)).includes("列出 5 只未达最低分的观察候选"));
+check("funnel_empty_market", app.funnelVerdict([{key: "input", count: 0}]) === "当日行情为空，后面各步都没有数据。");
+check("funnel_older", app.funnelPanel({...screen, is_latest: false, latest_run_id: "r2"}).includes("下面是更早的一次"));
+check("funnel_not_recorded", app.funnelPanel({status: "not_recorded"}).includes("插件更新到带筛选漏斗的版本后"));
+const auditHtml = app.auditPanel(screen);
+check("audit_rows", auditHtml.includes("深筛明细 · 前 1 / 共 300") && auditHtml.includes("没查 ST / 审计") && auditHtml.includes("风险：ST/审计状态未知")
+  && auditHtml.includes("缺 1 项") && auditHtml.includes("+3.40%") && auditHtml.includes("不是胜率"));
+check("audit_escaped", auditHtml.includes("&lt;b&gt;甲&lt;/b&gt;") && !auditHtml.includes("<b>甲</b>"));
+check("audit_absent", app.auditPanel({status: "not_recorded"}) === "");
+check("stock_screen_listed", app.stockScreenLine({screen_audit: {status: "listed", date: "2026-10-08", audit_total: 300, row: screen.audit[0]}})
+  .includes("深筛第 1 / 300 名 · 没查 ST / 审计 · 技术分 30（只用于排序）"));
+check("stock_screen_not_listed", app.stockScreenLine({screen_audit: {status: "not_listed", date: "2026-10-08", audit_total: 300, audit_shown: 60}}).includes("不在深筛明细前 60 名里"));
+check("stock_screen_none", app.stockScreenLine({screen_audit: {status: "not_recorded"}}) === "" && app.stockScreenLine({}) === "");
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

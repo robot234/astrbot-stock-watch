@@ -49,6 +49,13 @@ SIGNAL_EXCLUSIONS = frozenset({"not_main_or_chinext", "st_name", "no_bar_today",
                                "corporate_action_60d", "price_above_50", "amount_below_20m", "indicator_missing"})
 # Stock-page MACD uses the research schemes H / I definition and stays unverified until scheme I's endpoint.
 MACD_SPANS, MACD_CROSS_LOOKBACK, MACD_MIN_SESSIONS = (12, 26, 9), 3, 60
+# Written by the plugin's screen_audit.py into screen_runs.diagnostics (S03 / S04).
+SCREEN_STAGES = ("input", "price", "risk_state", "deep_screen", "indicators", "risk_review", "min_score", "candidates")
+SCREEN_STATUSES = frozenset({"candidate", "fallback_candidate", "beyond_candidate_limit", "risk_blocked",
+                             "technical_incomplete", "factor_not_checked", "st_audit_unknown", "risk_unknown",
+                             "below_min_score", "not_selected"})
+SCREEN_INDICATORS = ("rsi6", "ma5", "ma10", "ma20", "momentum5", "momentum20", "volume_ratio", "volatility20", "atr14")
+SCREEN_AUDIT_ROWS = 60
 SIGNAL_APPROXIMATIONS = frozenset({"turnover_ratio_from_volume", "st_from_current_name"})
 SIGNAL_INDICES = ("000905", "000852")
 # Offline research freezes shown read-only; stages are curated from each study's own delivery documents.
@@ -214,6 +221,52 @@ def signal_stock(code, overheat):
     reason = obj(overheat.get("excluded")).get(code)
     return {"code": code, "status": "excluded" if reason in SIGNAL_EXCLUSIONS else "not_evaluated", "hot": False,
             "score": None, "pct": None, "reason": reason if reason in SIGNAL_EXCLUSIONS else None, "indicators": {}}
+
+
+def plain_count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def reason_token(value, limit=30):
+    text = str(value or "")
+    return text if re.fullmatch(r"[a-z][a-z0-9_]{0,%d}" % (limit - 1), text) else None
+
+
+def screen_funnel(value):
+    """The plugin's funnel, keeping known stage keys, plain counts and reason tokens."""
+    funnel = obj(value)
+    if funnel.get("version") != 1:
+        return None
+    stages = []
+    for stage in arr(funnel.get("stages"))[:len(SCREEN_STAGES)]:
+        stage = obj(stage)
+        if stage.get("key") not in SCREEN_STAGES or plain_count(stage.get("count")) is None:
+            continue
+        excluded = {reason_token(key): plain_count(n) for key, n in obj(stage.get("excluded")).items()}
+        stages.append({"key": stage["key"], "count": stage["count"], "gate": stage.get("gate") is not False,
+                       "excluded": {key: n for key, n in excluded.items() if key and n},
+                       **{key: number(stage.get(key)) for key in ("price_min", "price_max", "limit", "min_score", "fallback")
+                          if number(stage.get(key)) is not None}})
+    return {"version": 1, "stages": stages} if stages else None
+
+
+def screen_audit_row(row):
+    row = obj(row)
+    code = safe_text(row.get("code"), 12)
+    if not re.fullmatch(r"(?:\d{6}|DEMO\d{2})", code) or plain_count(row.get("rank")) is None:
+        return None
+    indicators = obj(row.get("indicators"))
+    return {"code": code, "name": safe_text(row.get("name"), 20) or None, "rank": row["rank"],
+            "status": row.get("status") if row.get("status") in SCREEN_STATUSES else "unknown",
+            "base_score": number(row.get("base_score")), "score": number(row.get("score")),
+            "score_max": number(row.get("score_max")), "risk_level": reason_token(row.get("risk_level"), 20) or "unknown",
+            "risk_flags": [safe_text(flag, 40) for flag in arr(row.get("risk_flags"))[:6] if isinstance(flag, str)],
+            "reasons": [safe_text(reason, 40) for reason in arr(row.get("reasons"))[:8] if isinstance(reason, str)],
+            "indicators": {key: number(indicators.get(key)) for key in SCREEN_INDICATORS if number(indicators.get(key)) is not None},
+            "history_days": plain_count(row.get("history_days")),
+            "indicator_status": reason_token(row.get("indicator_status")) or "unknown",
+            "comparable": row.get("comparable") is True,
+            "missing_inputs": [key for key in arr(row.get("missing_inputs")) if key in SCREEN_INDICATORS]}
 
 
 def signal_index(item):
@@ -446,6 +499,39 @@ class Snapshot:
             "SELECT DISTINCT trade_date FROM batch_days WHERE batch_id=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 500",
             (active["batch_id"], today))][::-1]
         return {**macd_state(days, self.active_raw_rows(code, limit=500)), "verified": False, "display_only": True}
+
+    def screen_audit(self):
+        """Funnel and audit rows of the newest recent screen run that recorded them (S03 / S04); display only."""
+        if hasattr(self, "_screen_audit"):
+            return self._screen_audit
+        runs = self.rows("screen_runs", required=("run_id", "diagnostics"),
+                         order="actual_trade_date DESC,finished_at DESC", limit=10)
+        latest = safe_text(runs[0]["run_id"]) if runs else None
+        self._screen_audit = {"status": "not_recorded" if runs else "unavailable", "latest_run_id": latest}
+        for run in runs:
+            diagnostics = obj(run.get("diagnostics"))
+            funnel = screen_funnel(diagnostics.get("screen_funnel"))
+            if funnel is None:
+                continue
+            rows = [screen_audit_row(item) for item in arr(diagnostics.get("screen_audit"))[:SCREEN_AUDIT_ROWS]]
+            self._screen_audit = {
+                "status": "available", "latest_run_id": latest, "run_id": safe_text(run["run_id"]),
+                "is_latest": safe_text(run["run_id"]) == latest, "job_name": safe_text(run.get("job_name"), 40) or None,
+                "date": run.get("actual_trade_date"), "run_status": safe_text(run.get("status"), 20) or "unknown",
+                "finished_at": run.get("finished_at"), "funnel": funnel, "audit": [row for row in rows if row],
+                "audit_total": plain_count(diagnostics.get("screen_audit_total"))}
+            break
+        return self._screen_audit
+
+    def stock_screen(self, code):
+        """This code's row in the latest recorded screen audit, if it was among the rows kept."""
+        audit = self.screen_audit()
+        if audit["status"] != "available":
+            return {"status": audit["status"]}
+        row = next((item for item in audit["audit"] if item["code"] == code), None)
+        return {"status": "listed" if row else "not_listed", "run_id": audit["run_id"], "date": audit["date"],
+                "is_latest": audit["is_latest"], "audit_total": audit["audit_total"], "audit_shown": len(audit["audit"]),
+                "row": row}
 
     def raw_evidence(self, row, code):
         active = self.active_raw() or {}
@@ -1028,6 +1114,7 @@ class Snapshot:
             "technical_history": {"bars": len(bars), "status": "available" if len(bars) >= 20 else "insufficient"},
             "macd": (self.stock_macd(code) if bar_source["kind"] == "active_raw"
                      else {"status": "unavailable", "reason": "no_active_raw", "verified": False, "display_only": True}),
+            "screen_audit": self.stock_screen(code),
             "data_quality": {"status": data_status, "missing_reason": missing_reason,
                              "source_timestamp": source_timestamp.isoformat() if source_timestamp else None},
         }
@@ -1754,7 +1841,8 @@ class Dashboard:
                 elif route == "signals":
                     data = {"items": snapshot.signals(), "origin_configured": bool(self.origin)}
                 elif route == "candidates":
-                    data = {"items": snapshot.attach_latest_closes(snapshot.candidates()), "research": snapshot.research_pools()}
+                    data = {"items": snapshot.attach_latest_closes(snapshot.candidates()), "research": snapshot.research_pools(),
+                            "screen": snapshot.screen_audit()}
                 elif route.startswith("stocks/"):
                     data = snapshot.stock(route.split("/", 1)[1])
                 elif route == "search":
