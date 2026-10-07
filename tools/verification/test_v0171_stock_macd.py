@@ -1,13 +1,14 @@
 """Stock-page MACD state: display-only, chained prices, the same cross rule as research schemes H and I."""
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import json
 import sqlite3
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from webapp.data import MACD_MIN_SESSIONS, Dashboard, macd_state
+from webapp.data import MACD_MIN_SESSIONS, Dashboard, limit_prices, macd_state
 
 
 NOW = datetime(2026, 10, 7, 2, 30, tzinfo=timezone.utc)
@@ -72,6 +73,24 @@ def test_ex_rights_day_is_not_a_death_cross():
     assert not reference(raw[:101])[2][-1]
 
 
+def test_chart_series_carries_daily_lines_and_forward_adjustment_factors():
+    true = 20 * 1.003 ** np.arange(120)
+    raw = true.copy()
+    raw[100:] /= 2
+    pre = np.r_[raw[0], raw[:-1]]
+    pre[100] = raw[99] / 2
+    days, rows = series(raw, pre)
+    state = macd_state(days, rows, tail=30)
+    points = state["series"]
+    assert [point["date"] for point in points] == days[-30:] and "series" not in macd_state(days, rows)
+    assert points[-1]["dif"] == state["dif"] and points[-1]["dea"] == state["dea"] and points[-1]["hist"] == state["histogram"]
+    assert all(point["adj"] == pytest.approx(0.5) for point in points[:10])
+    assert all(point["adj"] == pytest.approx(1.0) for point in points[10:])
+    assert raw[95] * points[5]["adj"] == pytest.approx(true[95] / 2)
+    plain = macd_state(*series(true), tail=30)["series"]
+    assert [point["dif"] for point in points] == pytest.approx([point["dif"] / 2 for point in plain], abs=1e-4)
+
+
 def test_sessions_without_a_usable_bar_keep_the_price_unchanged():
     prices = 10 * np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.02, 100)))
     days, rows = series(prices)
@@ -104,6 +123,43 @@ def test_short_or_late_history_is_not_padded():
     assert macd_state(days, [])["status"] == "insufficient_history"
 
 
+def test_next_session_limits_follow_board_rules_with_exchange_rounding():
+    assert limit_prices("600857", "宁波中百", 10.05) == {"up": 11.06, "down": 9.05, "rate": 0.1, "board": "main", "st": False,
+                                                       "basis": "rule_derived_from_close"}
+    assert limit_prices("000001", "*ST平安", 3.33)["up"] == 3.5 and limit_prices("000001", "*ST平安", 3.33)["rate"] == 0.05
+    assert limit_prices("300750", "宁德时代", 250.0)["up"] == 300.0 and limit_prices("688001", "华兴源创", 20.0)["down"] == 16.0
+    assert limit_prices("830799", "艾融软件", 10.0)["up"] == 13.0 and limit_prices("920001", "x", 10.0)["board"] == "beijing"
+    assert limit_prices("600857", "x", 0) is None and limit_prices("DEMO01", "x", 10.0) is None
+
+
+def test_stock_page_shows_the_fresh_intraday_quote_beside_the_daily_bars(tmp_path):
+    from test_v0139_intraday_m2 import _imports
+    _, _, Store = _imports()
+    database = tmp_path / "plugin.sqlite3"
+    Store(database)
+    db = sqlite3.connect(database)
+    try:
+        db.executemany("INSERT INTO stock_symbols(code,name,normalized_name,source,updated_at) VALUES(?,?,?,?,?)",
+                       [("600857", "宁波中百", "宁波中百", "stock_basic", "2026-09-30T08:00:00"),
+                        ("600999", "乙", "乙", "stock_basic", "2026-09-30T08:00:00")])
+        db.commit()
+    finally:
+        db.close()
+    stamp = (NOW - timedelta(seconds=5)).isoformat()
+    artifact = {"schema_version": 1, "status": "available", "reason": "", "source": "sina", "published_at": stamp,
+                "collected_at": stamp, "valid_for_seconds": 60, "target_count": 1, "returned_count": 1,
+                "quotes": [{"code": "600857", "name": "宁波中百", "price": 17.5, "pct_change": 1.2, "provider_ts": stamp,
+                            "collected_at": stamp, "source": "sina"}]}
+    (tmp_path / "intraday_quotes.json").write_text(json.dumps(artifact, ensure_ascii=False), encoding="utf-8")
+    dashboard = Dashboard(database, now=lambda: NOW)
+    live = dashboard.query("stocks/600857")["data"]["live"]
+    assert live["status"] == "available" and live["watched"] is True and live["quote"]["price"] == 17.5
+    other = dashboard.query("stocks/600999")["data"]["live"]
+    assert other["watched"] is False and other["quote"] is None
+    later = Dashboard(database, now=lambda: NOW + timedelta(minutes=5)).query("stocks/600857")["data"]["live"]
+    assert later["status"] == "unknown" and later["reason"] == "artifact_expired"
+
+
 def test_stock_route_returns_display_only_macd_without_writing(tmp_path):
     from test_v0139_intraday_m2 import _imports
     _, _, Store = _imports()
@@ -133,8 +189,9 @@ def test_stock_route_returns_display_only_macd_without_writing(tmp_path):
         db.close()
     before = hashlib.sha256(database.read_bytes()).digest()
     data = Dashboard(database, now=lambda: NOW).query("stocks/600857")["data"]
-    expected = macd_state(*series(prices, start=date(2026, 6, 1)))
+    expected = macd_state(*series(prices, start=date(2026, 6, 1)), tail=120)
     assert data["macd"] == {**expected, "verified": False, "display_only": True}
+    assert [point["date"] for point in data["macd"]["series"]] == days
     assert expected["status"] == "available" and expected["sessions"] == 70 and expected["trade_date"] == days[-1]
     assert hashlib.sha256(database.read_bytes()).digest() == before
     db = sqlite3.connect(database)

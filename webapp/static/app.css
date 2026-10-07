@@ -251,6 +251,18 @@ select{height:32px;border:1px solid var(--line);border-radius:5px;background:var
 .stock-head>*{min-width:0}
 .chart-wrap{position:relative;padding:0 8px}
 .price-chart{width:100%;height:320px;display:block}
+.price-chart.with-macd{height:420px}
+.live-quote{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+.live-quote small{color:var(--muted)}
+.ma-bar{flex-wrap:wrap;gap:6px}
+.ma-chip{display:inline-flex;align-items:center;height:26px;border:1px solid var(--line);border-radius:13px;background:var(--surface);overflow:hidden}
+.ma-chip button{height:100%;border:0;background:none;padding:0 6px 0 10px;font-size:12px;color:var(--muted);cursor:pointer}
+.ma-chip.on button{color:var(--ink)}
+.ma-chip i{display:inline-block;width:12px;height:3px;margin-right:5px;vertical-align:middle;border-radius:2px;opacity:.3}
+.ma-chip.on i{opacity:1}
+.ma-chip .ma-x{padding:0 8px 0 4px;color:var(--muted)}
+.ma-add{display:inline-flex;gap:4px}
+.ma-add input{width:70px;height:28px;border:1px solid var(--line);border-radius:5px;padding:0 6px}
 .chart-tip{display:none;position:absolute;left:16px;top:8px;background:rgba(23,32,43,.92);color:#fff;font-size:12px;padding:6px 9px;border-radius:4px;pointer-events:none;font-variant-numeric:tabular-nums;z-index:2}
 .chart-caption{display:flex;justify-content:space-between;gap:6px 12px;flex-wrap:wrap;padding:6px 16px 12px;font-size:11px;color:var(--muted)}
 .chart-caption .ma5{color:#2f6bd8}.chart-caption .ma20{color:#c9861a}
@@ -336,6 +348,7 @@ details.history summary{cursor:pointer;padding:8px 16px;font-size:12px;color:var
   .hide-m{display:none}
   .show-m{display:inline}
   .price-chart{height:240px}
+  .price-chart.with-macd{height:330px}
   .signal-row{grid-template-columns:minmax(0,1fr) auto}
   .signal-row>div:nth-child(2){grid-column:1/-1;grid-row:2}
   .foot{padding:0 14px 90px}

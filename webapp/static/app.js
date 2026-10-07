@@ -700,44 +700,129 @@ function stockStatusNotice(d) {
   const screen = stockScreenLine(d);
   return notice("info", "database", `行情来源 ${esc(source)}<br>正式身份：${d.formal_status === "formal_candidate" ? "当前有效正式候选" : "不是当前正式候选"} · 推荐记录：${d.recommendation_status === "recorded" ? "有" : "无"}<br>${research}${offline.length ? `<br>离线研究名单：${offline.join("；")}` : ""}${screen ? `<br>${screen}` : ""}`);
 }
+function limitText(d) {
+  const l = d.limits;
+  if (!l || !finite(l.up) || !finite(l.down)) return "未知";
+  const board = {growth:"创业板 / 科创板", beijing:"北交所", main:l.st ? "主板 ST" : "主板"}[l.board] || "板块未知";
+  return `<span class="num up">${fmt(l.up)}</span> / <span class="num down">${fmt(l.down)}</span><small>按 ${esc(d.bar_date || "最近")} 收盘和${board} ±${fmt(Number(l.rate) * 100, 0)}% 推算，未核验；新股上市初期、退市整理期等特殊情况不适用</small>`;
+}
+// The plugin's intraday quote file, beside (never instead of) the stored daily close.
+function liveQuoteHtml(live) {
+  if (!live || !["available", "partial"].includes(live.status)) return "";
+  const q = live.quote;
+  if (!q) return `<small class="muted">盘中：这只股票不在插件盯盘名单（自选股 / 候选 / 关注）</small>`;
+  return `<span class="live-quote">${kindBadge("info", "盘中", "插件盯盘报价，只读")}<b class="num">${fmt(q.price)}</b><span class="num ${tone(q.pct_change)}">${pct(q.pct_change)}</span><small>${esc(bj(q.provider_ts))} · ${esc(q.source || live.source || "来源未知")}</small></span>`;
+}
+async function refreshStockLive() {
+  const code = state.selectedCode, el = $("#live-quote");
+  if (!code || !el) return false;
+  try {
+    const d = (await api("intraday")).data || {};
+    el.innerHTML = liveQuoteHtml({status: d.status, source: d.source, quote: (d.quotes || []).find(q => q.code === code) || null});
+    return true;
+  } catch {
+    return false;
+  }
+}
 function renderStock(d) {
   const bars = (d.bars || []).slice(-LIMITS.bars);
   state.stock = {...d, bars}; state.selectedCode = d.code;
   const c = d.candidate || {}, last = bars[bars.length - 1], prev = bars[bars.length - 2];
   const chg = last && prev && finite(prev.close) && Number(prev.close) !== 0 ? (last.close - prev.close) / prev.close * 100 : null;
-  const head = `<div class="stock-head"><a class="icon-btn tip-left" href="#candidates" aria-label="返回候选池" data-tip="返回候选池">${ic("arrow-left")}</a><div><h1>${esc(d.name || d.code)}</h1><small class="muted">${esc(d.code)} · ${esc(c.industry || "行业未知")}</small></div><span class="px">${fmt(d.last_close)}</span><span class="num ${tone(chg)}">${pct(chg)}</span>${badge(c.risk_level)}${srcSpans(state.meta, [`收盘 ${d.bar_date || "未知"}`])}</div>`;
+  const head = `<div class="stock-head"><a class="icon-btn tip-left" href="#candidates" aria-label="返回候选池" data-tip="返回候选池">${ic("arrow-left")}</a><div><h1>${esc(d.name || d.code)}</h1><small class="muted">${esc(d.code)} · ${esc(c.industry || "行业未知")}</small></div><span class="px">${fmt(d.last_close)}</span><span class="num ${tone(chg)}">${pct(chg)}</span><span id="live-quote">${liveQuoteHtml(d.live)}</span>${badge(c.risk_level)}${srcSpans(state.meta, [`收盘 ${d.bar_date || "未知"}`])}</div>`;
   const ev = d.data_evidence || {};
   const coverage = `<div class="evidence-coverage"><span>技术历史 ${d.technical_history?.bars ?? 0} 根 · ${d.technical_history?.status === "available" ? "可用" : "不足 20 根"}</span><span>财务因子 ${ev.financial_known ?? 0}/${ev.financial_total ?? 5} 已证实</span><span>风险证据 ${ev.risk_known ?? 0}/${ev.risk_total ?? 4} 已证实</span></div>`;
-  const tools = `<div class="toolbar"><div class="seg" role="group" aria-label="周期">${[30, 60, 120].map(n => `<button type="button" data-period="${n}" class="${state.period === n ? "active" : ""}">${n} 日</button>`).join("")}</div><label class="checkbox"><input type="checkbox" id="ma-toggle" ${state.ma ? "checked" : ""}>MA5 / MA20</label><span class="count">最多 ${LIMITS.bars} 根 · 未复权</span></div>`;
-  const chart = bars.length ? `<div class="chart-wrap"><canvas class="price-chart" role="img" aria-label="已存未复权日K线与成交量"></canvas><div class="chart-tip"></div></div><div class="chart-caption"><span>日 K · 未复权 · 空心红涨 / 实心绿跌</span><span><span class="ma5">MA5</span> · <span class="ma20">MA20</span> · 成交量</span></div>` : empty("K 线不可用", "bars_unavailable");
+  const tools = chartTools();
+  const chart = bars.length ? `<div class="chart-wrap"><canvas class="price-chart" role="img" aria-label="已存日K线、均线、成交量与 MACD"></canvas><div class="chart-tip"></div></div><div class="chart-caption" id="chart-caption">${chartCaption(chartSeries(bars))}</div>` : empty("K 线不可用", "bars_unavailable");
   const q = d.data_quality || {};
   const quality = notice(kindOf(q.status) === "ok" ? "info" : "", "database", `行情数据 ${badge(q.status)} · 来源时间 ${esc(bj(q.source_timestamp))}${q.missing_reason ? ` · 原因代码 ${esc(q.missing_reason)}` : ""} · 未知不以旧数据代替`);
   const kv = (k, v) => `<div>${k}</div><div>${v}</div>`;
-  const keyData = panel("关键数据", `<div class="kv">${kv("综合评分", `${fmt(c.score, 0)} / ${fmt(c.score_max, 0)}`)}${kv("技术 / 行业 / 基本面", `${fmt(c.technical_score, 0)} / ${fmt(c.industry_score, 0)} / ${fmt(c.fundamental_score, 0)}`)}${kv("市场修正", fmt(c.market_adjustment, 0))}${kv("风险区间", `${fmt(c.attention_low)} – ${fmt(c.attention_high)}`)}${kv("建议买入价", fmt(c.confirmation))}${kv("失效", fmt(c.invalidation))}${kv("目标区", `${fmt(c.target_low)} – ${fmt(c.target_high)}`)}${kv("涨跌停价", "未知")}${kv("计划验证", badge(c.plan_validated ? "validated" : "unknown"))}${kv("覆盖率", finite(c.coverage) ? `${fmt(c.coverage * 100, 1)}%` : "—")}${Object.entries(d.indicators || {}).map(([k, v]) => kv(esc(k), fmt(v))).join("")}</div>`);
+  const keyData = panel("关键数据", `<div class="kv">${kv("综合评分", `${fmt(c.score, 0)} / ${fmt(c.score_max, 0)}`)}${kv("技术 / 行业 / 基本面", `${fmt(c.technical_score, 0)} / ${fmt(c.industry_score, 0)} / ${fmt(c.fundamental_score, 0)}`)}${kv("市场修正", fmt(c.market_adjustment, 0))}${kv("风险区间", `${fmt(c.attention_low)} – ${fmt(c.attention_high)}`)}${kv("建议买入价", fmt(c.confirmation))}${kv("失效", fmt(c.invalidation))}${kv("目标区", `${fmt(c.target_low)} – ${fmt(c.target_high)}`)}${kv("下一交易日涨跌停价", limitText(d))}${kv("计划验证", badge(c.plan_validated ? "validated" : "unknown"))}${kv("覆盖率", finite(c.coverage) ? `${fmt(c.coverage * 100, 1)}%` : "—")}${Object.entries(d.indicators || {}).map(([k, v]) => kv(esc(k), fmt(v))).join("")}</div>`);
   const evRows = Object.entries({...(ev.financial || {}), ...(ev.risk || {})}).map(([k, v]) => `<tr><td>${esc(EVIDENCE_FIELDS[k] || k)}</td><td class="num">${v?.value === null || v?.value === undefined ? "未知" : typeof v.value === "boolean" ? (v.value ? "是" : "否") : fmt(v.value)}</td><td>${badge(v?.quality)}</td><td class="wrap">${esc(v?.reason || "—")}</td></tr>`);
   const recs = (d.recommendations || []).slice(0, LIMITS.recommendations).map(r => `<tr><td>${esc(r.date)}</td><td>${badge(r.plan_status)}</td><td>${badge(r.comparability)}</td><td class="mono">${esc(r.plan_version || "—")}</td></tr>`);
   return panel("查找个股", stockSearchForm()) + `<section class="panel">${head}${coverage}${tools}${chart}</section>` + stockStatusNotice(d) + quality +
     `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${macdStockPanel(d)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
+}
+// Chart settings live in this browser only (localStorage); moving averages are computed from the bars shown.
+const MA_DEFAULT = [5, 13, 34, 55, 120], MA_LIMIT = 8;
+const MA_COLORS = ["#2f6bd8", "#c9861a", "#8e44ad", "#16a085", "#d35400", "#7f8c8d", "#c0392b", "#2c3e50"];
+const saved = (key, fallback) => {try {const value = JSON.parse(localStorage.getItem(key)); return value ?? fallback;} catch {return fallback;}};
+const save = (key, value) => {try {localStorage.setItem(key, JSON.stringify(value));} catch {/* private mode: settings last for this page only */}};
+function maSet(value = saved("stock-watch.ma", null)) {
+  if (!Array.isArray(value)) return MA_DEFAULT.map(n => ({n, on: true}));
+  return value.filter((m, i, all) => Number.isInteger(m?.n) && m.n >= 2 && m.n <= 250 && all.findIndex(x => x?.n === m.n) === i)
+    .slice(0, MA_LIMIT).map(m => ({n: m.n, on: m.on !== false}));
+}
+function chartPrefs() {
+  if (!state.maList) Object.assign(state, {maList: maSet(), macdOn: saved("stock-watch.macd", true) !== false, adjusted: saved("stock-watch.adjust", false) === true});
+}
+const maColor = n => MA_COLORS[Math.max(0, state.maList.findIndex(m => m.n === n)) % MA_COLORS.length];
+function maBar() {
+  chartPrefs();
+  const chips = state.maList.map(m => `<span class="ma-chip ${m.on ? "on" : ""}"><button type="button" data-ma="${m.n}" aria-pressed="${m.on}"><i data-bg="${maColor(m.n)}"></i>MA${m.n}</button><button type="button" class="ma-x" data-ma-remove="${m.n}" aria-label="删除 MA${m.n}">×</button></span>`).join("");
+  const add = state.maList.length < MA_LIMIT ? `<form id="ma-add-form" class="ma-add"><input id="ma-add" type="number" min="2" max="250" step="1" placeholder="周期" aria-label="添加均线周期"><button type="submit" class="btn">添加均线</button></form>` : `<span class="count">最多 ${MA_LIMIT} 条均线</span>`;
+  return chips + add + `<button type="button" class="btn" data-ma-reset>恢复默认</button>`;
+}
+function chartTools() {
+  chartPrefs();
+  const check = (id, on, text) => `<label class="checkbox"><input type="checkbox" id="${id}" ${on ? "checked" : ""}>${text}</label>`;
+  return `<div class="toolbar"><div class="seg" role="group" aria-label="周期">${[30, 60, 120].map(n => `<button type="button" data-period="${n}" class="${state.period === n ? "active" : ""}">${n} 日</button>`).join("")}</div>${check("ma-toggle", state.ma, "均线")}${check("macd-toggle", state.macdOn, "MACD")}${check("adjust-toggle", state.adjusted, "前复权")}<span class="count">最多 ${LIMITS.bars} 根</span></div><div class="toolbar ma-bar" id="ma-bar">${maBar()}</div>`;
+}
+function chartSeries(bars) {
+  chartPrefs();
+  const macd = state.stock?.macd, byDate = new Map((macd?.status === "available" ? macd.series || [] : []).map(x => [x.date, x]));
+  const factors = bars.map(b => Number(byDate.get(b.date)?.adj));
+  const adjusted = state.adjusted && bars.length > 0 && factors.every(f => Number.isFinite(f) && f > 0);
+  const rows = adjusted ? bars.map((b, i) => ({...b, open: b.open * factors[i], high: b.high * factors[i], low: b.low * factors[i], close: b.close * factors[i]})) : bars;
+  return {rows, adjusted, adjustMissing: state.adjusted && !adjusted, macd: state.macdOn && byDate.size ? bars.map(b => byDate.get(b.date) || null) : null};
+}
+function chartCaption(s) {
+  const count = s.rows.length, on = state.ma ? state.maList.filter(m => m.on) : [];
+  const mas = on.length ? on.map(m => `<span data-fg="${maColor(m.n)}">MA${m.n}</span>`).join(" · ") : "均线已隐藏";
+  const start = Math.max(0, count - state.period), shown = count - start;
+  const short = on.filter(m => m.n > count).map(m => `MA${m.n}`);
+  const partial = on.filter(m => m.n <= count && (Math.max(start, m.n - 1) - start) / shown > .25).map(m => `MA${m.n}`);
+  const notes = [s.adjustMissing ? "前复权需要 60 个交易日以上的连续价格，这只股票不够，先按未复权显示" : "",
+    short.length ? `${short.join("、")} 需要比现有 ${fmt(count, 0)} 根更长的历史，画不出来` : "",
+    partial.length ? `${partial.join("、")} 只画得出后半段（前面历史不够）` : ""].filter(Boolean);
+  return `<span>日 K · ${s.adjusted ? "前复权（按前收盘连乘）" : "未复权"} · 空心红涨 / 实心绿跌</span><span>${mas} · 成交量${s.macd ? " · MACD(12, 26, 9) 未验证" : ""}</span>${notes.length ? `<span>${notes.join("；")}</span>` : ""}`;
+}
+function redrawChart() {
+  if (!state.stock) return;
+  const s = chartSeries(state.stock.bars), cap = $("#chart-caption");
+  drawChart(s.rows, $(".price-chart"), {period: state.period, macd: s.macd,
+    mas: state.ma ? state.maList.filter(m => m.on).map(m => ({n: m.n, color: maColor(m.n)})) : []});
+  if (cap) cap.innerHTML = chartCaption(s);
+  // The page CSP blocks inline style attributes; colours go through the CSSOM instead.
+  document.querySelectorAll("[data-bg]").forEach(el => {el.style.background = el.dataset.bg;});
+  document.querySelectorAll("[data-fg]").forEach(el => {el.style.color = el.dataset.fg;});
+}
+function setMaList(list) {
+  state.maList = maSet(list); save("stock-watch.ma", state.maList);
+  const bar = $("#ma-bar"); if (bar) bar.innerHTML = maBar();
+  redrawChart();
 }
 function movingAverage(bars, n) {
   const out = []; let sum = 0;
   bars.forEach((b, i) => {sum += Number(b.close); if (i >= n) sum -= Number(bars[i - n].close); out.push(i >= n - 1 ? sum / n : NaN);});
   return out;
 }
-function drawChart(bars, canvas, ma = true, period = 60) {
+function drawChart(bars, canvas, opts = {}) {
   state.chartCleanup?.(); state.chartCleanup = null;
   if (!canvas || !bars.length) return;
-  const start = Math.max(0, bars.length - period), rows = bars.slice(start), tip = $(".chart-tip", canvas.parentElement);
-  const ma5 = movingAverage(bars, 5).slice(start), ma20 = movingAverage(bars, 20).slice(start);
-  const left = 8, right = 52, top = 12, volH = 46, gap = 18, axis = 18;
+  const period = opts.period || 60, start = Math.max(0, bars.length - period), rows = bars.slice(start), tip = $(".chart-tip", canvas.parentElement);
+  const lines = (opts.mas || []).map(m => ({...m, values: movingAverage(bars, m.n).slice(start)}));
+  const macd = opts.macd ? opts.macd.slice(start) : null;
+  canvas.classList.toggle("with-macd", Boolean(macd));
+  const left = 8, right = 52, top = 12, volH = 46, gap = 18, axis = 18, macdGap = macd ? 16 : 0, macdH = macd ? 80 : 0;
   let hover = -1;
   function draw() {
     const width = canvas.clientWidth, height = canvas.clientHeight, ratio = devicePixelRatio || 1;
     canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
     const ctx = canvas.getContext("2d"); ctx.setTransform(ratio, 0, 0, ratio, 0, 0); ctx.clearRect(0, 0, width, height);
-    const plotW = width - left - right, plotH = height - top - volH - gap - axis;
+    const plotW = width - left - right, plotH = height - top - volH - gap - macdGap - macdH - axis;
     if (plotW <= 0 || plotH <= 0) return;
-    const values = rows.flatMap(r => [r.low, r.high]).concat(ma ? [...ma5, ...ma20].filter(Number.isFinite) : []);
+    const values = rows.flatMap(r => [r.low, r.high]).concat(lines.flatMap(l => l.values.filter(Number.isFinite)));
     const low = Math.min(...values), high = Math.max(...values), pad = Math.max((high - low) * .08, .05), min = low - pad, max = high + pad;
     const y = v => top + (max - v) / (max - min) * plotH, step = plotW / rows.length, x = i => left + step * (i + .5);
     const volTop = top + plotH + gap, maxVol = Math.max(...rows.map(r => Number(r.volume) || 0), 1), bw = Math.max(1, Math.min(12, step * .6));
@@ -753,21 +838,34 @@ function drawChart(bars, canvas, ma = true, period = 60) {
       const vh = (Number(r.volume) || 0) / maxVol * volH;
       ctx.globalAlpha = .45; ctx.fillStyle = color; ctx.fillRect(cx - bw / 2, volTop + volH - vh, bw, vh); ctx.globalAlpha = 1;
     });
-    if (ma) [[ma5, "#2f6bd8"], [ma20, "#c9861a"]].forEach(([series, color]) => {
-      ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.beginPath(); let started = false;
-      series.forEach((v, i) => {if (!Number.isFinite(v)) {started = false; return;} if (!started) {ctx.moveTo(x(i), y(v)); started = true;} else ctx.lineTo(x(i), y(v));});
+    const path = (series, scaleY, color, width = 1.4) => {
+      ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); let started = false;
+      series.forEach((v, i) => {if (!Number.isFinite(v)) {started = false; return;} if (!started) {ctx.moveTo(x(i), scaleY(v)); started = true;} else ctx.lineTo(x(i), scaleY(v));});
       ctx.stroke(); ctx.lineWidth = 1;
-    });
+    };
+    lines.forEach(l => path(l.values, y, l.color));
+    const macdTop = volTop + volH + macdGap, bottom = macd ? macdTop + macdH : volTop + volH;
+    if (macd) {
+      const pick = key => macd.map(m => Number.isFinite(Number(m?.[key])) ? Number(m[key]) : NaN);
+      const dif = pick("dif"), dea = pick("dea"), hist = pick("hist");
+      const span = Math.max(...[...dif, ...dea, ...hist].filter(Number.isFinite).map(Math.abs), 1e-6);
+      const my = v => macdTop + macdH / 2 - v / span * (macdH / 2);
+      ctx.strokeStyle = "#e3e7ed"; ctx.beginPath(); ctx.moveTo(left, Math.round(my(0)) + .5); ctx.lineTo(width - right, Math.round(my(0)) + .5); ctx.stroke();
+      hist.forEach((v, i) => {if (!Number.isFinite(v)) return; ctx.fillStyle = v >= 0 ? "#d0393b" : "#17875a"; ctx.globalAlpha = .6; ctx.fillRect(Math.round(x(i)) - 1, Math.min(my(0), my(v)), 2, Math.abs(my(v) - my(0))); ctx.globalAlpha = 1;});
+      path(dif, my, "#1f2937", 1.2); path(dea, my, "#d4a017", 1.2);
+      ctx.fillStyle = "#6a7584"; ctx.textAlign = "left"; ctx.fillText("MACD", width - right + 6, macdTop + 10);
+    }
     ctx.fillStyle = "#6a7584";
     [0, Math.floor(rows.length / 2), rows.length - 1].forEach((i, j) => {ctx.textAlign = j === 0 ? "left" : j === 2 ? "right" : "center"; ctx.fillText(String(rows[i].date).slice(5), j === 0 ? left : j === 2 ? width - right : x(i), height - 4);});
-    if (hover >= 0) {ctx.strokeStyle = "#9aa3af"; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(x(hover), top); ctx.lineTo(x(hover), volTop + volH); ctx.stroke(); ctx.setLineDash([]);}
+    if (hover >= 0) {ctx.strokeStyle = "#9aa3af"; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(x(hover), top); ctx.lineTo(x(hover), bottom); ctx.stroke(); ctx.setLineDash([]);}
   }
   const move = event => {
     const rect = canvas.getBoundingClientRect(), step = (rect.width - left - right) / rows.length;
     hover = Math.max(0, Math.min(rows.length - 1, Math.floor((event.clientX - rect.left - left) / step)));
-    const r = rows[hover];
+    const r = rows[hover], m = macd?.[hover];
+    const maText = lines.map(l => `MA${l.n} ${fmt(l.values[hover])}`).join("　");
     tip.style.display = "block";
-    tip.innerHTML = `${esc(r.date)}<br>开 ${fmt(r.open)}　高 ${fmt(r.high)}<br>低 ${fmt(r.low)}　收 ${fmt(r.close)}${ma ? `<br>MA5 ${fmt(ma5[hover])}　MA20 ${fmt(ma20[hover])}` : ""}`;
+    tip.innerHTML = `${esc(r.date)}<br>开 ${fmt(r.open)}　高 ${fmt(r.high)}<br>低 ${fmt(r.low)}　收 ${fmt(r.close)}${maText ? `<br>${maText}` : ""}${m ? `<br>DIF ${fmt(m.dif, 3)}　DEA ${fmt(m.dea, 3)}　柱 ${fmt(m.hist, 3)}` : ""}`;
     draw();
   };
   const leave = () => {hover = -1; tip.style.display = "none"; draw();};
@@ -981,7 +1079,7 @@ async function load({silent=false} = {}) {
     const renderers={overview:renderOverview,candidates:renderCandidates,signals:renderSignals,intraday:renderIntraday,stock:renderStock,research:renderResearch,performance:renderPerformance,health:renderHealth,settings:renderSettings};
     state.chartCleanup?.();state.chartCleanup=null;
     $("#content").innerHTML=renderers[view](payload.data);finalize();
-    if(view==="stock")drawChart(state.stock.bars,$(".price-chart"),state.ma,state.period);
+    if(view==="stock")redrawChart();
     return true;
   } catch(error) {
     if(error.name==="AbortError" || request!==state.request)return false;
@@ -1004,17 +1102,26 @@ async function load({silent=false} = {}) {
   } finally {if(!silent && request===state.request)$("#refresh").disabled=false;}
 }
 document.addEventListener("input",event=>{if(event.target.id==="candidate-search")filterCandidates();});
-document.addEventListener("submit",event=>{if(event.target.id==="stock-search-form"){event.preventDefault();searchStocks();}});
+document.addEventListener("submit",event=>{
+  if(event.target.id==="stock-search-form"){event.preventDefault();searchStocks();}
+  if(event.target.id==="ma-add-form"){event.preventDefault();const n=Number($("#ma-add")?.value);if(Number.isInteger(n)&&n>=2&&n<=250&&!state.maList.some(m=>m.n===n))setMaList([...state.maList,{n,on:true}].sort((a,b)=>a.n-b.n));}
+});
 document.addEventListener("change",event=>{
   if(["candidate-risk","candidate-sort"].includes(event.target.id))filterCandidates();
   if(event.target.id==="signal-filter")$("#signal-rows").innerHTML=signalRows(state.signals.filter(r=>!event.target.value || r.state===event.target.value));
-  if(event.target.id==="ma-toggle" && state.stock){state.ma=event.target.checked;drawChart(state.stock.bars,$(".price-chart"),state.ma,state.period);}
+  if(event.target.id==="ma-toggle" && state.stock){state.ma=event.target.checked;redrawChart();}
+  if(event.target.id==="macd-toggle" && state.stock){state.macdOn=event.target.checked;save("stock-watch.macd",state.macdOn);redrawChart();}
+  if(event.target.id==="adjust-toggle" && state.stock){state.adjusted=event.target.checked;save("stock-watch.adjust",state.adjusted);redrawChart();}
 });
 document.addEventListener("click",event=>{
   const t=event.target;
   const horizon=t.closest("[data-horizon]"), period=t.closest("[data-period]"), sort=t.closest("[data-sort]"), board=t.closest("[data-board]"), chip=t.closest("[data-chip]"), row=t.closest("tr.click");
   if(horizon){state.horizon=Number(horizon.dataset.horizon);load();return;}
-  if(period && state.stock){state.period=Number(period.dataset.period);document.querySelectorAll("[data-period]").forEach(b=>b.classList.toggle("active",Number(b.dataset.period)===state.period));drawChart(state.stock.bars,$(".price-chart"),state.ma,state.period);return;}
+  if(period && state.stock){state.period=Number(period.dataset.period);document.querySelectorAll("[data-period]").forEach(b=>b.classList.toggle("active",Number(b.dataset.period)===state.period));redrawChart();return;}
+  const maChip=t.closest("[data-ma]"), maRemove=t.closest("[data-ma-remove]");
+  if(maChip && state.stock){const n=Number(maChip.dataset.ma);setMaList(state.maList.map(m=>m.n===n?{...m,on:!m.on}:m));return;}
+  if(maRemove && state.stock){const n=Number(maRemove.dataset.maRemove);setMaList(state.maList.filter(m=>m.n!==n));return;}
+  if(t.closest("[data-ma-reset]") && state.stock){setMaList(MA_DEFAULT.map(n=>({n,on:true})));return;}
   if(sort){const s=$("#candidate-sort");s.value=s.value==="asc"?"desc":"asc";filterCandidates();return;}
   if(board){state.filter.board=board.dataset.board;document.querySelectorAll("[data-board]").forEach(b=>{b.classList.toggle("active",b===board);b.setAttribute("aria-pressed",String(b===board));});filterCandidates();return;}
   if(chip){const key=chip.dataset.chip==="cheap"?"cheap":"noSt";state.filter[key]=!state.filter[key];chip.classList.toggle("on",state.filter[key]);chip.setAttribute("aria-pressed",String(state.filter[key]));filterCandidates();return;}
@@ -1049,6 +1156,8 @@ setInterval(async()=>{
         state.snapshotRevision = snapshotRevision;
         state.artifactRevision = artifactRevision;
       }
+    } else if (artifactChanged && state.view === "stock") {
+      if(await refreshStockLive()) state.artifactRevision = artifactRevision;
     } else if ((artifactChanged || dataChanged) && state.view === "overview") {
       if(await refreshOverviewLiveMarket()) {
         state.dataRevision = dataRevision || state.dataRevision;

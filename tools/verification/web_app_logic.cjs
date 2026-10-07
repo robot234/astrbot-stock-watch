@@ -24,7 +24,8 @@ vm.createContext(context);
 vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
   dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice,
-  hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel, funnelPanel, auditPanel, funnelVerdict, stockScreenLine};`, context, {filename: "app.js"});
+  hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel, funnelPanel, auditPanel, funnelVerdict, stockScreenLine,
+  maSet, movingAverage, chartTools, chartSeries, chartCaption, liveQuoteHtml, limitText};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -226,6 +227,39 @@ check("stock_screen_listed", app.stockScreenLine({screen_audit: {status: "listed
   .includes("深筛第 1 / 300 名 · 没查 ST / 审计 · 技术分 30（只用于排序）"));
 check("stock_screen_not_listed", app.stockScreenLine({screen_audit: {status: "not_listed", date: "2026-10-08", audit_total: 300, audit_shown: 60}}).includes("不在深筛明细前 60 名里"));
 check("stock_screen_none", app.stockScreenLine({screen_audit: {status: "not_recorded"}}) === "" && app.stockScreenLine({}) === "");
+
+// Chart: default and custom moving averages, the MACD sub-chart series and the forward-adjusted view.
+check("ma_default", JSON.stringify(app.maSet(null).map(m => m.n)) === "[5,13,34,55,120]");
+check("ma_custom_clean", JSON.stringify(app.maSet([{n: 20}, {n: 20}, {n: 1}, {n: 300}, {n: 60, on: false}, "x"])) === JSON.stringify([{n: 20, on: true}, {n: 60, on: false}]));
+check("ma_empty_allowed", app.maSet([]).length === 0);
+check("ma_average", JSON.stringify(app.movingAverage([{close: 1}, {close: 2}, {close: 3}], 2).slice(1)) === "[1.5,2.5]");
+const chartBars = Array.from({length: 120}, (_, i) => ({date: `d${String(i).padStart(3, "0")}`, open: 10, high: 11, low: 9, close: i < 100 ? 20 : 10, volume: 1}));
+Object.assign(app.state, {maList: null, period: 60, ma: true, stock: {bars: chartBars, macd: {status: "available",
+  series: chartBars.map((b, i) => ({date: b.date, dif: 0.1, dea: 0.05, hist: 0.1, adj: i < 100 ? 0.5 : 1}))}}});
+const chartToolbar = app.chartTools();
+check("chart_tools", ["MA5", "MA13", "MA34", "MA55", "MA120"].every(t => chartToolbar.includes(`>MA${t.slice(2)}<`)) && chartToolbar.includes('id="ma-toggle"')
+  && chartToolbar.includes('id="macd-toggle"') && chartToolbar.includes('id="adjust-toggle"') && chartToolbar.includes("添加均线") && !chartToolbar.includes("style="));
+const unadjusted = app.chartSeries(chartBars);
+check("chart_unadjusted_default", unadjusted.adjusted === false && unadjusted.rows[0].close === 20 && unadjusted.macd.length === 120 && unadjusted.macd[0].dif === 0.1);
+app.state.adjusted = true;
+const forward = app.chartSeries(chartBars);
+check("chart_forward_adjusted", forward.adjusted && forward.rows[0].close === 10 && forward.rows[0].high === 5.5 && forward.rows[119].close === 10);
+const chartNote = app.chartCaption(forward);
+check("chart_caption", chartNote.includes("前复权") && chartNote.includes("MA120 只画得出后半段") && !chartNote.includes("MA55 只") && !chartNote.includes("style="));
+app.state.stock.macd = {status: "insufficient_history"};
+const noFactors = app.chartSeries(chartBars);
+check("chart_adjust_unavailable", !noFactors.adjusted && noFactors.macd === null && app.chartCaption(noFactors).includes("先按未复权显示"));
+app.state.macdOn = false; app.state.stock.macd = {status: "available", series: []};
+check("chart_macd_off", app.chartSeries(chartBars).macd === null);
+
+// Live intraday quote on the stock page: only while the artifact is current, and only for watched codes.
+const liveHtml = app.liveQuoteHtml({status: "available", source: "sina", quote: {code: "600857", price: 17.5, pct_change: 1.2, provider_ts: "2026-10-08T02:31:05+00:00", source: "sina"}});
+check("live_quote", liveHtml.includes("盘中") && liveHtml.includes("17.50") && liveHtml.includes("+1.20%") && liveHtml.includes("sina"));
+check("live_not_watched", app.liveQuoteHtml({status: "partial", quote: null}).includes("不在插件盯盘名单"));
+check("live_outside_session", app.liveQuoteHtml({status: "unknown", reason: "outside_session", quote: null}) === "" && app.liveQuoteHtml(undefined) === "");
+const limits = app.limitText({bar_date: "2026-09-30", limits: {up: 11.06, down: 9.05, rate: 0.1, board: "main", st: false}});
+check("limit_text", limits.includes("11.06") && limits.includes("9.05") && limits.includes("2026-09-30 收盘和主板 ±10%") && limits.includes("未核验"));
+check("limit_unknown", app.limitText({limits: null}) === "未知");
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

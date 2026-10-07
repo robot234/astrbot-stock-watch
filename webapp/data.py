@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 import hashlib
 import json
 import math
@@ -49,6 +50,7 @@ SIGNAL_EXCLUSIONS = frozenset({"not_main_or_chinext", "st_name", "no_bar_today",
                                "corporate_action_60d", "price_above_50", "amount_below_20m", "indicator_missing"})
 # Stock-page MACD uses the research schemes H / I definition and stays unverified until scheme I's endpoint.
 MACD_SPANS, MACD_CROSS_LOOKBACK, MACD_MIN_SESSIONS = (12, 26, 9), 3, 60
+MACD_SERIES_TAIL = 120  # the chart's bar limit
 # Written by the plugin's screen_audit.py into screen_runs.diagnostics (S03 / S04).
 SCREEN_STAGES = ("input", "price", "risk_state", "deep_screen", "indicators", "risk_review", "min_score", "candidates")
 SCREEN_STATUSES = frozenset({"candidate", "fallback_candidate", "beyond_candidate_limit", "risk_blocked",
@@ -325,12 +327,31 @@ def ohlc(row, basis_key="price_basis"):
     return values
 
 
-def macd_state(days, rows):
+def limit_prices(code, name, close):
+    """Next-session price limits derived from the latest close and board rules; not an exchange-published value."""
+    close = number(close)
+    if close is None or close <= 0 or not re.fullmatch(r"\d{6}", str(code or "")):
+        return None
+    st = bool(re.match(r"^\*?S?\*?ST", str(name or "").strip().upper()))
+    if code.startswith(("300", "301", "688", "689")):
+        board, rate = "growth", Decimal("0.20")
+    elif code.startswith(("4", "8", "92")):
+        board, rate = "beijing", Decimal("0.30")
+    else:
+        board, rate = "main", Decimal("0.05") if st else Decimal("0.10")
+    base, cent = Decimal(str(close)), Decimal("0.01")
+    return {"up": float((base * (1 + rate)).quantize(cent, rounding=ROUND_HALF_UP)),
+            "down": float((base * (1 - rate)).quantize(cent, rounding=ROUND_HALF_UP)),
+            "rate": float(rate), "board": board, "st": st, "basis": "rule_derived_from_close"}
+
+
+def macd_state(days, rows, tail=0):
     """MACD(12, 26, 9) side on the last session, from a price chained by close / pre_close.
 
     Chaining keeps ex-rights gaps from looking like crosses; sessions after the first usable bar that have
     no usable bar keep the price unchanged. DIF and DEA are rescaled to the latest close, so they read like
-    a forward-adjusted chart.
+    a forward-adjusted chart. With `tail`, the last `tail` sessions also carry the daily lines and each bar's
+    forward-adjustment factor (adjusted price = unadjusted price × adj).
     """
     by_date = {row.get("trade_date"): row for row in rows}
     series, level, last_bar = [], 1.0, None
@@ -343,29 +364,37 @@ def macd_state(days, rows):
         if values:
             last_bar = (day, values[3])
         if values or series:
-            series.append((day, level))
+            series.append((day, level, values[3] if values else None))
     if len(series) < MACD_MIN_SESSIONS:
         return {"status": "insufficient_history", "sessions": len(series), "min_sessions": MACD_MIN_SESSIONS}
     alphas = [2 / (span + 1) for span in MACD_SPANS]
     fast = slow = series[0][1]
-    dea, above = None, []
-    for _, price in series:
+    dea, above, lines = None, [], []
+    for _, price, _close in series:
         fast += alphas[0] * (price - fast)
         slow += alphas[1] * (price - slow)
         dif = fast - slow
         dea = dif if dea is None else dea + alphas[2] * (dif - dea)
         above.append(dif > dea)
+        lines.append((dif, dea))
     t = k = len(series) - 1
     while k > 0 and above[k - 1] == above[t]:
         k -= 1
     recent = above[t] and any(above[j] and not above[j - 1]
                               for j in range(max(1, t - MACD_CROSS_LOOKBACK + 1), t + 1))
     scale = last_bar[1] / series[t][1]
-    return {"status": "available", "rule": "MACD_12_26_9_CHAINED", "state": "golden" if above[t] else "dead",
-            "trade_date": series[t][0], "last_bar_date": last_bar[0], "sessions": len(series),
-            "first_session": series[0][0], "cross_date": series[k][0] if k else None,
-            "sessions_since_cross": t - k if k else None, "recent_golden_cross": bool(recent),
-            "dif": round(dif * scale, 4), "dea": round(dea * scale, 4), "histogram": round(2 * (dif - dea) * scale, 4)}
+    result = {"status": "available", "rule": "MACD_12_26_9_CHAINED", "state": "golden" if above[t] else "dead",
+              "trade_date": series[t][0], "last_bar_date": last_bar[0], "sessions": len(series),
+              "first_session": series[0][0], "cross_date": series[k][0] if k else None,
+              "sessions_since_cross": t - k if k else None, "recent_golden_cross": bool(recent),
+              "dif": round(dif * scale, 4), "dea": round(dea * scale, 4), "histogram": round(2 * (dif - dea) * scale, 4)}
+    if tail:
+        result["series"] = [
+            {"date": day, "dif": round(line[0] * scale, 4), "dea": round(line[1] * scale, 4),
+             "hist": round(2 * (line[0] - line[1]) * scale, 4),
+             "adj": round(price * scale / close, 6) if close else None}
+            for (day, price, close), line in list(zip(series, lines))[-tail:]]
+    return result
 
 
 class Unavailable(RuntimeError):
@@ -498,7 +527,8 @@ class Snapshot:
         days = [row[0] for row in self.db.execute(
             "SELECT DISTINCT trade_date FROM batch_days WHERE batch_id=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 500",
             (active["batch_id"], today))][::-1]
-        return {**macd_state(days, self.active_raw_rows(code, limit=500)), "verified": False, "display_only": True}
+        return {**macd_state(days, self.active_raw_rows(code, limit=500), tail=MACD_SERIES_TAIL),
+                "verified": False, "display_only": True}
 
     def screen_audit(self):
         """Funnel and audit rows of the newest recent screen run that recorded them (S03 / S04); display only."""
@@ -1115,6 +1145,7 @@ class Snapshot:
             "macd": (self.stock_macd(code) if bar_source["kind"] == "active_raw"
                      else {"status": "unavailable", "reason": "no_active_raw", "verified": False, "display_only": True}),
             "screen_audit": self.stock_screen(code),
+            "limits": limit_prices(code, name, closes[-1]) if closes else None,
             "data_quality": {"status": data_status, "missing_reason": missing_reason,
                              "source_timestamp": source_timestamp.isoformat() if source_timestamp else None},
         }
@@ -1743,6 +1774,14 @@ class Dashboard:
                 "age_seconds": max(0, int(age)) if age is not None and age >= 0 else None, "valid_for_seconds": valid_for_seconds,
                 "market": market, "effective_revision": effective_revision, "quotes": clean}
 
+    def stock_live(self, code):
+        """The intraday artifact's quote for this code; shown beside, never instead of, the stored daily bars."""
+        artifact = self.intraday()
+        quote = next((row for row in artifact["quotes"] if str(row.get("code")) == code), None)
+        return {"status": artifact["status"], "reason": artifact["reason"], "source": artifact["source"],
+                "age_seconds": artifact["age_seconds"], "published_at": artifact["published_at"],
+                "watched": quote is not None, "quote": quote}
+
     @staticmethod
     def _unknown_live_market(reason, *, pending=False):
         return {"status": "pending" if pending else "unknown", "regime": "unknown", "quality": "unknown",
@@ -1844,7 +1883,8 @@ class Dashboard:
                     data = {"items": snapshot.attach_latest_closes(snapshot.candidates()), "research": snapshot.research_pools(),
                             "screen": snapshot.screen_audit()}
                 elif route.startswith("stocks/"):
-                    data = snapshot.stock(route.split("/", 1)[1])
+                    code = route.split("/", 1)[1]
+                    data = {**snapshot.stock(code), "live": self.stock_live(code)}
                 elif route == "search":
                     data = snapshot.search(params.get("q", ""))
                 elif route == "performance":
