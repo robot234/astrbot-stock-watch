@@ -25,7 +25,8 @@ vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
   dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice,
   hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel, funnelPanel, auditPanel, funnelVerdict, stockScreenLine,
-  maSet, movingAverage, chartTools, chartSeries, chartCaption, liveQuoteHtml, limitText, riskReminderPanel};`, context, {filename: "app.js"});
+  maSet, movingAverage, chartTools, chartSeries, chartCaption, liveQuoteHtml, limitText, riskReminderPanel,
+  watchButton, watchNote, watchReady};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -281,6 +282,18 @@ const quietPanel = app.riskReminderPanel(riskSignals({unlock: {status: "none", e
 check("risk_panel_quiet", quietPanel.includes("30 天内没有解禁") && quietPanel.includes("不在两融标的里"));
 check("risk_panel_failed", app.riskReminderPanel(riskSignals(null, {margin: {status: "unavailable", reason: "margin_unpublished"}})).includes("margin_unpublished"));
 check("risk_panel_missing", app.riskReminderPanel({meta: {status: "partial"}, data: {status: "missing"}}).includes("研究信号还没有生成"));
+
+const watch = extra => ({configured: true, inbox: "ready", codes: ["600000"],
+  plugin: {fresh: true, enabled: true, age_seconds: 5}, scope: {status: "only_whitelisted", label: "aiocqhttp · 私聊 · 尾号 6789", count: 1, limit: 100}, ...extra});
+check("watch_hidden_when_not_configured", app.watchButton("600857", {configured: false}) === "" && app.watchNote({configured: false}) === "");
+check("watch_button_ready", app.watchReady(watch()) && app.watchButton("600857", watch()).includes('data-watch-add="600857"') && !app.watchButton("600857", watch()).includes(" disabled"));
+check("watch_already_listed", app.watchButton("600000", watch()).includes("已在自选") && !app.watchButton("600000", watch()).includes("data-watch-add"));
+check("watch_scope_note", app.watchNote(watch()).includes("尾号 6789") && app.watchNote(watch()).includes("1 / 100"));
+check("watch_disabled_when_plugin_stale", app.watchButton("600857", watch({plugin: {fresh: false, enabled: true, age_seconds: 900}})).includes(" disabled") && app.watchNote(watch({plugin: {fresh: false, enabled: true, age_seconds: 900}})).includes("900"));
+check("watch_ambiguous_scope", app.watchNote(watch({scope: {status: "ambiguous", label: null}})).includes("web_watch_scope") && !app.watchReady(watch({scope: {status: "ambiguous", label: null}})));
+check("watch_inbox_missing", app.watchNote(watch({inbox: "missing"})).includes("收件箱") && app.watchButton("600857", watch({inbox: "missing"})).includes(" disabled"));
+check("watch_plugin_not_reloaded", app.watchNote(watch({plugin: null})).includes("重载"));
+check("watch_rejects_non_codes", app.watchButton("DEMO01", watch()) === "");
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

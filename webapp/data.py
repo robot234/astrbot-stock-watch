@@ -1718,6 +1718,22 @@ class Dashboard:
             db.rollback()
             db.close()
 
+    def known_code(self, code):
+        """The code is in the name index or the latest active daily batch; checked before a watch request is queued."""
+        if not re.fullmatch(r"\d{6}", str(code or "")):
+            return False
+        try:
+            with self.snapshot() as snapshot:
+                if snapshot.symbol(code):
+                    return True
+                active = snapshot.active_raw()
+                return bool(active and snapshot.db.execute(
+                    "SELECT 1 FROM batch_days bd JOIN partition_bars pb ON pb.partition_id=bd.partition_id"
+                    " WHERE bd.batch_id=? AND bd.trade_date=? AND pb.code=? LIMIT 1",
+                    (active["batch_id"], active["trade_date"], code)).fetchone())
+        except (Unavailable, sqlite3.Error, OSError, ValueError):
+            return False
+
     def settings_snapshot(self):
         """The plugin's load-time settings file (``--settings``, else next to the intraday artifact)."""
         path = (Path(self.settings) if self.settings is not None

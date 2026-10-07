@@ -34,6 +34,7 @@ from .research_risk import evidence_label, load_evidence
 from . import formal_source_policy
 from . import config_checks
 from . import screen_audit
+from . import web_watch
 
 PLUGIN_NAME = "astrbot_stock_watch"
 
@@ -1789,6 +1790,7 @@ class Main(Star):
             asyncio.create_task(self._intraday_loop(), name=f"{PLUGIN_NAME}:quotes"),
             asyncio.create_task(self._intraday_market_loop(), name=f"{PLUGIN_NAME}:market"),
             asyncio.create_task(self._news_loop(), name=f"{PLUGIN_NAME}:news"),
+            asyncio.create_task(self._web_watch_loop(), name=f"{PLUGIN_NAME}:web_watch"),
         ]
         logger.info("[%s] 已加载，研究/模拟盘模式=%s", PLUGIN_NAME, self._bool("paper_trading_only", True))
 
@@ -1975,6 +1977,82 @@ class Main(Star):
         except Exception:
             logger.exception("[%s] 推送失败：%s", PLUGIN_NAME, origin or "<empty>")
             return False
+
+    def _web_watch_paths(self) -> tuple[Path, Path]:
+        return (self.intraday_artifact_path.with_name(web_watch.INBOX_DIRNAME),
+                self.intraday_artifact_path.with_name(web_watch.RESULTS_NAME))
+
+    async def _web_watch_loop(self):
+        """Apply watchlist additions queued by the dashboard; one bad request never stops the loop."""
+        published_at = None
+        while True:
+            try:
+                published_at = await self._web_watch_pass(published_at)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[%s] 网页自选请求处理失败", PLUGIN_NAME)
+            await asyncio.sleep(3)
+
+    async def _web_watch_pass(self, published_at: float | None) -> float | None:
+        inbox, results_path = self._web_watch_paths()
+        enabled = self._bool("web_watch_enabled", True)
+        scope, how = web_watch.resolve_scope(self.config.get("web_watch_scope", ""), self._configured_whitelist(),
+                                             self.store.all_watch().keys())
+        limit = self._int("watchlist_limit", 100, 1, 1000)
+        added: list[tuple[str, str | None]] = []
+
+        def apply(code: str) -> dict:
+            if not enabled:
+                return {"status": "disabled"}
+            if scope is None:
+                return {"status": "scope_unresolved", "reason": how}
+            name = self._clean_external_text((self.store.stock_symbol(code) or {}).get("name"), 40) or None
+            if code in self.store.list_watch(scope):
+                return {"status": "exists", "name": name}
+            if not self.store.add_watch(scope, code, limit, None, name):
+                return {"status": "limit_reached", "name": name}
+            added.append((code, name))
+            return {"status": "added", "name": name}
+
+        handled = web_watch.process_inbox(inbox, apply) if inbox.is_dir() else []
+        now = datetime.now(timezone.utc)
+        stamp = now.isoformat(timespec="seconds")
+        for item in handled:
+            item["processed_at"] = stamp
+            logger.info("[%s] 网页自选请求 %s %s：%s", PLUGIN_NAME, item.get("request_id"), item.get("code"), item.get("status"))
+        if handled or published_at is None or now.timestamp() - published_at >= 60:
+            self._write_web_watch_results(results_path, enabled=enabled, scope=scope, how=how, limit=limit,
+                                          handled=handled, stamp=stamp, inbox_ready=inbox.is_dir())
+            published_at = now.timestamp()
+        if added and self._bool("web_watch_notify", True):
+            total = len(self.store.list_watch(scope))
+            for code, name in added:
+                await self._push(scope, f"网页已把 {name or code}（{code}）加入自选（共 {total} / {limit} 只）。"
+                                        f"如非本人操作，可用 /自选 删除 {code} 移除。")
+        return published_at
+
+    def _write_web_watch_results(self, path: Path, *, enabled: bool, scope: str | None, how: str, limit: int,
+                                 handled: list[dict], stamp: str, inbox_ready: bool) -> None:
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8")).get("results", [])
+        except (OSError, ValueError, AttributeError):
+            previous = []
+        version = getattr(self, "_metadata_version", None)
+        if version is None:
+            try:
+                match = re.search(r"^version:\s*(\S+)", Path(__file__).with_name("metadata.yaml").read_text(encoding="utf-8"), re.M)
+                version = match.group(1) if match else ""
+            except OSError:
+                version = ""
+            self._metadata_version = version
+        body = web_watch.payload(enabled=enabled, scope_status=how, label=web_watch.scope_label(scope) if scope else None,
+                                 codes=self.store.list_watch(scope) if scope else [], limit=limit,
+                                 results=web_watch.merge_results(previous, handled), written_at=stamp,
+                                 version=version or None, inbox_ready=inbox_ready)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(body, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
 
     def _universe(self) -> list[str]:
         configured = parse_codes(str(self.config.get("universe_codes", "")))

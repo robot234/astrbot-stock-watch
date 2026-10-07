@@ -29,6 +29,7 @@ const ICONS = {
   "database": '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
   "triangle-alert": '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
   "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+  "circle-plus": '<circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/>',
   "circle-help": '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
   "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
   "lock": '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
@@ -709,10 +710,10 @@ async function searchStocks() {
   if (!out) return;
   if (/^(?:\d{6}|DEMO\d{2})$/i.test(q)) {location.hash = `#stock/${encodeURIComponent(q.toUpperCase())}`; return;}
   try {
-    const payload = await api(`search?q=${encodeURIComponent(q)}`);
+    const [payload, w] = await Promise.all([api(`search?q=${encodeURIComponent(q)}`), watchStatus()]);
     const items = payload.data?.items || [];
     const SOURCE = {stock_symbols:"名称索引", formal_candidate:"正式候选", research_pool:"研究池", active_raw:"active raw 日线"};
-    out.innerHTML = items.length ? `<div class="search-results">${items.map(r => `<a href="${stockHref(r.code)}"><span>${esc(r.name || "名称未知")} <small class="mono">${esc(r.code)}</small></span><small>${esc(SOURCE[r.source] || "来源未知")}</small></a>`).join("")}</div>` : empty("没有匹配的股票", "no_records");
+    out.innerHTML = items.length ? `<div class="search-results">${items.map(r => `<div class="search-row"><a href="${stockHref(r.code)}"><span>${esc(r.name || "名称未知")} <small class="mono">${esc(r.code)}</small></span><small>${esc(SOURCE[r.source] || "来源未知")}</small></a>${watchButton(r.code, w, true)}</div>`).join("")}</div>${w.configured ? `<p class="watch-scope">${esc(watchNote(w))}</p>` : ""}` : empty("没有匹配的股票", "no_records");
   } catch (error) {
     out.innerHTML = empty("查找失败", error.message);
   }
@@ -752,12 +753,81 @@ async function refreshStockLive() {
     return false;
   }
 }
+// Add to watchlist: the page only queues a request; the plugin applies it to one chat session and reports back.
+const WATCH_RESULT = {added:"已加入自选", exists:"已在自选中", limit_reached:"自选已满：请先在聊天里 /自选 删除 几只", scope_unresolved:"插件不确定加到哪个会话：请在插件设置 web_watch_scope 指定", disabled:"插件已关闭网页加自选（web_watch_enabled）", invalid_request:"请求无效，插件没有处理", error:"插件处理出错，请看插件日志"};
+const WATCH_REJECT = {invalid_code:"代码无效", unknown_code:"快照里没有这只股票", invalid_body:"请求无效", inbox_missing:"插件收件箱目录不存在（部署时创建）", inbox_full:"待处理的请求太多，请稍后再试", rate_limited:"操作太频繁，请稍后再试", inbox_unwritable:"写不进插件收件箱", inbox_unreadable:"读不了插件收件箱"};
+async function watchStatus(id = null) {
+  if (!id && state.watch && Date.now() - state.watch.at < 15000) return state.watch.data;
+  try {
+    const response = await fetch(`/api/watch${id ? `?id=${encodeURIComponent(id)}` : ""}`, {cache:"no-store"});
+    const data = response.ok ? (await response.json()).data || {configured:false} : {configured:false};
+    state.watch = {at:Date.now(), data};
+    return data;
+  } catch {
+    return {configured:false};
+  }
+}
+function watchNote(w) {
+  if (!w?.configured) return "";
+  if (w.inbox !== "ready") return WATCH_REJECT.inbox_missing;
+  if (!w.plugin) return "插件还没有写出网页自选状态：需要在 AstrBot 重载新版插件";
+  if (!w.plugin.fresh) return `插件已 ${w.plugin.age_seconds ?? "?"} 秒没有更新网页自选状态，可能没在运行新版本`;
+  if (!w.plugin.enabled) return WATCH_RESULT.disabled;
+  const s = w.scope || {};
+  if (!s.label) return s.status === "ambiguous" ? "有多个会话可选，插件不猜：请在插件设置 web_watch_scope 指定" : "还没有可写入的会话：先在聊天里用一次 /自选 添加，或在插件设置 web_watch_scope 指定";
+  return `加到 ${s.label}（已有 ${s.count ?? "?"} / ${s.limit ?? "?"} 只；成本价不在网页显示）`;
+}
+const watchReady = w => !!(w?.configured && w.inbox === "ready" && w.plugin?.fresh && w.plugin.enabled && w.scope?.label);
+function watchButton(code, w, compact = false) {
+  if (!w?.configured || !/^\d{6}$/.test(code || "")) return "";
+  if ((w.codes || []).includes(code)) return `<span class="watch-state">${ic("circle-check")}已在自选</span>`;
+  return `<button type="button" class="btn${compact ? " sm" : ""} watch-add" data-watch-add="${esc(code)}" title="${esc(watchNote(w))}"${watchReady(w) ? "" : " disabled"}>${ic("circle-plus")}加入自选</button>`;
+}
+async function refreshWatchSlot(code) {
+  const slot = $("#watch-slot");
+  if (!slot) return;
+  const w = await watchStatus();
+  if (state.selectedCode !== code || !$("#watch-slot")) return;
+  slot.innerHTML = w.configured ? `${watchButton(code, w)}<small class="watch-note">${esc(watchNote(w))}</small>` : "";
+}
+async function addToWatch(button) {
+  const code = button.dataset.watchAdd, holder = button.parentElement;
+  const say = text => { let el = holder.querySelector(".watch-note"); if (!el) { el = document.createElement("small"); el.className = "watch-note"; holder.appendChild(el); } el.textContent = text; };
+  const reset = () => { button.disabled = false; button.textContent = "加入自选"; };
+  button.disabled = true; button.textContent = "提交中…";
+  try {
+    const response = await fetch("/api/watch/add", {method:"POST", cache:"no-store", headers:{"Content-Type":"application/json", "X-Stock-Watch":"add"}, body:JSON.stringify({code})});
+    const payload = await response.json().catch(() => ({}));
+    if (response.status !== 202) { reset(); say(WATCH_REJECT[payload.reason] || `提交失败（HTTP ${response.status}）`); return; }
+    button.textContent = "等待插件确认…";
+    let last = "pending";
+    for (let i = 0; i < 20; i++) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const r = (await watchStatus(payload.request_id)).request || {};
+      last = r.state || "unknown";
+      if (r.state === "done") {
+        say(WATCH_RESULT[r.status] || "插件已处理");
+        state.watch = null;
+        if (["added", "exists"].includes(r.status)) button.outerHTML = `<span class="watch-state">${ic("circle-check")}已在自选</span>`;
+        else reset();
+        return;
+      }
+      // The plugin removes the request file a moment before it writes the result.
+      if (last === "unknown" && i >= 2) break;
+    }
+    reset();
+    say(last === "pending" ? "插件还没有处理这条请求：插件可能没在运行新版本，请求会留在收件箱里等插件处理" : "收件箱和结果里都找不到这条请求，请刷新页面查看");
+  } catch {
+    reset();
+    say("连接不可用，请求可能没有提交");
+  }
+}
 function renderStock(d) {
   const bars = (d.bars || []).slice(-LIMITS.bars);
   state.stock = {...d, bars}; state.selectedCode = d.code;
   const c = d.candidate || {}, last = bars[bars.length - 1], prev = bars[bars.length - 2];
   const chg = last && prev && finite(prev.close) && Number(prev.close) !== 0 ? (last.close - prev.close) / prev.close * 100 : null;
-  const head = `<div class="stock-head"><a class="icon-btn tip-left" href="#candidates" aria-label="返回候选池" data-tip="返回候选池">${ic("arrow-left")}</a><div><h1>${esc(d.name || d.code)}</h1><small class="muted">${esc(d.code)} · ${esc(c.industry || "行业未知")}</small></div><span class="px">${fmt(d.last_close)}</span><span class="num ${tone(chg)}">${pct(chg)}</span><span id="live-quote">${liveQuoteHtml(d.live)}</span>${badge(c.risk_level)}${srcSpans(state.meta, [`收盘 ${d.bar_date || "未知"}`])}</div>`;
+  const head = `<div class="stock-head"><a class="icon-btn tip-left" href="#candidates" aria-label="返回候选池" data-tip="返回候选池">${ic("arrow-left")}</a><div><h1>${esc(d.name || d.code)}</h1><small class="muted">${esc(d.code)} · ${esc(c.industry || "行业未知")}</small></div><span class="px">${fmt(d.last_close)}</span><span class="num ${tone(chg)}">${pct(chg)}</span><span id="live-quote">${liveQuoteHtml(d.live)}</span><span id="watch-slot" class="watch-slot"></span>${badge(c.risk_level)}${srcSpans(state.meta, [`收盘 ${d.bar_date || "未知"}`])}</div>`;
   const ev = d.data_evidence || {};
   const coverage = `<div class="evidence-coverage"><span>技术历史 ${d.technical_history?.bars ?? 0} 根 · ${d.technical_history?.status === "available" ? "可用" : "不足 20 根"}</span><span>财务因子 ${ev.financial_known ?? 0}/${ev.financial_total ?? 5} 已证实</span><span>风险证据 ${ev.risk_known ?? 0}/${ev.risk_total ?? 4} 已证实</span></div>`;
   const tools = chartTools();
@@ -1124,7 +1194,7 @@ async function load({silent=false} = {}) {
     const renderers={overview:renderOverview,candidates:renderCandidates,signals:renderSignals,intraday:renderIntraday,stock:renderStock,research:renderResearch,performance:renderPerformance,health:renderHealth,settings:renderSettings};
     state.chartCleanup?.();state.chartCleanup=null;
     $("#content").innerHTML=renderers[view](payload.data);finalize();
-    if(view==="stock")redrawChart();
+    if(view==="stock"){redrawChart();refreshWatchSlot(payload.data?.code);}
     return true;
   } catch(error) {
     if(error.name==="AbortError" || request!==state.request)return false;
@@ -1160,6 +1230,8 @@ document.addEventListener("change",event=>{
 });
 document.addEventListener("click",event=>{
   const t=event.target;
+  const watchAdd=t.closest("[data-watch-add]");
+  if(watchAdd){if(!watchAdd.disabled)addToWatch(watchAdd);return;}
   const horizon=t.closest("[data-horizon]"), period=t.closest("[data-period]"), sort=t.closest("[data-sort]"), board=t.closest("[data-board]"), chip=t.closest("[data-chip]"), row=t.closest("tr.click");
   if(horizon){state.horizon=Number(horizon.dataset.horizon);load();return;}
   if(period && state.stock){state.period=Number(period.dataset.period);document.querySelectorAll("[data-period]").forEach(b=>b.classList.toggle("active",Number(b.dataset.period)===state.period));redrawChart();return;}

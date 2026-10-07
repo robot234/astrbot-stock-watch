@@ -297,6 +297,14 @@ details.history{border-top:1px solid var(--line-2)}
 details.history summary{cursor:pointer;padding:8px 16px;font-size:12px;color:var(--muted)}
 .search-results{display:grid;gap:2px;padding:0 16px 12px}
 .search-results a{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line-2)}
+.search-row{display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line-2)}
+.search-row a{flex:1;min-width:0;border-bottom:0}
+.btn.sm{height:26px;padding:0 8px;font-size:12px}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.watch-slot{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+.watch-note,.watch-scope{color:var(--muted);font-size:12px}
+.watch-scope{margin:0;padding:0 16px 12px}
+.watch-state{display:inline-flex;align-items:center;gap:4px;color:var(--ok);font-size:12px;white-space:nowrap}
 
 .foot{padding:0 24px 24px;color:var(--muted);font-size:11px}
 

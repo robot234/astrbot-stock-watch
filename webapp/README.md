@@ -177,6 +177,24 @@ scp webapp/deploy/stock-watch-research-signals.* pi@192.168.124.6:/home/pi/.conf
 ssh pi@192.168.124.6 "systemctl --user daemon-reload && systemctl --user enable --now stock-watch-research-signals.timer"
 ```
 
+## Add To Watchlist (Optional Write)
+
+The database snapshot is never written. With `--watch-inbox <plugin_data>/web_watch_inbox`
+the server also accepts `POST /api/watch/add` (`{"code": "600857"}`) and writes one small
+request file into that directory; the plugin applies it to one chat-session scope it resolves
+itself and publishes `web_watch_results.json` beside the inbox. `GET /api/watch` (optionally
+`?id=<request_id>`) returns whether the plugin is applying requests, a masked scope label, the
+codes already in that scope and the outcome of one request; session ids and cost prices are
+never exposed.
+
+- Add only: no delete, no cost price. Without `--watch-inbox` every write method stays `405 read_only`.
+- The POST must carry a same-origin `Origin`, `X-Stock-Watch: add` and a JSON body of at most
+  1 KB; codes must exist in the snapshot. 10 requests per minute, 200 per day, at most 30 pending files.
+- The directory is created at deployment (`install -d -o pi -g pi -m 0750 .../web_watch_inbox`);
+  the plugin never creates it, because a root-created directory would not be writable by the Web user.
+- There is still no authentication (see audit item O10): anyone who can open the page on the LAN
+  can add stocks; the plugin announces every web addition in the target chat with the delete command.
+
 ## Explicit Existing Database
 
 Pass an already authorized, consistent **local** SQLite snapshot explicitly:
