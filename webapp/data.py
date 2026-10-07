@@ -22,8 +22,8 @@ CHINA = timezone(timedelta(hours=8))
 TABLES = {
     "web_demo_metadata", "screen_runs", "screen_candidates", "active_candidate_runs",
     "daily_quotes", "daily_bars", "market_contexts", "daily_snapshot_meta", "batches", "datasets", "active_generations",
-    "provider_health", "provider_api_state", "job_runs", "intraday_event_outbox",
-    "intraday_signal_states", "automatic_close_deliveries", "recommendation_records",
+    "provider_health", "provider_api_state", "job_runs", "screen_gate_diagnostics", "intraday_event_outbox",
+    "intraday_signal_states", "automatic_close_deliveries", "automatic_close_publications", "recommendation_records",
     "recommendation_outcomes", "recommendation_ai_review_batches", "recommendation_ai_reviews",
     "daily_acceptance_runs", "daily_acceptance_events", "daily_acceptance_alerts",
     "trading_calendar", "corporate_action_factors",
@@ -51,13 +51,20 @@ RESEARCH_CATALOG = (
 RESEARCH_STAGES = ("not_passed", "exploration", "forward_pending", "passed")
 TRADING_PHASES = ((9 * 60 + 15, "pre_open"), (9 * 60 + 30, "call_auction"), (11 * 60 + 30, "trading"),
                   (13 * 60, "lunch_break"), (15 * 60, "trading"))
-PUBLIC_SETTINGS = {
+COMMON_SETTINGS = {
     "min_score", "price_min", "price_max", "deep_screen_limit", "factor_screen_limit",
     "screen_min_indicator_coverage", "intraday_confirmation_periods",
     "intraday_cooldown_seconds", "intraday_min_amount", "market_comparison_enabled",
     "market_comparison_benchmark", "paper_trading_only", "price_plan_close_tolerance_pct",
     "official_evidence_enabled", "official_evidence_candidate_limit", "official_evidence_cache_seconds",
 }
+# Kept equal to the plugin's PUBLIC_STRING_SETTINGS; any other string is shown only as a configured state.
+PUBLIC_STRING_SETTINGS = frozenset({
+    "factor_mode", "factor_source", "tushare_bj_calendar_policy", "tushare_raw_dataset_key", "tushare_universe_statuses",
+    "realtime_backup_mode", "daily_scan_time", "daily_acceptance_time", "llm_model", "llm_shadow_prompt_version",
+    "market_comparison_benchmark", "tushare_raw_universe_version",
+})
+CONFIGURED_STATES = {"empty", "default", "custom", "invalid_type"}
 
 
 def obj(value):
@@ -140,8 +147,37 @@ def error_category(value):
     return "error_recorded" if text else None
 
 
+GATE_FAILURES = ("risk_evidence_missing", "indicator_coverage", "snapshot_incomplete", "market_stats_unconfirmed")
+JOB_ERROR_PHRASES = (("当日完整收盘数据尚未就绪", "waiting_snapshot"), ("报告版本门控未通过", "report_gate"),
+                     ("扫描异常", "exception"))
+GATE_COUNTS = ("input", "risk_tuple_complete", "tradable", "indicator_targets", "enriched", "candidate_count",
+               "observation_universe_targets", "observation_universe_enriched")
+
+
+def job_failure_codes(value):
+    """Only the plugin's own failure codes; free error text can carry paths or provider messages."""
+    text = str(value or "")
+    return [code for code in GATE_FAILURES if code in text] + [code for phrase, code in JOB_ERROR_PHRASES if phrase in text]
+
+
+def job_stop(row):
+    """Why a terminal automatic job stopped retrying."""
+    if str(row.get("status") or "") != "missed":
+        return None
+    reason = str(row.get("automatic_terminal_reason") or row.get("error") or "")
+    for marker, code in (("formal_gate_unpassable", "gate_unpassable"), ("retry bounds exhausted", "retry_exhausted"),
+                         ("trading-date boundary", "crossed_trading_date")):
+        if marker in reason:
+            return code
+    return "terminal_unrecorded"
+
+
 def safe_text(value, limit=120):
     return re.sub(r"[\x00-\x1f\x7f]", "", str(value or ""))[:limit]
+
+
+def sha256_text(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
 
 
 def catalog_entry(directory, spec):
@@ -1105,6 +1141,79 @@ class Snapshot:
                            "state_updated_at": updated.isoformat() if updated else None})
         return result
 
+    def job_records(self, jobs):
+        """Each job with its attempt count, next retry, stop reason and the latest recorded gate attempt."""
+        gates = {}
+        keys = [str(r["job_key"]) for r in jobs if r.get("job_key")]
+        required = ("job_key", "attempt", "phase", "diagnostics_json", "recorded_at")
+        if keys and "screen_gate_diagnostics" in self.tables:
+            for row in self.rows("screen_gate_diagnostics", required=required, where=f"job_key IN ({','.join('?' * len(keys))})",
+                                 params=keys, order="job_key,attempt DESC", limit=500):
+                gates.setdefault(row["job_key"], row)
+        result = []
+        for row in jobs:
+            state, attempts = row.get("status", "unknown"), number(row.get("automatic_attempts"))
+            retry_at = epoch_instant(row.get("automatic_next_retry_at"))
+            record = {"key": row.get("job_key"), "name": row.get("job_name"), "date": row.get("trade_date"), "state": state,
+                      "error": error_category(row.get("error")), "failure_codes": job_failure_codes(row.get("error")),
+                      "started_at": row.get("started_at"), "finished_at": row.get("finished_at"),
+                      "attempts": int(attempts) if attempts else None,
+                      "next_retry_at": retry_at.isoformat() if retry_at and state == "failed" else None,
+                      "stop": job_stop(row), "terminal_reason": safe_text(row.get("automatic_terminal_reason"), 120) or None,
+                      "gate": None}
+            gate = gates.get(row.get("job_key"))
+            if gate:
+                values = obj(gate.get("diagnostics_json"))
+                codes = lambda key: [safe_text(item, 40) for item in arr(values.get(key)) if isinstance(item, str)][:8]
+                record["gate"] = {"attempt": number(gate.get("attempt")), "phase": safe_text(gate.get("phase"), 120),
+                                  "recorded_at": gate.get("recorded_at"), "generation": number(values.get("raw_generation")),
+                                  "batch_id": safe_text(values.get("raw_batch_id"), 80) or None,
+                                  "counts": {key: int(number(values[key])) for key in GATE_COUNTS if number(values.get(key)) is not None},
+                                  "retryable": codes("gate_retryable"), "unpassable": codes("gate_unpassable"),
+                                  "dependency": safe_text(values.get("gate_dependency"), 60) or None,
+                                  "unlicensed_risk_fields": codes("gate_unlicensed_risk_fields")}
+            result.append(record)
+        return result
+
+    def acceptance_records(self, rows):
+        """Acceptance rows stay as recorded; later runs and publications for the date sit beside them, never merged in."""
+        dates = sorted({str(r["trade_date"]) for r in rows if r.get("trade_date")})
+        runs, publications = {}, {}
+        if dates:
+            marks = ",".join("?" * len(dates))
+            for run in self.rows("screen_runs", required=("run_id", "job_name", "actual_trade_date", "status", "finished_at"),
+                                 where=f"actual_trade_date IN ({marks})", params=dates, order="finished_at", limit=200):
+                runs.setdefault(run["actual_trade_date"], []).append(run)
+            if "automatic_close_publications" in self.tables:
+                for item in self.rows("automatic_close_publications", required=("actual_trade_date", "run_id", "created_at"),
+                                      where=f"actual_trade_date IN ({marks})", params=dates, limit=50):
+                    publications[item["actual_trade_date"]] = item
+        result = []
+        for row in rows:
+            day, checked = row.get("trade_date"), instant(row.get("checked_at"))
+            linked = []
+            for run in runs.get(day, [])[-5:]:
+                finished = instant(run.get("finished_at"))
+                linked.append({"run_id": safe_text(run.get("run_id"), 40), "job": safe_text(run.get("job_name"), 40),
+                               "status": safe_text(run.get("status"), 20), "quality": safe_text(run.get("quality"), 20),
+                               "candidates": number(run.get("candidate_count")), "report_version": number(run.get("report_version")),
+                               "finished_at": finished.isoformat() if finished else None,
+                               "after_check": bool(finished and checked and finished > checked)})
+            publication = publications.get(day)
+            published = instant(publication.get("created_at")) if publication else None
+            late = [run for run in linked if run["after_check"] and run["status"] == "completed"]
+            review = ("late_publication" if published and checked and published > checked
+                      else "late_screen_not_formal" if late and not publication
+                      else "late_screen" if late else "no_later_evidence")
+            result.append({"date": day, "checked_at": row.get("checked_at"), "status": row.get("status", "unknown"),
+                           "summary": row.get("summary") or "",
+                           "findings": [safe_text(item.get("code"), 60) for item in arr(row.get("findings_json"))
+                                        if isinstance(item, dict) and item.get("code")][:12],
+                           "runs": linked, "review": review,
+                           "publication": {"run_id": safe_text(publication.get("run_id"), 40),
+                                           "created_at": published.isoformat() if published else None} if publication else None})
+        return result
+
     def health(self):
         providers = self.providers()
         batches = self.rows("batches", required=("actual_trade_date",), order="actual_trade_date DESC,created_at DESC", limit=10)
@@ -1121,13 +1230,11 @@ class Snapshot:
             "batches": [{"id": r.get("batch_id"), "date": r.get("actual_trade_date"), "generation": r.get("generation"),
                          "state": r.get("status", "unknown"), "rows": r.get("row_count"), "basis": r.get("basis", "unknown"),
                          "published_at": r.get("published_at")} for r in batches],
-            "jobs": [{"key": r.get("job_key"), "name": r.get("job_name"), "date": r.get("trade_date"),
-                      "state": r.get("status", "unknown"), "error": error_category(r.get("error"))} for r in jobs],
+            "jobs": self.job_records(jobs),
             "failures": [{"code": r.get("code"), "state": r.get("state"), "risk": r.get("risk_level"), "at": r.get("event_at")} for r in failures],
             "outbox": dict(Counter(r["state"] for r in outbox)),
             "automatic_outbox": dict(Counter(r.get("state", "unknown_delivery") for r in deliveries)),
-            "daily_acceptance": [{"date": r.get("trade_date"), "checked_at": r.get("checked_at"),
-                                  "status": r.get("status", "unknown"), "summary": r.get("summary") or ""} for r in acceptance],
+            "daily_acceptance": self.acceptance_records(acceptance),
             "daily_acceptance_outbox": dict(Counter(r.get("state", "unknown_delivery") for r in acceptance_alerts)),
             "evidence": self.source_summary(),
         }
@@ -1239,14 +1346,19 @@ class Dashboard:
                 "last_published_at": published.isoformat() if published else None,
                 "failure_category": safe_text(values.get("category"), 60) or None}
 
-    def version(self):
-        """Which features this deployed backend actually contains, independent of plugin version numbers."""
+    def build_info(self):
         try:
             recorded = obj(self.build_info_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError):
             recorded = {}
         build = {key: safe_text(recorded.get(key), 80) or None for key in ("release", "revision", "built_at")}
+        build["plugin_main_sha256"] = sha256_text(recorded.get("plugin_main_sha256"))
         build["status"] = "recorded" if build["release"] or build["revision"] else "unknown"
+        return build
+
+    def version(self):
+        """Which features this deployed backend actually contains, independent of plugin version numbers."""
+        build = self.build_info()
         schema_version = None
         try:
             with self.snapshot() as snapshot:
@@ -1274,24 +1386,64 @@ class Dashboard:
             db.rollback()
             db.close()
 
+    def settings_snapshot(self):
+        """The plugin's load-time settings file (``--settings``, else next to the intraday artifact)."""
+        path = (Path(self.settings) if self.settings is not None
+                else self.artifact_path.with_name("public_settings.json") if self.artifact_configured else None)
+        unknown = {"status": "not_configured", "values": {}, "configured": {}, "written_at": None, "plugin_version": None,
+                   "code_sha256": None, "schema_sha256": None, "deprecated_settings": []}
+        if path is None:
+            return unknown
+        try:
+            if path.stat().st_size > 262144:
+                return {**unknown, "status": "invalid"}
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {**unknown, "status": "missing"}
+        except (OSError, UnicodeError, ValueError):
+            return {**unknown, "status": "unreadable"}
+        if not isinstance(data, dict) or not isinstance(data.get("values"), dict):
+            return {**unknown, "status": "invalid"}
+        written = instant(data.get("written_at"))
+        return {"status": "plugin_snapshot" if data.get("schema_version") == 1 else "explicit_values",
+                "values": data["values"], "configured": obj(data.get("configured")),
+                "written_at": written.isoformat() if written else None,
+                "plugin_version": safe_text(data.get("plugin_version"), 40) or None,
+                "code_sha256": sha256_text(data.get("code_sha256")), "schema_sha256": sha256_text(data.get("schema_sha256")),
+                "deprecated_settings": [safe_text(key, 60) for key in arr(data.get("deprecated_settings")) if isinstance(key, str)][:20]}
+
     def public_settings(self):
+        """Schema default next to the plugin's load-time value; strings outside the allowlist show only a state."""
         schema = obj((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-        supplied = {}
-        if self.settings is not None:
-            supplied = obj(Path(self.settings).read_text(encoding="utf-8")).get("values", {})
-            if not isinstance(supplied, dict):
-                supplied = {}
+        snapshot = self.settings_snapshot()
+        values, configured = snapshot["values"], snapshot["configured"]
+        source = "explicit_public_snapshot" if snapshot["status"] == "explicit_values" else "plugin_snapshot"
         result = []
-        for key in sorted(PUBLIC_SETTINGS):
-            spec = schema.get(key, {})
-            value = supplied.get(key)
-            kind = spec.get("type")
-            valid = ((kind == "bool" and isinstance(value, bool))
+        for key, spec in schema.items():
+            if not isinstance(spec, dict):
+                continue
+            kind, default, value = spec.get("type"), spec.get("default"), values.get(key)
+            shown = ((kind == "bool" and isinstance(value, bool))
                      or (kind in ("int", "float") and not isinstance(value, bool) and number(value) is not None)
-                     or (key == "market_comparison_benchmark" and isinstance(value, str) and re.fullmatch(r"\d{6}\.(SH|SZ|CSI)", value)))
-            result.append({"key": key, "label": spec.get("description", key), "default": spec.get("default"),
-                           "effective": value if valid else None, "source": "explicit_public_snapshot" if valid else "effective_unknown"})
-        return {"items": result, "read_only": True, "sensitive_fields": "not_exposed"}
+                     or (kind == "string" and key in PUBLIC_STRING_SETTINGS and isinstance(value, str)
+                         and re.fullmatch(r"[A-Za-z0-9_.:,\-]{0,40}", value) is not None))
+            if shown:
+                state, differs = "shown", value != default
+            else:
+                state = configured.get(key) if configured.get(key) in CONFIGURED_STATES else "unknown"
+                differs = {"custom": True, "invalid_type": True, "default": False,
+                           "empty": str(default or "").strip() not in ("", "[]", "{}")}.get(state)
+            result.append({"key": key, "label": spec.get("description", key), "type": kind,
+                           "group": "common" if key in COMMON_SETTINGS else "advanced",
+                           "default": default, "effective": value if shown else None, "state": state, "differs": differs,
+                           "source": "effective_unknown" if state == "unknown" else source})
+        result.sort(key=lambda item: (item["group"] != "common", item["key"]))
+        plugin_sha = snapshot["code_sha256"]
+        build_sha = self.build_info()["plugin_main_sha256"] if plugin_sha else None
+        meta = {key: snapshot[key] for key in ("status", "written_at", "plugin_version", "code_sha256", "schema_sha256",
+                                               "deprecated_settings")}
+        meta["matches_web_build"] = (plugin_sha == build_sha) if plugin_sha and build_sha else None
+        return {"items": result, "snapshot": meta, "read_only": True, "sensitive_fields": "not_exposed"}
 
     def intraday(self):
         try:
@@ -1435,6 +1587,12 @@ class Dashboard:
                     data = snapshot.performance(int(params.get("horizon", "5")))
                 elif route == "health":
                     data = snapshot.health()
+                    values = self.settings_snapshot()["values"]
+                    data["automatic_close_limits"] = {
+                        key: values[name] if isinstance(values.get(name), int) and not isinstance(values.get(name), bool) else None
+                        for key, name in (("max_attempts", "automatic_close_max_attempts"),
+                                          ("retry_seconds", "automatic_close_retry_seconds"),
+                                          ("retry_window_seconds", "automatic_close_retry_window_seconds"))}
                 elif route == "settings":
                     data = self.public_settings()
                 elif route == "intraday":

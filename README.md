@@ -106,8 +106,9 @@
 - `factor_data_url`：可选自定义因子接口。留空时使用 `factor_source` 指定的内置来源。接口返回 `data` 数组，每项至少包含 `code`，可选 `industry`、`industry_score`、`fundamental_score`；也可直接给原始 `roe`、`profit_growth`、`cash_quality`、`pe`、`pb`、`st_flag`、`audit_flag`，插件会计算基本面分。
 - `market_min_snapshot_size`：只有本地快照达到该数量才按“完整市场”计算大盘环境，默认 4000；不足时报告会标为 `partial`。
 - `confirmation_enabled` / `confirmation_periods` / `confirmation_max_gap_seconds`：**已废弃且不生效**，只为旧配置保留。盘中连续确认的次数和间隔由 `intraday_confirmation_periods`（默认 2，弱市额外加 1）和 `intraday_confirmation_max_gap_seconds`（默认 90 秒）控制，确认进度保存到 SQLite。旧键不是旧默认值时，插件加载会写一条 warning。
-- 【高级】`automatic_close_max_attempts` / `automatic_close_retry_window_seconds` / `automatic_close_retry_seconds`：自动收盘筛选的最多尝试次数、恢复窗口和重试间隔，默认 6 次 / 14400 秒 / 300 秒；`automatic_delivery_lease_seconds`、`automatic_delivery_max_attempts`、`automatic_delivery_retry_window_seconds`、`automatic_delivery_retry_seconds` 控制自动报告投递的租约与重试（默认 120 秒 / 5 次 / 3600 秒 / 60 秒）；`intraday_risk_delivery_max_age_seconds` 是盘中风险失效提醒的最大补发年龄（默认 900 秒）。这些默认值与此前代码内置值相同。
+- 【高级】`automatic_close_max_attempts` / `automatic_close_retry_window_seconds` / `automatic_close_retry_seconds`：自动收盘筛选的最多尝试次数、恢复窗口和重试间隔，默认 6 次 / 14400 秒 / 300 秒。只有可能被新数据改变的失败（快照不完整、市场统计未确认、指标覆盖不足）才重试；如果唯一的失败是四项风险证据不足，而 `formal_source_policy` 里还有字段没有任何获验收的来源，重试不可能通过，任务在当次就以 `missed` 结束（终止原因 `formal_gate_unpassable:risk_evidence_missing`），降级观察名单随即推送，分类写入 `screen_gate_diagnostics`；`automatic_delivery_lease_seconds`、`automatic_delivery_max_attempts`、`automatic_delivery_retry_window_seconds`、`automatic_delivery_retry_seconds` 控制自动报告投递的租约与重试（默认 120 秒 / 5 次 / 3600 秒 / 60 秒）；`intraday_risk_delivery_max_age_seconds` 是盘中风险失效提醒的最大补发年龄（默认 900 秒）。这些默认值与此前代码内置值相同。
 - 配置缺键时，代码统一回退到 `_conf_schema.json` 的默认值（例如 `quote_interval_seconds` 5 秒、`max_concurrency` 5）。
+- 插件每次加载时在盘中报价文件同目录写 `public_settings.json`，供只读 Web 设置页显示“当前值”：数值和开关写原值，12 个白名单字符串（如 `llm_model`、`daily_scan_time`）写原值，其余字符串（令牌、密钥、地址、推送白名单、路径等）只写 `empty` / `default` / `custom`；同时记录加载时间、插件版本、`main.py` 与 Schema 的 SHA-256 和已废弃项。面板改配置后要等插件重新加载才会更新。
 
 自定义快照接口的返回格式示例：
 

@@ -22,6 +22,12 @@ def accepted_negative(source: object, scenario_version: object, field: object) -
                 (source_id, version, field_name) in ACCEPTED_NEGATIVE_SCENARIOS)
 
 
+def unlicensed_fields() -> tuple[str, ...]:
+    """Fields no accepted scenario covers; while any remains, no retry can make a risk tuple eligible."""
+    licensed = {field for _source, _version, field in ACCEPTED_NEGATIVE_SCENARIOS}
+    return tuple(field for field in RISK_FIELDS if field not in licensed)
+
+
 def formal_value(value: object, *, source: object, scenario_version: object, field: object) -> bool | None:
     if value is True:
         return True

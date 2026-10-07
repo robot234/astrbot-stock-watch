@@ -36,7 +36,15 @@ Mobile acceptance here means a responsive browser viewport, not LAN access.
   MFE, close-series drawdown and distinct price/path denominators.
 - Health: provider success telemetry and API rate-limit deadlines kept apart,
   batches, jobs and outboxes; records older than the current data date are folded.
-- Settings: allowlisted public effective values and separate schema defaults.
+  Each automatic job shows its attempt count, next retry, why it stopped
+  (`retry_exhausted`, `gate_unpassable`, `crossed_trading_date`) and the latest
+  `screen_gate_diagnostics` attempt (phase, input generation, funnel counts).
+  Each daily acceptance keeps its recorded verdict and lists the same-date
+  screen runs and automatic-close publication beside it, with a latest-status
+  review (`late_publication`, `late_screen_not_formal`, `late_screen`,
+  `no_later_evidence`); a later screen never rewrites the original result.
+- Settings: every schema key with its default, the plugin's load-time value,
+  whether it differs and where the value came from.
 - `/api/version`: API version, capability list, build release/revision (written
   into `webapp/build_info.json` by `deploy/package.py`) and database schema.
 - `/api/research_catalog`: the allowlisted offline research freezes in
@@ -53,9 +61,16 @@ copy during a holiday is distinguishable from a timer that stopped checking.
 Only public recommendations and the server's fixed `--origin` are visible.
 The API ignores client attempts to change origin. Without `--origin`, private
 events are not exposed. This is a local trust boundary, not user authentication.
-Optional `--settings` must be an explicitly sanitized JSON file of the form
-`{"values":{"min_score":20,"paper_trading_only":true}}`; never pass credentials.
-Absent settings mean effective values are unknown, not equal to defaults.
+Settings come from `--settings` or, when it is omitted and `--artifact` is set,
+from `public_settings.json` next to the artifact, which the plugin writes on
+every load. Only numbers, booleans and allowlisted strings are shown; other
+strings appear as `empty` / `default` / `custom`, and the Web re-applies the
+same string allowlist. An explicit `--settings` file of the form
+`{"values":{"min_score":20,"paper_trading_only":true}}` still works; never pass
+credentials. A missing or unreadable file means effective values are unknown,
+not equal to defaults. `deploy/package.py` records the committed `main.py`
+SHA-256 in `build_info.json`, so the page can tell whether the plugin and the
+Web come from the same commit.
 
 Each API request opens SQLite with `mode=ro`, enables `query_only`, and reads
 one transaction with a 3-second query budget. Missing files are never created.

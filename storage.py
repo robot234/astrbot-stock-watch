@@ -5674,7 +5674,9 @@ class StockStore:
                 "candidate_count", "valid_empty", "raw_batch_id", "risk_confirmed", "history_missing",
                 "observation_universe_targets", "observation_universe_enriched", "observation_universe_coverage",
                 "indicator_targets_risk_unknown", "indicator_source_counts", "indicator_price_basis_counts",
-                "observation_count", "market_stats_confirmed", "degraded_reason", "degraded_missing")
+                "observation_count", "market_stats_confirmed", "degraded_reason", "degraded_missing",
+                "raw_generation", "gate_retryable", "gate_unpassable", "gate_dependency",
+                "gate_unlicensed_risk_fields", "gate_risk_policy_version")
         summary = {key: diagnostics.get(key) for key in keys if key in diagnostics}
         with self._connect() as db:
             row = db.execute("SELECT automatic_attempts FROM job_runs WHERE job_key=?", (job_key,)).fetchone()
@@ -8754,6 +8756,7 @@ class StockStore:
         retry_after_seconds: int = 300,
         max_attempts: int = 6,
         retry_window_seconds: int = 14400,
+        terminal_reason: str | None = None,
         now=None,
     ) -> dict:
         current = self._automatic_delivery_clock(now)
@@ -8765,19 +8768,21 @@ class StockStore:
                 raise KeyError(f"unknown automatic close job {job_key}")
             value = dict(row)
             final_status = str(status or "failed")
-            terminal_reason = ""
+            recorded_reason = ""
             next_retry = 0.0
             if final_status == "failed":
                 attempts = max(0, int(value.get("automatic_attempts") or 0))
                 first_started = self._automatic_job_time(value.get("automatic_first_started_at") or value.get("started_at"), current)
-                if attempts >= max(1, int(max_attempts)) or current - first_started >= max(300, int(retry_window_seconds)):
+                if terminal_reason:
+                    final_status, recorded_reason = "missed", str(terminal_reason)[:500]
+                elif attempts >= max(1, int(max_attempts)) or current - first_started >= max(300, int(retry_window_seconds)):
                     final_status = "missed"
-                    terminal_reason = "automatic close retry bounds exhausted"
+                    recorded_reason = "automatic close retry bounds exhausted"
                 else:
                     next_retry = current + max(30, min(int(retry_after_seconds), 3600))
             db.execute(
                 "UPDATE job_runs SET finished_at=?,status=?,error=?,automatic_next_retry_at=?,automatic_terminal_reason=? WHERE job_key=?",
-                (now_text, final_status, error, next_retry, terminal_reason, str(job_key)),
+                (now_text, final_status, error, next_retry, recorded_reason, str(job_key)),
             )
             finished = db.execute("SELECT * FROM job_runs WHERE job_key=?", (str(job_key),)).fetchone()
             return dict(finished)

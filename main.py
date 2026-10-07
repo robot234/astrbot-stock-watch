@@ -52,6 +52,16 @@ def _schema_default(key: str, fallback):
     return _SCHEMA_DEFAULTS.get(key, fallback)
 
 
+# String settings whose values the Web may show; any other string can carry credentials, endpoints,
+# session ids or local paths and is reported only as empty / default / custom.
+PUBLIC_STRING_SETTINGS = frozenset({
+    "factor_mode", "factor_source", "tushare_bj_calendar_policy", "tushare_raw_dataset_key", "tushare_universe_statuses",
+    "realtime_backup_mode", "daily_scan_time", "daily_acceptance_time", "llm_model", "llm_shadow_prompt_version",
+    "market_comparison_benchmark", "tushare_raw_universe_version",
+})
+_PUBLIC_STRING_RE = re.compile(r"[A-Za-z0-9_.:,\-]{0,40}")
+
+
 # Old keys kept in stored configs; none of them is read by the current intraday path.
 _DEPRECATED_SETTINGS = MappingProxyType({
     "confirmation_enabled": ("intraday_confirmation_periods", False),
@@ -140,6 +150,7 @@ class Main(Star):
         configured_artifact = str(self.config.get("intraday_artifact_path", "") or "").strip()
         self.intraday_artifact_path = Path(configured_artifact) if configured_artifact else data_dir / "intraday_quotes.json"
         self.deprecated_settings = self._warn_deprecated_settings()
+        self._write_public_settings(self.intraday_artifact_path.with_name("public_settings.json"))
         timeout = self._float("request_timeout", 10, 3, 60)
         self.http = HttpRuntime(timeout, self._max_concurrency())
         self.raw_dataset_key = str(self.config.get("tushare_raw_dataset_key", "tushare_daily")).strip() or "tushare_daily"
@@ -1812,6 +1823,51 @@ class Main(Star):
 
     def _max_concurrency(self, maximum: int = 64) -> int:
         return self._int("max_concurrency", _schema_default("max_concurrency", 5), 1, maximum)
+
+    def public_settings_snapshot(self) -> dict:
+        """Load-time settings for the read-only Web; secrets and free-form strings are never copied."""
+        values, configured = {}, {}
+        for key, default in _SCHEMA_DEFAULTS.items():
+            value = self.config.get(key, default)
+            if isinstance(default, bool):
+                shown = isinstance(value, bool)
+            elif isinstance(default, (int, float)):
+                shown = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            else:
+                shown = key in PUBLIC_STRING_SETTINGS and isinstance(value, str) and bool(_PUBLIC_STRING_RE.fullmatch(value))
+            if shown:
+                values[key] = value
+            elif isinstance(default, (bool, int, float)):
+                configured[key] = "invalid_type"
+            else:
+                text = str(value if value is not None else "").strip()
+                configured[key] = "empty" if text in ("", "[]", "{}") else "default" if value == default else "custom"
+        here = Path(__file__)
+        try:
+            version = re.search(r"^version:\s*(\S+)", here.with_name("metadata.yaml").read_text(encoding="utf-8"), re.M)
+            code_sha = hashlib.sha256(here.read_bytes()).hexdigest()
+            schema_sha = hashlib.sha256(here.with_name("_conf_schema.json").read_bytes()).hexdigest()
+        except OSError:
+            version, code_sha, schema_sha = None, None, None
+        return {"schema_version": 1, "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "plugin_version": version.group(1) if version else None, "code_sha256": code_sha,
+                "schema_sha256": schema_sha, "values": values, "configured": configured,
+                "deprecated_settings": list(self.deprecated_settings)}
+
+    def _write_public_settings(self, path: Path) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(self.public_settings_snapshot(), ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            temporary.replace(path)
+        except Exception:
+            # Runs during plugin load: never block startup, and never leave an older snapshot looking current.
+            logger.warning("[%s] 公开配置快照写入失败，Web 设置页将显示未知", PLUGIN_NAME, exc_info=True)
+            for stale in (path, path.with_name(path.name + ".tmp")):
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _warn_deprecated_settings(self) -> list[str]:
         found = []
@@ -5754,7 +5810,8 @@ class Main(Star):
             self._int("automatic_close_retry_seconds", 300, 30, 3600),
         )
 
-    async def _finish_automatic_close_job(self, job_key: str, status: str, error: str | None = None) -> dict:
+    async def _finish_automatic_close_job(self, job_key: str, status: str, error: str | None = None,
+                                          terminal_reason: str | None = None) -> dict:
         max_attempts, retry_window, retry_seconds = self._automatic_job_limits()
         finisher = getattr(self.store, "finish_automatic_close_job", None)
         if callable(finisher):
@@ -5766,6 +5823,7 @@ class Main(Star):
                 retry_after_seconds=retry_seconds,
                 max_attempts=max_attempts,
                 retry_window_seconds=retry_window,
+                **({"terminal_reason": terminal_reason} if terminal_reason else {}),
             )
             return dict(result or {})
         await self._store_call(self.store.finish_job, job_key, status, error)
@@ -6191,6 +6249,19 @@ class Main(Star):
         return failures
 
     @staticmethod
+    def _gate_failure_classes(failures: list[str]) -> dict:
+        """Split fail-closed reasons into ones new data can clear and ones the current code can never pass."""
+        unlicensed = formal_source_policy.unlicensed_fields()
+        unpassable = [item for item in failures if item == "risk_evidence_missing" and unlicensed]
+        result = {"gate_retryable": [item for item in failures if item not in unpassable],
+                  "gate_unpassable": unpassable}
+        if unpassable:
+            result.update({"gate_dependency": "formal_risk_source_acceptance",
+                           "gate_unlicensed_risk_fields": list(unlicensed),
+                           "gate_risk_policy_version": formal_source_policy.POLICY_VERSION})
+        return result
+
+    @staticmethod
     def _degraded_watch_details(diagnostics: Mapping[str, object], snapshot: Mapping[str, object],
                                 failures: list[str]) -> tuple[str, list[str]]:
         """Explain, in plain words, which formal gate inputs are missing."""
@@ -6532,12 +6603,16 @@ class Main(Star):
         failures = self._automatic_report_failures(report_diagnostics, snapshot)
         if failures:
             degraded_reason, missing = self._degraded_watch_details(report_diagnostics, snapshot, failures)
+            classes = self._gate_failure_classes(failures)
             gate_diagnostics = {**dict(report_diagnostics), "degraded_reason": degraded_reason,
-                                "degraded_missing": missing}
+                                "degraded_missing": missing, **classes}
             await record_gate("fail_closed:" + ",".join(failures), gate_diagnostics)
             self._daily_retry_after = datetime.now(CHINA_TZ) + timedelta(minutes=5)
             reason = "自动收盘报告校验失败：" + ",".join(failures)
-            finished = await self._finish_automatic_close_job(job_key, "failed", reason)
+            # While a retryable failure remains, new data can still change the screen; otherwise retries repeat it.
+            terminal_reason = ("formal_gate_unpassable:" + ",".join(classes["gate_unpassable"])
+                               if classes["gate_unpassable"] and not classes["gate_retryable"] else None)
+            finished = await self._finish_automatic_close_job(job_key, "failed", reason, terminal_reason=terminal_reason)
             try:
                 await self._save_and_push_degraded_watch(
                     job_key, requested_date, degraded_reason, missing, gate_diagnostics,
@@ -6549,14 +6624,15 @@ class Main(Star):
                 # The job outcome is already recorded; a watch-list problem must not rewrite it.
                 logger.exception("[%s] 降级观察名单处理失败：invocation=%s", PLUGIN_NAME, job_key)
             logger.warning(
-                "[%s] 自动收盘 fail-closed：invocation=%s requested=%s actual=%s reasons=%s",
+                "[%s] 自动收盘 fail-closed：invocation=%s requested=%s actual=%s reasons=%s terminal=%s",
                 PLUGIN_NAME,
                 job_key,
                 requested_date,
                 actual_date,
                 ",".join(failures),
+                terminal_reason or "retry",
             )
-            return {"state": "fail_closed", "reasons": failures}
+            return {"state": "fail_closed", "reasons": failures, "terminal_reason": terminal_reason}
 
         report_text = "\n".join(self._market_report_lines(
             requested_date,

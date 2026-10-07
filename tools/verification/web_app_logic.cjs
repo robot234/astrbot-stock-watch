@@ -23,7 +23,7 @@ context.window = context;
 vm.createContext(context);
 vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
-  dataState, renderResearch, renderPerformance, renderHealth, reasonText, candidateEmpty, stockStatusNotice};`, context, {filename: "app.js"});
+  dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -127,6 +127,34 @@ check("candidates_empty_links_research", app.candidateEmpty().includes("查看�
 app.state.ctx.catalog = {data: {entries: [{id: "ULTRASHORT_REVERSAL_V1", label: "未通过检验，仅观察", items: [{rank: 1, code: "600857"}]}]}};
 check("stock_offline_membership", app.stockStatusNotice({code: "600857", bar_source: {kind: "active_raw"}, formal_status: "no_formal_candidate"})
   .includes("离线研究名单：ULTRASHORT_REVERSAL_V1 第 1 名"));
+
+// Jobs say which attempt stopped and why; acceptance rows list later runs without rewriting the verdict.
+const explained = app.renderHealth({database: "readable", integrity: "not_checked", tables: 72, data_date: "2026-10-08", providers: [], batches: [], failures: [],
+  automatic_close_limits: {max_attempts: 6, retry_seconds: 300, retry_window_seconds: 14400},
+  jobs: [{date: "2026-10-08", name: "automatic_close", state: "missed", stop: "gate_unpassable", attempts: 1, failure_codes: ["risk_evidence_missing"],
+          gate: {attempt: 1, phase: "fail_closed:risk_evidence_missing", generation: 22, counts: {input: 5561, risk_tuple_complete: 0, tradable: 0},
+                 unpassable: ["risk_evidence_missing"], retryable: []}},
+         {date: "2026-10-08", name: "automatic_close", state: "missed", stop: "retry_exhausted", attempts: 6, failure_codes: ["indicator_coverage"]},
+         {date: "2026-10-08", name: "automatic_close", state: "failed", attempts: 2, failure_codes: ["waiting_snapshot"], next_retry_at: "2026-10-08T07:16:00+00:00"}],
+  daily_acceptance: [{date: "2026-10-08", status: "critical", checked_at: "2026-10-08T07:40:00", review: "late_screen_not_formal", publication: null,
+                      runs: [{job: "daily_screen", status: "completed", candidates: 0, report_version: 1, finished_at: "2026-10-09T01:03:00", after_check: true}]}]});
+check("job_gate_unpassable", explained.includes("门槛不可通过·已停止") && explained.includes("第 1 / 6 次尝试后停止") && explained.includes("不可能通过"));
+check("job_funnel", explained.includes("漏斗：行情 5,561 → 风险四项已知 0 → 可交易 0") && explained.includes("输入第 22 代"));
+check("job_retry_exhausted", explained.includes("重试用完·已终止") && explained.includes("上限 6 次 / 4.0 小时") && explained.includes("指标覆盖不足"));
+check("job_waiting_retry", explained.includes("等待重试") && explained.includes("下次尝试"));
+check("acceptance_late_run", explained.includes("（验收之后）") && explained.includes("补跑不算正式冻结") && explained.includes("没有自动收盘正式发布"));
+
+// Settings show the plugin's load-time values, mark changes, and never print hidden strings.
+const settings = app.renderSettings({snapshot: {status: "plugin_snapshot", written_at: "2026-10-07T04:00:00+00:00", plugin_version: "0.13.3",
+  code_sha256: "a".repeat(64), matches_web_build: true, deprecated_settings: ["confirmation_enabled"]},
+  items: [{key: "max_concurrency", group: "common", state: "shown", effective: 7, default: 5, differs: true, source: "plugin_snapshot"},
+          {key: "tushare_token", group: "advanced", state: "custom", effective: null, default: "", differs: true, source: "plugin_snapshot"},
+          {key: "news_rss_url", group: "advanced", state: "unknown", effective: null, default: "", differs: null, source: "effective_unknown"}]});
+check("settings_snapshot_head", settings.includes("插件加载时写出的配置快照") && settings.includes("与当前 Web 构建是同一提交") && settings.includes("aaaaaaaaaaaa"));
+check("settings_changed", settings.includes("与默认值不同 · 2 项") && settings.includes("已改"));
+check("settings_hidden_value", settings.includes("已修改（值不公开）") && settings.includes("没有读到插件配置"));
+check("settings_deprecated", settings.includes("confirmation_enabled") && settings.includes("实际行为不变"));
+check("settings_missing", app.renderSettings({snapshot: {status: "missing"}, items: []}).includes("没有读到插件配置快照"));
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

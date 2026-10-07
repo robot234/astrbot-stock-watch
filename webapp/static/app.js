@@ -79,7 +79,7 @@ const STATUS = {
   validated:["已验证","ok"], comparable:["可比","ok"], confirmed:["已确认","ok"], read_only:["只读","ok"], valuation_complete:["收盘估值完成","ok"],
   partial:["部分可用","warn"], degraded:["部分可用","warn"], warning:["警告","warn"], rate_limited:["限流","warn"], stale:["数据过期","warn"],
   watch_only:["需复核","warn"], data_unverified:["数据未核验","warn"], trading_flags_clear_only:["交易状态字段已核","warn"],
-  critical:["严重","crit"], unavailable:["不可用","crit"], missing:["不可用","crit"], failed:["失败","crit"], blocked:["已拦截","crit"],
+  critical:["严重","crit"], unavailable:["不可用","crit"], missing:["不可用","crit"], failed:["失败","crit"], blocked:["已拦截","crit"], missed:["已终止","crit"],
   pending:["待到期","info"], running:["运行中","info"], valuation_in_progress:["估值中","info"], stored_not_live:["已存非实时","info"],
   unknown:["未知","unk"], unknown_order:["未知","unk"], not_checked:["未检查","unk"], closed:["休市","unk"], closed_day:["休市","unk"], live_market_missing:["无盘中行情","unk"],
   not_applicable:["不适用","unk"], recent:["近期","ok"], unchanged:["源未变化","ok"],
@@ -400,7 +400,7 @@ function pipeline(d, chain) {
   }
   return panel("处理链路", pb(`<div class="pipe">${steps.join("")}</div>`));
 }
-const JOB_NAMES = {automatic_close:"自动收盘筛选"};
+const JOB_NAMES = {automatic_close:"自动收盘筛选", daily_screen:"收盘筛选"};
 
 // Watch: stored signals and intraday quote artifact.
 function watchHead(view) {
@@ -673,6 +673,46 @@ function renderPerformance(d) {
     panel(`推荐记录 · ${recs.length}`, statusBar + table(["推荐日期 / 标的", "到期", "评估状态", "AI 评审", {t:"收益", cls:"r"}, {t:"最大浮盈", cls:"r"}, {t:"收盘回撤", cls:"r"}, "原因代码"], rows, 1000));
 }
 
+// A job row says which attempt this was, why it stopped, and what the screen saw.
+const GATE_TEXT = {risk_evidence_missing:"四项风险证据不足", indicator_coverage:"指标覆盖不足", snapshot_incomplete:"收盘快照不完整",
+  market_stats_unconfirmed:"市场统计未确认", waiting_snapshot:"当日完整收盘数据未就绪", report_gate:"报告版本门控未通过", exception:"扫描异常"};
+const FUNNEL = [["input", "行情"], ["risk_tuple_complete", "风险四项已知"], ["tradable", "可交易"], ["indicator_targets", "指标目标"], ["enriched", "指标可算"], ["candidate_count", "候选"]];
+function jobBadge(r) {
+  if (r.state !== "missed") return r.state === "failed" && r.next_retry_at ? kindBadge("info", "等待重试", "failed") : badge(r.state);
+  if (r.stop === "gate_unpassable") return kindBadge("warn", "门槛不可通过·已停止", r.stop);
+  return kindBadge("crit", {retry_exhausted:"重试用完·已终止", crossed_trading_date:"跨日终止"}[r.stop] || "已终止", r.stop || "missed");
+}
+function jobExplain(r, limits = {}) {
+  const codes = (r.failure_codes || []).map(c => GATE_TEXT[c] || c).join("、"), max = limits?.max_attempts;
+  const tries = r.attempts ? `第 ${r.attempts}${max ? ` / ${max}` : ""} 次尝试` : "", after = tries ? `${tries}后` : "";
+  const window = finite(limits?.retry_window_seconds) ? `${fmt(limits.retry_window_seconds / 3600, 1)} 小时` : "";
+  const bound = [max ? `${max} 次` : "", window].filter(Boolean).join(" / ");
+  const main = r.stop === "gate_unpassable" ? `${after}停止：${codes || "正式风险门槛"}在当前代码下不可能通过（四项风险字段还没有获验收的来源），重复同一筛选不会改变结果；风险证据通过验收前每天都会这样`
+    : r.stop === "retry_exhausted" ? `${after}停止：重试次数或时间窗用完${bound ? `（上限 ${bound}）` : ""}${codes ? `；最后一次失败：${codes}` : ""}`
+    : r.stop === "crossed_trading_date" ? "到下一个交易日仍未完成，按规则终止，避免隔日误发"
+    : r.stop ? `${after}终止，终止原因没有记录`
+    : r.state === "failed" ? `${tries || "本次"}失败${codes ? `：${codes}` : ""}${r.next_retry_at ? `；下次尝试 ${bj(r.next_retry_at)}` : ""}`
+    : r.state === "completed" ? "已完成" : r.state === "running" ? "运行中" : "—";
+  const g = r.gate, counts = g?.counts || {};
+  const funnel = FUNNEL.filter(([k]) => counts[k] !== undefined).map(([k, t]) => `${t} ${fmt(counts[k], 0)}`).join(" → ");
+  const watch = counts.observation_universe_targets ? `观察口径：成交额前 ${fmt(counts.observation_universe_targets, 0)} 只（含风险未核验），指标可用 ${fmt(counts.observation_universe_enriched, 0)}` : "";
+  const record = g ? [g.attempt ? `第 ${fmt(g.attempt, 0)} 次尝试的门控记录` : "门控记录", g.generation ? `输入第 ${fmt(g.generation, 0)} 代` : "", g.phase ? `阶段 ${g.phase}` : "", g.recorded_at ? bj(g.recorded_at) : ""].filter(Boolean).join(" · ") : "";
+  return esc(main) + [funnel && `漏斗：${funnel}`, watch, record].filter(Boolean).map(t => `<small>${esc(t)}</small>`).join("") + (r.error && !(r.failure_codes || []).length ? `<small class="mono">${esc(r.error)}</small>` : "");
+}
+// Later runs for an accepted date are listed next to the original verdict; they never rewrite it.
+const REVIEW = {
+  late_publication:"最新状态复核：验收之后该日才有自动收盘正式发布；原验收记录的是当时状态，保留不改",
+  late_screen_not_formal:"最新状态复核：验收之后才有该日完成的筛选，但不是自动收盘正式发布；补跑不算正式冻结，原验收结论保留",
+  late_screen:"最新状态复核：验收之后该日又有完成的筛选；原验收结论保留",
+  no_later_evidence:"最新状态复核：验收之后没有该日新的筛选或发布"
+};
+function acceptanceFollowUp(r) {
+  const runs = (r.runs || []).map(x => `${JOB_NAMES[x.job] || x.job} ${(STATUS[x.status] || [x.status || "未知"])[0]}${finite(x.candidates) ? ` · ${fmt(x.candidates, 0)} 只` : ""}${Number(x.report_version) > 0 ? ` · 报告 v${x.report_version}` : ""} · ${bj(x.finished_at)}${x.after_check ? "（验收之后）" : ""}`);
+  const lines = [...(runs.length ? runs : ["该日没有筛选运行记录"]), r.publication ? `自动收盘正式发布 ${bj(r.publication.created_at)}` : "没有自动收盘正式发布"];
+  if (r.review) lines.push(REVIEW[r.review] || r.review);
+  return lines.map(t => `<small>${esc(t)}</small>`).join("");
+}
+
 function renderHealth(d) {
   const loop = isLoopback(), chain = chainState(), live = state.ctx.overview?.data?.live_market, acc = (d.daily_acceptance || [])[0];
   const sec = `<div class="secnote ${loop ? "ok" : ""}">${ic(loop ? "lock" : "shield-alert")}<div><b>${esc(accessText())}</b><br>${loop ? "仅本机回环可访问；远程查看请走 SSH 隧道。" : "当前地址可被局域网访问且没有鉴权，建议改为回环绑定并通过 SSH 隧道访问。"}</div></div>`;
@@ -693,23 +733,42 @@ function renderHealth(d) {
   const current = d.data_date || acc?.date;
   const split = (rows, key) => {const now = rows.filter(r => !current || !r[key] || r[key] >= current); return [now, rows.filter(r => !now.includes(r))];};
   const history = (heads, rows, min) => rows.length ? `<details class="history"><summary>更早记录 ${rows.length} 条 · 保留原始证据，不代表当前问题</summary>${table(heads, rows, min)}</details>` : "";
-  const accHeads = ["交易日", "检查时间", "状态", "摘要"], jobHeads = ["日期", "任务", "状态", "错误代码"];
-  const accRow = r => `<tr><td>${esc(r.date)}</td><td>${esc(bj(r.checked_at))}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.summary || "—")}</td></tr>`;
-  const jobRow = r => `<tr><td>${esc(r.date)}</td><td>${esc(JOB_NAMES[r.name] || r.name)}</td><td>${badge(r.state)}</td><td class="mono">${esc(r.error || "—")}</td></tr>`;
+  const accHeads = ["交易日", "检查时间", "状态", "摘要", "同日运行与复核"], jobHeads = ["日期", "任务", "状态", "说明"];
+  const accRow = r => `<tr><td>${esc(r.date)}</td><td>${esc(bj(r.checked_at))}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.summary || "—")}</td><td class="wrap">${acceptanceFollowUp(r)}</td></tr>`;
+  const jobRow = r => `<tr><td>${esc(r.date)}</td><td>${esc(JOB_NAMES[r.name] || r.name)}</td><td>${jobBadge(r)}</td><td class="wrap">${jobExplain(r, d.automatic_close_limits)}</td></tr>`;
   const [accNow, accOld] = split(d.daily_acceptance || [], "date"), [jobsNow, jobsOld] = split(d.jobs || [], "date");
   const fails = (d.failures || []).map(r => `<tr><td>${esc(r.code)}</td><td>${badge(r.state)}</td><td>${badge(r.risk)}</td><td>${esc(bj(r.at))}</td></tr>`);
   const outbox = (title, o) => panel(title, Object.keys(o || {}).length ? `<div class="status-rows">${Object.entries(o).map(([s, n]) => `<div class="status-row">${badge(s, DELIVERY)}<span class="num">${fmt(n, 0)}</span></div>`).join("")}</div>` : empty("没有投递记录", "no_records"));
   return pageHead("系统健康", "", ["持久状态快照，不代表远端服务探活"]) + sec + svc +
     panel("数据源接口", table(["接口 / 遥测", "状态", "最近成功", "最近错误", "质量记录", "错误", "暂停 / 熔断到", "状态更新"], prov, 980), `<span class="src">每类最多 30 条</span>`) +
     panel("原始数据批次", table(["批次", "数据日期", {t:"代", cls:"r"}, "状态", {t:"行数", cls:"r"}, "口径", "发布时间"], batches, 760), `<span class="src">最近 10 批</span>`) +
-    panel(`每日链路验收 · 当前数据日 ${esc(current || "未知")}`, table(accHeads, accNow.map(accRow), 640, {empty:empty("当前数据日没有验收记录", "daily_acceptance_missing")}) + findingHelp(state.ctx.overview?.data?.acceptance?.findings) + history(accHeads, accOld.map(accRow), 640), `<span class="src">最近 10 次</span>`) +
-    `<div class="grid g-1-1"><div class="col">${panel(`任务 · 当前数据日 ${esc(current || "未知")}`, table(jobHeads, jobsNow.map(jobRow), 520, {empty:empty("当前数据日没有任务记录", "no_records")}) + history(jobHeads, jobsOld.map(jobRow), 520), `<span class="src">最近 15 条</span>`)}${panel("失败与风险标的", table(["标的", "状态", "风险", "时间"], fails, 480), `<span class="src">最近 20 条</span>`)}</div><div class="col">${outbox("盘中信号投递", d.outbox)}${outbox("自动收盘推送", d.automatic_outbox)}${outbox("每日验收推送", d.daily_acceptance_outbox)}</div></div>`;
+    panel(`每日链路验收 · 当前数据日 ${esc(current || "未知")}`, table(accHeads, accNow.map(accRow), 900, {empty:empty("当前数据日没有验收记录", "daily_acceptance_missing")}) + findingHelp(state.ctx.overview?.data?.acceptance?.findings) + history(accHeads, accOld.map(accRow), 900), `<span class="src">最近 10 次 · 原验收记录不改写</span>`) +
+    panel(`任务 · 当前数据日 ${esc(current || "未知")}`, table(jobHeads, jobsNow.map(jobRow), 760, {empty:empty("当前数据日没有任务记录", "no_records")}) + history(jobHeads, jobsOld.map(jobRow), 760), `<span class="src">最近 15 条</span>`) +
+    `<div class="grid g-1-1"><div class="col">${panel("失败与风险标的", table(["标的", "状态", "风险", "时间"], fails, 480), `<span class="src">最近 20 条</span>`)}</div><div class="col">${outbox("盘中信号投递", d.outbox)}${outbox("自动收盘推送", d.automatic_outbox)}${outbox("每日验收推送", d.daily_acceptance_outbox)}</div></div>`;
 }
 function renderSettings(d) {
   const names = {min_score:"最低技术分", price_min:"最低价格", price_max:"最高价格", deep_screen_limit:"技术深筛上限", factor_screen_limit:"因子筛选上限", screen_min_indicator_coverage:"最低指标覆盖", intraday_confirmation_periods:"连续确认次数", intraday_cooldown_seconds:"信号冷却（秒）", intraday_min_amount:"最低成交额", market_comparison_enabled:"量价对照", market_comparison_benchmark:"指定基准指数", paper_trading_only:"仅研究 / 模拟", price_plan_close_tolerance_pct:"收盘计划偏差容限", official_evidence_enabled:"官方证据核验", official_evidence_candidate_limit:"官方证据候选上限", official_evidence_cache_seconds:"官方证据缓存（秒）"};
-  const value = v => typeof v === "boolean" ? (v ? "开启" : "关闭") : v === null || v === undefined || v === "" ? `<span class="muted">未知</span>` : esc(v);
-  const rows = (d.items || []).map(r => `<tr><td>${esc(names[r.key] || r.key)}<small class="mono">${esc(r.key)}</small></td><td class="num">${value(r.effective)}</td><td class="num">${value(r.default)}</td><td class="wrap">${esc(r.label || "—")}<small>${r.source === "explicit_public_snapshot" ? "显式公开配置快照" : "有效配置未提供"}</small></td></tr>`);
-  return pageHead("策略设置", "", ["只读"]) + panel("参数", table(["参数", "当前值", "默认值", "说明"], rows, 720)) + notice("info", "lock", "敏感字段未暴露。默认值不代表正在运行的插件配置。");
+  const s = d.snapshot || {}, items = d.items || [];
+  const STATE = {empty:"未填写", default:"与默认相同（值不公开）", custom:"已修改（值不公开）", invalid_type:"类型不符（值不公开）", unknown:"未知"};
+  const SOURCE = {plugin_snapshot:"来源：插件加载时的配置快照", explicit_public_snapshot:"来源：显式公开配置快照", effective_unknown:"来源：没有读到插件配置"};
+  const value = v => typeof v === "boolean" ? (v ? "开启" : "关闭") : v === null || v === undefined || v === "" ? `<span class="muted">空</span>` : esc(v);
+  const current = r => r.state === "shown" ? value(r.effective) : `<span class="muted">${esc(STATE[r.state] || "未知")}</span>`;
+  const row = r => `<tr><td>${esc(names[r.key] || r.key)}<small class="mono">${esc(r.key)}</small></td><td class="num">${current(r)}${r.differs ? ` ${kindBadge("warn", "已改", "differs_from_default")}` : ""}</td><td class="num">${value(r.default)}</td><td class="wrap">${esc(r.label || "—")}<small>${esc(SOURCE[r.source] || "来源未知")}</small></td></tr>`;
+  const heads = ["参数", "当前值", "默认值", "说明 / 来源"];
+  const common = items.filter(r => r.group === "common"), others = items.filter(r => r.group !== "common"), changed = items.filter(r => r.differs);
+  const SNAP = {missing:"没有读到插件配置快照：插件还没加载带这个功能的版本，或 Web 读不到插件数据目录。", unreadable:"插件配置快照无法读取。",
+    invalid:"插件配置快照格式不对。", not_configured:"Web 没有配置插件快照的位置。"};
+  const build = s.matches_web_build === true ? "与当前 Web 构建是同一提交" : s.matches_web_build === false ? "与当前 Web 构建的提交不同" : "无法与 Web 构建比对";
+  const head = s.status === "plugin_snapshot"
+    ? notice("info", "clock", `当前值来自插件加载时写出的配置快照：加载于 ${esc(bj(s.written_at))} · 插件 ${esc(s.plugin_version || "版本未知")} · main.py ${esc((s.code_sha256 || "").slice(0, 12) || "未知")}（${esc(build)}）。面板改配置后，插件重新加载才会更新这里。`)
+    : s.status === "explicit_values" ? notice("info", "lock", "当前值来自显式指定的公开配置快照，不是插件自己写出的。")
+    : notice("warn", "triangle-alert", `${esc(SNAP[s.status] || "插件配置快照状态未知。")}当前值显示为未知；默认值不代表正在运行的配置。`);
+  const deprecated = (s.deprecated_settings || []).length ? notice("warn", "triangle-alert", `这些旧配置项设成了非默认值，但当前代码不读取：${esc(s.deprecated_settings.join("、"))}。在面板改回默认可以消掉加载告警，实际行为不变。`) : "";
+  return pageHead("策略设置", "", ["只读"]) + head + deprecated +
+    (changed.length ? panel(`与默认值不同 · ${fmt(changed.length, 0)} 项`, table(heads, changed.map(row), 760)) : "") +
+    panel("常用参数", table(heads, common.map(row), 760)) +
+    panel(`全部参数 · ${fmt(items.length, 0)} 项`, `<details class="history"><summary>展开其余 ${fmt(others.length, 0)} 项（高级）</summary>${table(heads, others.map(row), 760)}</details>`) +
+    notice("info", "lock", "令牌、密钥、地址、推送白名单、路径等字段只显示“未填写 / 与默认相同 / 已修改”，不显示内容。");
 }
 
 // Navigation.

@@ -41,8 +41,10 @@ def main():
     output = ROOT / ".local_records" / "pi-web-deployment" / (release + revision)
     output.mkdir(parents=True, exist_ok=False)
     payload = collect(revision)
+    plugin_main = subprocess.check_output(["git", "cat-file", "blob", f"{revision}:main.py"], cwd=ROOT) if revision else None
     payload["webapp/build_info.json"] = json.dumps({
         "release": release, "revision": revision or None,
+        "plugin_main_sha256": hashlib.sha256(plugin_main).hexdigest() if plugin_main is not None else None,
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, sort_keys=True).encode()
     manifest = {"release": release, "files": {
         name: hashlib.sha256(data).hexdigest() for name, data in payload.items()}}
