@@ -1862,8 +1862,9 @@ class Main(Star):
     def _write_public_settings(self, path: Path) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            snapshot = self.public_settings_snapshot()
             temporary = path.with_name(path.name + ".tmp")
-            temporary.write_text(json.dumps(self.public_settings_snapshot(), ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            temporary.write_text(json.dumps(snapshot, ensure_ascii=False, sort_keys=True), encoding="utf-8")
             temporary.replace(path)
         except Exception:
             # Runs during plugin load: never block startup, and never leave an older snapshot looking current.
@@ -1873,6 +1874,40 @@ class Main(Star):
                     stale.unlink(missing_ok=True)
                 except OSError:
                     pass
+            return
+        try:
+            self._append_settings_history(path.with_name("public_settings_history.jsonl"), snapshot)
+        except Exception:
+            logger.warning("[%s] 配置加载记录写入失败（不影响配置快照）", PLUGIN_NAME, exc_info=True)
+
+    @staticmethod
+    def _settings_fingerprint(snapshot: dict) -> dict:
+        """Public values as they are, other strings only by state: the same exposure as the snapshot itself."""
+        return {**{key: ["value", value] for key, value in (snapshot.get("values") or {}).items()},
+                **{key: ["state", value] for key, value in (snapshot.get("configured") or {}).items()}}
+
+    def _append_settings_history(self, path: Path, snapshot: dict, keep: int = 50) -> None:
+        """One line per load: when, which code, and which setting keys changed since the previous load."""
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        try:
+            previous = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            previous = None
+        before = previous.get("fingerprint") if isinstance(previous, dict) else None
+        current = self._settings_fingerprint(snapshot)
+        changed = (sorted(key for key in set(current) | set(before) if before.get(key) != current.get(key))
+                   if isinstance(before, dict) else None)
+        entry = {"written_at": snapshot.get("written_at"), "plugin_version": snapshot.get("plugin_version"),
+                 "code_sha256": snapshot.get("code_sha256"), "schema_sha256": snapshot.get("schema_sha256"),
+                 "changed": changed, "fingerprint": current}
+        kept = lines[-(keep - 1):] if keep > 1 else []
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text("".join(line + "\n" for line in kept) + json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n",
+                             encoding="utf-8")
+        temporary.replace(path)
 
     def _warn_deprecated_settings(self) -> list[str]:
         found = []

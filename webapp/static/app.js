@@ -1216,6 +1216,15 @@ function credentialPanel(items) {
   }).join("");
   return panel("凭据状态（C11）", `<div class="status-rows">${rows}</div><p class="regime-note">只显示有没有填写，不显示内容，也不代表能用：能不能用看健康页的接口状态。默认关闭的功能保持关闭。</p>`, `<span class="src">只读</span>`);
 }
+// C12: one line per plugin load, newest first; only key names, never values.
+function settingsHistoryPanel(h) {
+  const items = h?.items || [];
+  const groupName = key => (SETTING_GROUPS.find(([id]) => id === settingGroup(key)) || [null, "其它 / 运维"])[1];
+  const row = r => `<tr><td>${esc(bj(r.written_at))}</td><td>${esc(r.plugin_version || "—")}<small class="mono">${esc((r.code_sha256 || "").slice(0, 12) || "—")}</small></td><td class="wrap">${r.first ? "第一次记录（更早的修改无从查起）" : r.changed.length ? esc(r.changed.join("、")) : "与上次加载相同"}</td><td class="wrap">${r.first || !r.changed.length ? "—" : esc([...new Set(r.changed.map(groupName))].join("、"))}</td></tr>`;
+  const body = items.length ? table(["加载时间", "插件版本 / main.py", "改了哪些设置", "影响哪类功能"], items.map(row), 760)
+    : empty(h?.status === "missing" ? "还没有加载记录：插件更新到带这个功能的版本并重载后开始记录" : "没有加载记录", h?.status || "settings_history_unavailable");
+  return panel("配置变更记录（C12）", body + `<p class="regime-note">每次插件加载记一条：时间、版本、和上次加载比改了哪些键（只记键名；不公开的字符串只看得出“未填写 / 默认 / 已修改”之间的变化）。在 AstrBot 面板改配置要重载插件才生效，这里也是重载后才多一条。兼容保护项 tushare_raw_require_universe_evidence 设成 false 也不会关掉全市场完整性保护（代码里固定开启）。</p>`, `<span class="src">只读 · 最近 20 次加载</span>`);
+}
 function renderSettings(d) {
   const names = {min_score:"最低技术分", price_min:"最低价格", price_max:"最高价格", deep_screen_limit:"技术深筛上限", factor_screen_limit:"因子筛选上限", screen_min_indicator_coverage:"最低指标覆盖", intraday_confirmation_periods:"连续确认次数", intraday_cooldown_seconds:"信号冷却（秒）", intraday_min_amount:"最低成交额", market_comparison_enabled:"量价对照", market_comparison_benchmark:"指定基准指数", paper_trading_only:"仅研究 / 模拟", price_plan_close_tolerance_pct:"收盘计划偏差容限", official_evidence_enabled:"官方证据核验", official_evidence_candidate_limit:"官方证据候选上限", official_evidence_cache_seconds:"官方证据缓存（秒）"};
   const s = d.snapshot || {}, items = d.items || [];
@@ -1237,7 +1246,7 @@ function renderSettings(d) {
   const issues = (s.setting_issues || []).map(i => notice(i.level === "error" ? "crit" : "warn", "triangle-alert",
     `配置检查：${esc(i.message)}。${esc(i.effect)}。<small class="mono">${esc((i.keys || []).join(" · "))}</small>`)).join("");
   return pageHead("策略设置", "", ["只读"]) + head + deprecated + issues + capsPanel(items) +
-    `<div class="grid g-1-1">${budgetPanel(items)}${arrivalPanel(items)}</div>` + credentialPanel(items) +
+    `<div class="grid g-1-1">${budgetPanel(items)}${arrivalPanel(items)}</div>` + credentialPanel(items) + settingsHistoryPanel(d.history) +
     (changed.length ? panel(`与默认值不同 · ${fmt(changed.length, 0)} 项`, table(heads, changed.map(row), 760)) : "") +
     panel("常用参数", table(heads, common.map(row), 760)) +
     panel(`全部参数 · ${fmt(items.length, 0)} 项`, settingGroupsHtml(others, heads, row), `<span class="src">按用途分组（C06）；常用参数已在上面单列</span>`) +

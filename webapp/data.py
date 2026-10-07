@@ -1792,7 +1792,36 @@ class Dashboard:
         meta = {key: snapshot[key] for key in ("status", "written_at", "plugin_version", "code_sha256", "schema_sha256",
                                                "deprecated_settings", "setting_issues")}
         meta["matches_web_build"] = (plugin_sha == build_sha) if plugin_sha and build_sha else None
-        return {"items": result, "snapshot": meta, "read_only": True, "sensitive_fields": "not_exposed"}
+        return {"items": result, "snapshot": meta, "history": self.settings_history(set(schema)), "read_only": True,
+                "sensitive_fields": "not_exposed"}
+
+    def settings_history(self, known_keys):
+        """Load records the plugin appends beside its settings snapshot: when, which code, which keys changed."""
+        if self.settings is not None or not self.artifact_configured:
+            return {"status": "not_configured", "items": []}
+        path = self.artifact_path.with_name("public_settings_history.jsonl")
+        try:
+            if path.stat().st_size > 1048576:
+                return {"status": "invalid", "items": []}
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return {"status": "missing", "items": []}
+        except (OSError, UnicodeError):
+            return {"status": "unreadable", "items": []}
+        items = []
+        for line in lines[-20:]:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            written, changed = instant(row.get("written_at")), row.get("changed")
+            items.append({"written_at": written.isoformat() if written else None,
+                          "plugin_version": safe_text(row.get("plugin_version"), 40) or None,
+                          "code_sha256": sha256_text(row.get("code_sha256")), "first": changed is None,
+                          "changed": [key for key in arr(changed) if isinstance(key, str) and key in known_keys][:60]})
+        return {"status": "available", "items": items[::-1]}
 
     def intraday(self):
         try:
