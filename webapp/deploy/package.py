@@ -4,11 +4,31 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+FILES = (
+    "webapp/__init__.py", "webapp/server.py", "webapp/data.py",
+    "data_evidence.py", "paper_forward.py", "paper_review.py", "_conf_schema.json",
+    "docs/research/ULTRASHORT_REVERSAL_V1_FROZEN.json", "docs/research/LLM_SECTOR_FIRST_EXP_V0_FROZEN.json",
+    "webapp/deploy/snapshot.py", "webapp/deploy/stock-watch-web.service",
+    "webapp/deploy/stock-watch-web-snapshot.service",
+    "webapp/deploy/stock-watch-web-snapshot.timer",
+)
+
+
+def collect(revision=""):
+    """With a revision, package the committed bytes so a CRLF checkout cannot change file hashes."""
+    if revision:
+        git = lambda *args: subprocess.check_output(["git", *args], cwd=ROOT)
+        static = git("ls-tree", "-r", "--name-only", revision, "--", "webapp/static").decode().split()
+        return {name: git("cat-file", "blob", f"{revision}:{name}") for name in (*FILES, *sorted(static))}
+    paths = [ROOT / name for name in FILES]
+    paths += sorted(p for p in (ROOT / "webapp/static").rglob("*") if p.is_file())
+    return {p.relative_to(ROOT).as_posix(): p.read_bytes() for p in paths}
 
 
 def main():
@@ -20,16 +40,7 @@ def main():
         raise ValueError("invalid_revision")
     output = ROOT / ".local_records" / "pi-web-deployment" / (release + revision)
     output.mkdir(parents=True, exist_ok=False)
-    paths = [ROOT / name for name in (
-        "webapp/__init__.py", "webapp/server.py", "webapp/data.py",
-        "data_evidence.py", "paper_forward.py", "paper_review.py", "_conf_schema.json",
-        "docs/research/ULTRASHORT_REVERSAL_V1_FROZEN.json", "docs/research/LLM_SECTOR_FIRST_EXP_V0_FROZEN.json",
-        "webapp/deploy/snapshot.py", "webapp/deploy/stock-watch-web.service",
-        "webapp/deploy/stock-watch-web-snapshot.service",
-        "webapp/deploy/stock-watch-web-snapshot.timer",
-    )]
-    paths += sorted(p for p in (ROOT / "webapp/static").rglob("*") if p.is_file())
-    payload = {p.relative_to(ROOT).as_posix(): p.read_bytes() for p in paths}
+    payload = collect(revision)
     payload["webapp/build_info.json"] = json.dumps({
         "release": release, "revision": revision or None,
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, sort_keys=True).encode()
