@@ -25,7 +25,7 @@ vm.runInContext(source + `
 ;globalThis.__app = {providerKind, providerText, sessionBand, primaryDate, coveragePanel, snapshotAgeText, bj, state,
   dataState, renderResearch, renderPerformance, renderHealth, renderSettings, reasonText, candidateEmpty, stockStatusNotice,
   hotBadge, indexTrendPanel, overheatStockPanel, macdStockPanel, funnelPanel, auditPanel, funnelVerdict, stockScreenLine,
-  maSet, movingAverage, chartTools, chartSeries, chartCaption, liveQuoteHtml, limitText};`, context, {filename: "app.js"});
+  maSet, movingAverage, chartTools, chartSeries, chartCaption, liveQuoteHtml, limitText, riskReminderPanel};`, context, {filename: "app.js"});
 
 const app = context.__app;
 const failures = [];
@@ -260,6 +260,21 @@ check("live_outside_session", app.liveQuoteHtml({status: "unknown", reason: "out
 const limits = app.limitText({bar_date: "2026-09-30", limits: {up: 11.06, down: 9.05, rate: 0.1, board: "main", st: false}});
 check("limit_text", limits.includes("11.06") && limits.includes("9.05") && limits.includes("2026-09-30 收盘和主板 ±10%") && limits.includes("未核验"));
 check("limit_unknown", app.limitText({limits: null}) === "未知");
+
+// Lockup-expiry and margin-crowding reminders: list badges and the stock panel, display only.
+const riskSignals = (risk, extra = {}) => signals({unlock: {status: "available", window: ["2026-10-07", "2026-11-06"], heavy: [{code: "301683", date: "2026-10-08", ratio: 0.0568}]},
+  margin: {status: "available", trade_date: "2026-09-29", crowded: [{code: "600519", buy_share: 0.2}]}, risk, ...extra});
+const unlockBadge = app.hotBadge("301683", riskSignals(null)), marginBadge = app.hotBadge("600519", riskSignals(null));
+check("risk_badges", unlockBadge.includes("解禁") && unlockBadge.includes("5.7%") && !unlockBadge.includes("过热") && marginBadge.includes("两融拥挤") && marginBadge.includes("20.0%"));
+check("risk_badges_absent", app.hotBadge("600011", riskSignals(null)) === "");
+const riskPanel = app.riskReminderPanel(riskSignals({unlock: {status: "scheduled", heavy: true, ratio_total: 0.0568, events: [{date: "2026-10-08", type: "首发机构配售股份", ratio: 0.0568}]},
+  margin: {status: "listed", buy: 229076790, balance: 17318617925, buy_share: 0.2, pct: 0.99, crowded: true}}));
+check("risk_panel", riskPanel.includes("解禁压力大") && riskPanel.includes("2026-10-08 首发机构配售股份 占流通 5.68%") && riskPanel.includes("两融拥挤")
+  && riskPanel.includes("融资余额 173.19 亿") && riskPanel.includes("未验证"));
+const quietPanel = app.riskReminderPanel(riskSignals({unlock: {status: "none", events: []}, margin: {status: "not_listed"}}));
+check("risk_panel_quiet", quietPanel.includes("30 天内没有解禁") && quietPanel.includes("不在两融标的里"));
+check("risk_panel_failed", app.riskReminderPanel(riskSignals(null, {margin: {status: "unavailable", reason: "margin_unpublished"}})).includes("margin_unpublished"));
+check("risk_panel_missing", app.riskReminderPanel({meta: {status: "partial"}, data: {status: "missing"}}).includes("研究信号还没有生成"));
 
 if (failures.length) {
   console.error(JSON.stringify({status: "failed", failures}));

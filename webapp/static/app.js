@@ -585,11 +585,39 @@ function hotMap(payload = state.ctx.signals) {
   if (!d || !["available", "stale"].includes(d.status) || oh?.status !== "available") return new Map();
   return new Map((oh.hot || []).map(item => [item.code, item]));
 }
+const riskCache = new WeakMap();
+function riskMaps(payload = state.ctx.signals) {
+  const d = signalsData(payload);
+  if (!d || !["available", "stale"].includes(d.status)) return {unlock: new Map(), margin: new Map()};
+  if (!riskCache.has(d)) riskCache.set(d, {
+    unlock: new Map(d.unlock?.status === "available" ? (d.unlock.heavy || []).map(x => [x.code, x]) : []),
+    margin: new Map(d.margin?.status === "available" ? (d.margin.crowded || []).map(x => [x.code, x]) : [])});
+  return riskCache.get(d);
+}
+// Overheat, heavy lockup expiry and margin crowding: research reminders only, never gates.
 function hotBadge(code, payload = state.ctx.signals) {
-  const item = hotMap(payload).get(code);
-  if (!item) return "";
-  const oh = signalsData(payload).overheat;
-  return ` ${kindBadge("warn", "过热", `研究标签 · ${oh.trade_date || "日期未知"} 过热综合分位 ${fmt(Number(item.pct) * 100, 1)}%，属于研究股票池里最热的 10%。只做提醒，不改正式门槛。`)}`;
+  const item = hotMap(payload).get(code), risk = riskMaps(payload), unlock = risk.unlock.get(code), margin = risk.margin.get(code);
+  const oh = signalsData(payload)?.overheat;
+  return (item ? ` ${kindBadge("warn", "过热", `研究标签 · ${oh.trade_date || "日期未知"} 过热综合分位 ${fmt(Number(item.pct) * 100, 1)}%，属于研究股票池里最热的 10%。只做提醒，不改正式门槛。`)}` : "")
+    + (unlock ? ` ${kindBadge("warn", "解禁", `${unlock.date} 起 30 天内解禁合计约占流通市值 ${fmt(Number(unlock.ratio) * 100, 1)}%（≥5% 才标）。研究显示解禁比例越大前后收益越差；只做提醒，未验证。`)}` : "")
+    + (margin ? ` ${kindBadge("warn", "两融拥挤", `融资买入占当日成交额 ${fmt(Number(margin.buy_share) * 100, 1)}%，排在两融标的前 10%。研究显示融资买入强度高之后短期收益偏低；只做提醒，未验证。`)}` : "");
+}
+function riskReminderPanel(payload = state.ctx.signals) {
+  const d = signalsData(payload);
+  if (!d || ["not_configured", "missing", "unreadable", "invalid"].includes(d.status)) return signalsUnavailable("解禁与两融", d?.status || payload?.meta?.reason || "research_signals_unavailable");
+  const u = d.risk?.unlock, m = d.risk?.margin, uw = d.unlock, mw = d.margin;
+  const row = (title, sub, right) => `<div class="status-row"><span>${title}${sub ? `<small>${sub}</small>` : ""}</span><span>${right}</span></div>`;
+  const missing = section => kindBadge("unk", "这次没取到", section?.reason || section?.status || "unavailable");
+  const unlockRow = uw?.status !== "available" ? row("解禁", "", missing(uw))
+    : !u?.events?.length ? row("解禁", `${esc(uw.window?.[0] || "")} — ${esc(uw.window?.[1] || "")}`, kindBadge("ok", "30 天内没有解禁"))
+    : row("解禁", u.events.map(e => `${esc(e.date)} ${esc(e.type || "")} 占流通 ${fmt(Number(e.ratio) * 100, 2)}%`).join("<br>"),
+      `${u.heavy ? kindBadge("warn", "解禁压力大", "30 天内合计 ≥ 5% 流通市值") : kindBadge("info", "有解禁", "30 天内合计低于 5%")}<small>合计 ${fmt(Number(u.ratio_total) * 100, 2)}%</small>`);
+  const marginRow = mw?.status !== "available" ? row("两融", "", missing(mw))
+    : m?.status !== "listed" ? row("两融", esc(mw.trade_date || ""), kindBadge("unk", "不在两融标的里或当天无成交"))
+    : row("两融", `${esc(mw.trade_date || "")} · 融资余额 ${fmt(Number(m.balance) / 1e8)} 亿 · 融资买入 ${fmt(Number(m.buy) / 1e8, 3)} 亿`,
+      `${m.crowded ? kindBadge("warn", "两融拥挤", "融资买入占成交额排在两融标的前 10%") : kindBadge("ok", "不拥挤")}<small>买入占成交 ${fmt(Number(m.buy_share) * 100, 1)}% · 分位 ${fmt(Number(m.pct) * 100, 0)}%</small>`);
+  const stale = d.status === "stale" ? notice("", "triangle-alert", `研究信号超过 3 天没有更新（生成于 ${esc(bj(d.generated_at))}）`) : "";
+  return panel("解禁与两融", stale + `<div class="status-rows">${unlockRow}${marginRow}</div><p class="regime-note">风险提醒，只显示、未验证：A 股研究显示解禁占流通比例越大，前后收益越差；融资买入强度高的股票之后短期收益偏低。阈值（30 天内解禁合计 ≥ 5%、融资买入占成交额前 10%）只是展示用，不改正式门槛。</p>`, `<span class="src">研究参考 · 只显示</span>`);
 }
 function signalsUnavailable(title, code) {
   return panel(title, empty(SIGNAL_STATUS_TEXT[code] || `${title}暂不可用`, code), `<span class="src">研究参考</span>`);
@@ -741,7 +769,7 @@ function renderStock(d) {
   const evRows = Object.entries({...(ev.financial || {}), ...(ev.risk || {})}).map(([k, v]) => `<tr><td>${esc(EVIDENCE_FIELDS[k] || k)}</td><td class="num">${v?.value === null || v?.value === undefined ? "未知" : typeof v.value === "boolean" ? (v.value ? "是" : "否") : fmt(v.value)}</td><td>${badge(v?.quality)}</td><td class="wrap">${esc(v?.reason || "—")}</td></tr>`);
   const recs = (d.recommendations || []).slice(0, LIMITS.recommendations).map(r => `<tr><td>${esc(r.date)}</td><td>${badge(r.plan_status)}</td><td>${badge(r.comparability)}</td><td class="mono">${esc(r.plan_version || "—")}</td></tr>`);
   return panel("查找个股", stockSearchForm()) + `<section class="panel">${head}${coverage}${tools}${chart}</section>` + stockStatusNotice(d) + quality +
-    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${macdStockPanel(d)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
+    `<div class="grid g-2-1"><div class="col">${panel("推荐历史", table(["推荐日期", "计划状态", "可比性", "计划版本"], recs, 520), `<span class="src">最多 ${LIMITS.recommendations} 条</span>`)}${panel("信号历史", signalRows(d.signals || []), `<span class="src">最多 ${LIMITS.events} 条</span>`)}${panel("财务与风险证据", table(["字段", "值", "质量", "缺口"], evRows, 520))}</div><div class="col">${overheatStockPanel(d.code)}${riskReminderPanel()}${macdStockPanel(d)}${keyData}${panel("相关公告", renderAnnouncements(d.announcements), `<span class="src">最多 ${LIMITS.announcements} 条</span>`)}</div></div>`;
 }
 // Chart settings live in this browser only (localStorage); moving averages are computed from the bars shown.
 const MA_DEFAULT = [5, 13, 34, 55, 120], MA_LIMIT = 8;

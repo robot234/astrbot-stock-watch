@@ -153,11 +153,19 @@ server reads through `--signals` (`/api/research_signals`, optionally `?code=`):
   approximations are listed in the file and on the stock page.
 - **Index trend (scheme D)**: CSI 500 / CSI 1000 close against the 200-session
   mean (120 shown as a diagnostic) from AKShare's Sina index series.
+- **Lockup expiry**: restricted-share releases from today through the next 30
+  calendar days (AKShare `stock_restricted_release_detail_em`), summed per code;
+  a total of at least 5% of float market value is flagged.
+- **Margin crowding**: margin buying over that day's turnover (snapshot amount)
+  on the newest session both SSE and SZSE published, ranked among margin stocks;
+  the top decile is flagged. Both reminders rest on published A-share studies
+  only and their thresholds are display choices, not validated here.
 
 Both are display-only: no formal gate, candidate, recommendation or plugin
 setting changes. Each new trade date is appended once to
-`research_overheat_forward.jsonl` and `research_index_trend_forward.jsonl`
-next to the output; those files are never rewritten. Evidence and forward-check
+`research_overheat_forward.jsonl`, `research_index_trend_forward.jsonl`,
+`research_unlock_forward.jsonl` and `research_margin_forward.jsonl` next to the
+output; those files are never rewritten. Evidence and forward-check
 rules: `docs/research/NEW_SCHEMES_RESULTS_20261007.md`.
 
 On the Pi the job runs as `pi` with the data-probe venv (numpy, pandas,

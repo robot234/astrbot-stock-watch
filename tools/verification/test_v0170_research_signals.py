@@ -128,19 +128,22 @@ def test_build_reads_active_raw_writes_atomically_and_records_each_date_once(tmp
     _active_raw_db(database, market, codes, names, days)
     output = tmp_path / "state" / "research_signals.json"
     fetch = lambda code: _index_frame(5000, 2)  # noqa: E731
-    first = rs.build(database, output, now=NOW, fetch=fetch)
+    quiet = {"unlock_fetch": lambda start, end: pd.DataFrame(), "margin_fetch": lambda exchange, day: pd.DataFrame()}
+    first = rs.build(database, output, now=NOW, fetch=fetch, **quiet)
     direct = rs.overheat(market, codes, names, days)
     written = json.loads(output.read_text(encoding="utf-8"))
     assert written["schema"] == SIGNALS_SCHEMA and written["inputs"]["batch_id"] == "b1" and written["inputs"]["sessions"] == 80
     assert [x["code"] for x in written["overheat"]["hot"]] == [x["code"] for x in direct["hot"]]
-    assert first["forward_recorded"] == {"overheat": True, "index_trend": True}
-    again = rs.build(database, output, now=NOW + timedelta(hours=3), fetch=fetch)
-    assert again["forward_recorded"] == {"overheat": False, "index_trend": False}
+    assert written["unlock"]["status"] == "available" and written["margin"]["reason"] == "margin_unpublished"
+    assert first["forward_recorded"] == {"overheat": True, "index_trend": True, "unlock": True, "margin": False}
+    again = rs.build(database, output, now=NOW + timedelta(hours=3), fetch=fetch, **quiet)
+    assert again["forward_recorded"] == {"overheat": False, "index_trend": False, "unlock": False, "margin": False}
     lines = (tmp_path / "state" / "research_overheat_forward.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1 and json.loads(lines[0])["trade_date"] == days[-1]
     assert not list((tmp_path / "state").glob("*.tmp"))
     broken = rs.build(tmp_path / "missing.sqlite3", tmp_path / "other" / "research_signals.json", now=NOW, skip_index=True)
     assert broken["overheat"]["status"] == "unavailable" and broken["index_trend"]["status"] == "skipped"
+    assert broken["unlock"] == {"status": "skipped"} and broken["margin"] == {"status": "skipped"}
     assert not (tmp_path / "other" / "research_overheat_forward.jsonl").exists()
 
 

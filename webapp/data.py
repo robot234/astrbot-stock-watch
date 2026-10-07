@@ -271,6 +271,52 @@ def screen_audit_row(row):
             "missing_inputs": [key for key in arr(row.get("missing_inputs")) if key in SCREEN_INDICATORS]}
 
 
+def iso_day(value):
+    text = str(value or "")
+    return text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else None
+
+
+def signal_unlock(section):
+    """Lockup-expiry reminder summary: the window and the codes over the display threshold."""
+    section = obj(section)
+    heavy = [{"code": row[0], "date": row[1], "ratio": number(row[2])} for row in (arr(item) for item in arr(section.get("heavy"))[:2000])
+             if len(row) == 3 and re.fullmatch(r"\d{6}", str(row[0])) and iso_day(row[1]) and number(row[2]) is not None]
+    window = [iso_day(day) for day in arr(section.get("window"))[:2]]
+    return {"status": reason_token(section.get("status"), 20) or "unknown", "reason": "job_error" if section.get("reason") else None,
+            "window": window if len(window) == 2 and all(window) else None, "events": plain_count(section.get("events")),
+            "heavy_threshold": number(section.get("heavy_threshold")), "heavy_count": len(heavy), "heavy": heavy}
+
+
+def signal_unlock_stock(code, section):
+    entry = obj(obj(obj(section).get("stocks")).get(code))
+    events = [{"date": iso_day(event.get("date")), "type": safe_text(event.get("type"), 20) or None,
+               "ratio": number(event.get("ratio")), "value": number(event.get("value"))}
+              for event in (obj(item) for item in arr(entry.get("events"))[:6]) if iso_day(event.get("date"))]
+    return {"code": code, "status": "scheduled" if events else "none", "heavy": entry.get("heavy") is True and bool(events),
+            "ratio_total": number(entry.get("ratio_total")) if events else None, "events": events}
+
+
+def signal_margin(section):
+    """Margin-crowding reminder summary: the session used and the codes in the top decile."""
+    section = obj(section)
+    crowded = [{"code": row[0], "buy_share": number(row[1])} for row in (arr(item) for item in arr(section.get("crowded"))[:2000])
+               if len(row) == 2 and re.fullmatch(r"\d{6}", str(row[0])) and number(row[1]) is not None]
+    return {"status": reason_token(section.get("status"), 20) or "unknown",
+            "reason": reason_token(section.get("reason")) if section.get("reason") in ("margin_unpublished", "margin_rows_lt_30")
+            else "job_error" if section.get("reason") else None,
+            "trade_date": iso_day(section.get("trade_date")), "eligible": plain_count(section.get("eligible")),
+            "quantile": number(section.get("quantile")), "threshold": number(section.get("threshold")),
+            "crowded_count": len(crowded), "crowded": crowded}
+
+
+def signal_margin_stock(code, section):
+    entry = obj(obj(obj(section).get("stocks")).get(code))
+    if not entry:
+        return {"code": code, "status": "not_listed"}
+    return {"code": code, "status": "listed", "buy": number(entry.get("buy")), "balance": number(entry.get("balance")),
+            "buy_share": number(entry.get("buy_share")), "pct": number(entry.get("pct")), "crowded": entry.get("crowded") is True}
+
+
 def signal_index(item):
     item = obj(item)
     values = {key: number(item.get(key)) for key in ("close", "ma200", "distance_ma200", "ma120", "distance_ma120",
@@ -1555,9 +1601,10 @@ class Dashboard:
         return self._signals_cache[1]
 
     def research_signals(self, code=None):
-        """Evening research job output (scheme F overheat label, scheme D index trend); display only."""
+        """Evening research job output (overheat label, index trend, lockup and margin reminders); display only."""
         empty = {"status": "not_configured", "generated_at": None, "age_seconds": None, "inputs": None,
-                 "overheat": None, "index_trend": None, "stock": None, "display_only": True}
+                 "overheat": None, "index_trend": None, "unlock": None, "margin": None, "stock": None, "risk": None,
+                 "display_only": True}
         if self.signals_path is None:
             return empty
         try:
@@ -1603,7 +1650,11 @@ class Dashboard:
                            "generation": number(inputs.get("generation")), "sessions": number(inputs.get("sessions")),
                            "snapshot_revision": safe_text(inputs.get("snapshot_revision"), 16) or None},
                 "overheat": overheat, "index_trend": index_trend,
-                "stock": signal_stock(code, hot) if code else None, "display_only": True}
+                "unlock": signal_unlock(data.get("unlock")), "margin": signal_margin(data.get("margin")),
+                "stock": signal_stock(code, hot) if code else None,
+                "risk": {"unlock": signal_unlock_stock(code, data.get("unlock")),
+                         "margin": signal_margin_stock(code, data.get("margin"))} if code else None,
+                "display_only": True}
 
     def snapshot_check(self):
         """The refresh timer's last check; it can be recent while an unchanged copy stays old."""

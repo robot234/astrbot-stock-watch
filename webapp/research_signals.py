@@ -1,4 +1,5 @@
-"""Daily display-only research signals: overheat label (scheme F) and index trend (scheme D).
+"""Daily display-only research signals: overheat label (scheme F), index trend (scheme D), and the
+lockup-expiry and margin-crowding risk reminders.
 
 They never change formal gates, candidates or recommendations. Run once each evening with an
 interpreter that has numpy, pandas and akshare (the data-probe venv on the Pi):
@@ -6,13 +7,13 @@ interpreter that has numpy, pandas and akshare (the data-probe venv on the Pi):
     python -B -m webapp.research_signals --database SNAPSHOT.sqlite3 --output STATE/research_signals.json
 
 The latest result is replaced atomically. Each new trade date is also appended to the forward
-records next to it (research_overheat_forward.jsonl, research_index_trend_forward.jsonl), which
-are only ever appended to.
+records next to it (research_overheat_forward.jsonl, research_index_trend_forward.jsonl,
+research_unlock_forward.jsonl, research_margin_forward.jsonl), which are only ever appended to.
 """
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,11 @@ APPROXIMATIONS = (
     "st_from_current_name",         # ST taken from the current stock_symbols name, not rebuilt day by day
 )
 EVIDENCE = "docs/research/NEW_SCHEMES_RESULTS_20261007.md"
+CHINA = timezone(timedelta(hours=8))
+# Risk reminders rest on published A-share studies only; both thresholds are display choices, not validated here.
+UNLOCK_DAYS, UNLOCK_HEAVY = 30, 0.05
+MARGIN_LOOKBACK, MARGIN_QUANTILE = 5, 0.9
+MARGIN_COLUMNS = {"sse": "标的证券代码", "szse": "证券代码"}
 
 
 def load_window(database, now):
@@ -210,6 +216,99 @@ def index_trend(fetch=None):
             "source": "akshare.stock_zh_index_daily (sina)", "indices": indices, "errors": errors, "evidence": EVIDENCE}
 
 
+def default_unlock_fetch(start, end):
+    import akshare as ak  # evening job only
+    return ak.stock_restricted_release_detail_em(start_date=start, end_date=end)
+
+
+def default_margin_fetch(exchange, day):
+    import akshare as ak  # evening job only
+    return (ak.stock_margin_detail_sse if exchange == "sse" else ak.stock_margin_detail_szse)(date=day)
+
+
+def finite(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def stock_code(value):
+    text = str(value if value is not None else "").strip()
+    return text.zfill(6) if text.isdigit() and len(text) <= 6 else text
+
+
+def unlock_schedule(today, fetch=None):
+    """Restricted-share releases from today through the next 30 calendar days, summed per code."""
+    fetch = fetch or default_unlock_fetch
+    end = today + timedelta(days=UNLOCK_DAYS)
+    stocks = {}
+    for row in fetch(today.strftime("%Y%m%d"), end.strftime("%Y%m%d")).to_dict(orient="records"):
+        code, day = stock_code(row.get("股票代码")), str(row.get("解禁时间") or "")[:10]
+        if not re.fullmatch(r"\d{6}", code) or not today.isoformat() <= day <= end.isoformat():
+            continue
+        ratio, value = finite(row.get("占解禁前流通市值比例")), finite(row.get("实际解禁市值"))
+        stocks.setdefault(code, []).append({"date": day, "type": str(row.get("限售股类型") or "")[:20],
+                                            "ratio": round(ratio, 6) if ratio is not None else None,
+                                            "value": round(value) if value is not None else None})
+    summary = {}
+    for code, events in stocks.items():
+        events.sort(key=lambda event: event["date"])
+        total = round(sum(event["ratio"] or 0.0 for event in events), 6)
+        summary[code] = {"next_date": events[0]["date"], "ratio_total": total, "heavy": total >= UNLOCK_HEAVY,
+                         "events": events[:6]}
+    heavy = sorted(([code, item["next_date"], item["ratio_total"]] for code, item in summary.items() if item["heavy"]),
+                   key=lambda row: (row[1], row[0]))
+    return {"status": "available", "rule": "UNLOCK_30D_FLOAT5", "window": [today.isoformat(), end.isoformat()],
+            "events": sum(len(events) for events in stocks.values()), "heavy_threshold": UNLOCK_HEAVY,
+            "heavy_count": len(heavy), "heavy": heavy, "stocks": summary,
+            "source": "akshare.stock_restricted_release_detail_em (eastmoney)"}
+
+
+def margin_crowding(days, market, codes, fetch=None):
+    """Margin buying over that day's turnover, ranked among margin stocks, on the newest day both exchanges published."""
+    fetch = fetch or default_margin_fetch
+    index = {code: j for j, code in enumerate(codes)}
+    attempts, rows, t = {}, {}, None
+    for back in range(1, min(MARGIN_LOOKBACK, len(days)) + 1):
+        t, rows, counts = len(days) - back, {}, {}
+        for exchange, column in MARGIN_COLUMNS.items():
+            records = fetch(exchange, days[t].replace("-", "")).to_dict(orient="records")
+            counts[exchange] = len(records)
+            for row in records:
+                j = index.get(stock_code(row.get(column)))
+                buy, balance = finite(row.get("融资买入额")), finite(row.get("融资余额"))
+                amount = market["amount"][t, j] if j is not None else np.nan
+                if buy is not None and balance is not None and np.isfinite(amount) and amount > 0:
+                    rows[codes[j]] = (buy, balance, buy / amount)
+        attempts[days[t]] = counts
+        if all(counts.values()):
+            break
+    else:
+        return {"status": "unavailable", "reason": "margin_unpublished", "attempts": attempts}
+    if len(rows) < MIN_NAMES:
+        return {"status": "unavailable", "reason": "margin_rows_lt_30", "trade_date": days[t], "attempts": attempts}
+    shares = pd.Series({code: share for code, (_buy, _balance, share) in rows.items()})
+    pct, threshold = shares.rank(pct=True), float(shares.quantile(MARGIN_QUANTILE))
+    stocks = {code: {"buy": round(buy), "balance": round(balance), "buy_share": round(share, 6),
+                     "pct": round(float(pct[code]), 4), "crowded": bool(share >= threshold)}
+              for code, (buy, balance, share) in rows.items()}
+    crowded = sorted(([code, item["buy_share"]] for code, item in stocks.items() if item["crowded"]),
+                     key=lambda row: (-row[1], row[0]))
+    return {"status": "available", "rule": "MARGIN_BUY_SHARE_Q90", "trade_date": days[t], "eligible": len(stocks),
+            "quantile": MARGIN_QUANTILE, "threshold": round(threshold, 6), "crowded_count": len(crowded),
+            "crowded": crowded, "stocks": stocks, "attempts": attempts,
+            "source": "akshare.stock_margin_detail_sse / stock_margin_detail_szse (exchanges)"}
+
+
+def guarded(section):
+    try:
+        return section()
+    except Exception as error:  # a reminder source failing must not hide the others
+        return {"status": "unavailable", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
+
+
 def write_atomic(path, payload):
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
@@ -231,21 +330,29 @@ def append_forward(path, key, record):
     return True
 
 
-def build(database, output, *, now=None, fetch=None, skip_index=False):
+def build(database, output, *, now=None, fetch=None, skip_index=False, unlock_fetch=None, margin_fetch=None):
+    """`skip_index` is the offline mode: no index, lockup or margin requests."""
     now = now or datetime.now(timezone.utc)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema": SCHEMA, "generated_at": now.isoformat(), "display_only": True,
                "formal_tables_written": False, "inputs": None}
+    window = None
     try:
-        inputs, days, market, codes, names = load_window(database, now)
+        window = load_window(database, now)
+        inputs, days, market, codes, names = window
         payload["inputs"] = inputs
         payload["overheat"] = overheat(market, codes, names, days)
     except Exception as error:
         payload["overheat"] = {"status": "unavailable", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
+    skipped = {"status": "skipped"}
     payload["index_trend"] = ({"status": "skipped", "indices": {}, "errors": {}} if skip_index else index_trend(fetch))
+    payload["unlock"] = skipped if skip_index else guarded(lambda: unlock_schedule(now.astimezone(CHINA).date(), unlock_fetch))
+    payload["margin"] = (skipped if skip_index else
+                         guarded(lambda: margin_crowding(window[1], window[2], window[3], margin_fetch)) if window else
+                         {"status": "unavailable", "reason": "snapshot_unavailable"})
     write_atomic(output, payload)
-    recorded = {"overheat": False, "index_trend": False}
+    recorded = {"overheat": False, "index_trend": False, "unlock": False, "margin": False}
     hot = payload["overheat"]
     if hot.get("status") == "available":
         recorded["overheat"] = append_forward(output.with_name("research_overheat_forward.jsonl"), "trade_date", {
@@ -260,6 +367,15 @@ def build(database, output, *, now=None, fetch=None, skip_index=False):
             "key": key, "recorded_at": payload["generated_at"],
             "indices": {code: {k: item[k] for k in ("date", "close", "ma200", "above_ma200", "ma120", "above_ma120")}
                         for code, item in trend["indices"].items()}})
+    unlock, margin = payload["unlock"], payload["margin"]
+    if unlock.get("status") == "available" and payload["inputs"]:
+        recorded["unlock"] = append_forward(output.with_name("research_unlock_forward.jsonl"), "trade_date", {
+            "trade_date": payload["inputs"]["trade_date"], "recorded_at": payload["generated_at"], "window": unlock["window"],
+            "events": unlock["events"], "heavy": unlock["heavy"]})
+    if margin.get("status") == "available":
+        recorded["margin"] = append_forward(output.with_name("research_margin_forward.jsonl"), "trade_date", {
+            "trade_date": margin["trade_date"], "recorded_at": payload["generated_at"], "eligible": margin["eligible"],
+            "threshold": margin["threshold"], "crowded": margin["crowded"]})
     payload["forward_recorded"] = recorded
     return payload
 
@@ -275,6 +391,8 @@ def main(argv=None):
     print(json.dumps({"overheat": {k: hot.get(k) for k in ("status", "reason", "trade_date", "pool_size", "hot_count")},
                       "index_trend": {"status": trend.get("status"), "errors": trend.get("errors"),
                                       "dates": {c: i.get("date") for c, i in (trend.get("indices") or {}).items()}},
+                      "unlock": {k: payload["unlock"].get(k) for k in ("status", "reason", "window", "events", "heavy_count")},
+                      "margin": {k: payload["margin"].get(k) for k in ("status", "reason", "trade_date", "eligible", "crowded_count")},
                       "forward_recorded": payload["forward_recorded"]}, ensure_ascii=False), flush=True)
     return 0 if hot.get("status") == "available" and trend.get("status") in ("available", "skipped") else 1
 
