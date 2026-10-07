@@ -35,6 +35,36 @@ from . import formal_source_policy
 
 PLUGIN_NAME = "astrbot_stock_watch"
 
+
+def _load_schema_defaults() -> dict:
+    try:
+        schema = json.loads(Path(__file__).with_name("_conf_schema.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {key: item.get("default") for key, item in schema.items() if isinstance(item, dict)} if isinstance(schema, dict) else {}
+
+
+# Fallbacks for keys absent from a stored config come from the panel schema, so code and panel agree.
+_SCHEMA_DEFAULTS = MappingProxyType(_load_schema_defaults())
+
+
+def _schema_default(key: str, fallback):
+    return _SCHEMA_DEFAULTS.get(key, fallback)
+
+
+# Old keys kept in stored configs; none of them is read by the current intraday path.
+_DEPRECATED_SETTINGS = MappingProxyType({
+    "confirmation_enabled": ("intraday_confirmation_periods", False),
+    "confirmation_periods": ("intraday_confirmation_periods", 2),
+    "confirmation_max_gap_seconds": ("intraday_confirmation_max_gap_seconds", 90),
+})
+
+# The research pools are a separate observation track with fixed bounds; each freeze records them.
+RESEARCH_POOL_POLICY = "technical-research-v1"
+RESEARCH_POOL_PARAMETERS = MappingProxyType({"deep_limit": 300, "primary_limit": 7, "radar_limit": 20,
+                                             "price_min": 2.0, "price_max": 80.0})
+RESEARCH_POOL_INDEPENDENT_OF = ("price_min", "price_max", "deep_screen_limit")
+
 _TUSHARE_FALLBACK_DIAGNOSTICS = {
     "network_failed": "network",
     "network": "network",
@@ -109,8 +139,9 @@ class Main(Star):
         self.store = StockStore(data_dir / "stock_watch.sqlite3")
         configured_artifact = str(self.config.get("intraday_artifact_path", "") or "").strip()
         self.intraday_artifact_path = Path(configured_artifact) if configured_artifact else data_dir / "intraday_quotes.json"
+        self.deprecated_settings = self._warn_deprecated_settings()
         timeout = self._float("request_timeout", 10, 3, 60)
-        self.http = HttpRuntime(timeout, self._int("max_concurrency", 8, 1, 64))
+        self.http = HttpRuntime(timeout, self._max_concurrency())
         self.raw_dataset_key = str(self.config.get("tushare_raw_dataset_key", "tushare_daily")).strip() or "tushare_daily"
         # Normalize the deprecated natural-day setting once at the boundary;
         # every production bulk request below uses the session-count contract.
@@ -137,7 +168,7 @@ class Main(Star):
             timeout,
             str(self.config.get("tushare_url", "")),
             str(self.config.get("tushare_token", "")),
-            self._int("max_concurrency", 8, 1, 64),
+            self._max_concurrency(),
             self.http,
             self.store,
             bulk_page_size=self._int("tushare_bulk_page_size", 6000, 1, 10000),
@@ -756,7 +787,7 @@ class Main(Star):
         source_time = self._quote_source_timestamp(quote)
         if fetched is None or source_time is None:
             return [], ["missing_quote_timestamp"]
-        max_age = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
+        max_age = max(30, self._quote_interval_seconds() * 2)
         allowed_future_skew = self._int("quote_clock_skew_seconds", 120, 0, 900)
         if any(not -allowed_future_skew <= (current - value).total_seconds() <= max_age for value in (fetched, source_time)):
             return [], ["stale_quote"]
@@ -1775,6 +1806,20 @@ class Main(Star):
             return max(minimum, min(int(self.config.get(key, default)), maximum))
         except (TypeError, ValueError):
             return default
+
+    def _quote_interval_seconds(self) -> int:
+        return self._int("quote_interval_seconds", _schema_default("quote_interval_seconds", 5), 5, 600)
+
+    def _max_concurrency(self, maximum: int = 64) -> int:
+        return self._int("max_concurrency", _schema_default("max_concurrency", 5), 1, maximum)
+
+    def _warn_deprecated_settings(self) -> list[str]:
+        found = []
+        for key, (replacement, legacy_default) in _DEPRECATED_SETTINGS.items():
+            if key in self.config and self.config.get(key) != legacy_default:
+                found.append(key)
+                logger.warning("[%s] 配置项 %s 已废弃且不生效；连续确认请改用 %s", PLUGIN_NAME, key, replacement)
+        return found
 
     @staticmethod
     def _session_count_from_config(config) -> int:
@@ -3900,7 +3945,7 @@ class Main(Star):
             try:
                 result = await enrich(
                     enrich_targets,
-                    self._int("max_concurrency", 8, 1, 64),
+                    self._max_concurrency(),
                     actual,
                 )
             except asyncio.CancelledError:
@@ -4108,7 +4153,7 @@ class Main(Star):
                 else:
                     network_targets.append(quote)
             if network_targets:
-                concurrency = self._int("max_concurrency", 8, 1, 64)
+                concurrency = self._max_concurrency()
                 try:
                     fetched = await self.quotes.enrich_indicators(network_targets, concurrency, as_of)
                 except TypeError as exc:
@@ -4706,7 +4751,7 @@ class Main(Star):
         """Accept only timestamps in the bounded source-clock window (Line B)."""
         current = now or datetime.now(CHINA_TZ)
         current = current.astimezone(CHINA_TZ) if current.tzinfo else current.replace(tzinfo=CHINA_TZ)
-        max_age = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
+        max_age = max(30, self._quote_interval_seconds() * 2)
         allowed_future_skew = self._int("quote_clock_skew_seconds", 120, 0, 900)
         source_health = getattr(self, "_source_health", None)
         if not isinstance(source_health, dict):
@@ -5926,7 +5971,7 @@ class Main(Star):
             return "delivery creation time is in the future"
         if str(delivery.get("signal") or "") == "radar_observation":
             quote_at = self._intraday_delivery_time(delivery.get("quote_fetched_at"))
-            maximum = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
+            maximum = max(30, self._quote_interval_seconds() * 2)
             if quote_at is None or not 0 <= (current - quote_at).total_seconds() <= maximum or age > maximum:
                 return "radar observation quote expired"
             pools = await self._current_research_pools(current.date().isoformat())
@@ -5955,7 +6000,7 @@ class Main(Star):
             return "opportunity market regime changed before delivery"
 
         fetched = self._intraday_delivery_time(delivery.get("quote_fetched_at"))
-        quote_max_age = max(30, self._int("quote_interval_seconds", 30, 10, 600) * 2)
+        quote_max_age = max(30, self._quote_interval_seconds() * 2)
         if fetched is None:
             return "opportunity quote timestamp is unverified"
         quote_age = (current - fetched).total_seconds()
@@ -6718,7 +6763,7 @@ class Main(Star):
             "expected_size": int(values.get("expected_size") or 0),
             "coverage": float(values.get("coverage") or 0),
             "opportunity_allowed": bool(confirmed and regime != "risk_off"),
-        }, "valid_for_seconds": max(30, self._int("quote_interval_seconds", 30, 5, 600) * 2)}
+        }, "valid_for_seconds": max(30, self._quote_interval_seconds() * 2)}
 
     async def _intraday_cycle(self, now: datetime | None = None) -> dict[str, object]:
         current = (now or datetime.now(CHINA_TZ)).astimezone(CHINA_TZ)
@@ -7113,7 +7158,7 @@ class Main(Star):
                 health["consecutive_failures"] += 1
                 health["last_error_at"] = datetime.now(CHINA_TZ).isoformat()
                 logger.exception("[%s] 盘中监听失败", PLUGIN_NAME)
-            await asyncio.sleep(self._int("quote_interval_seconds", 30, 5, 600))
+            await asyncio.sleep(self._quote_interval_seconds())
 
     async def _intraday_market_loop(self):
         """Refresh whole-market regime independently of the 5s target feed."""
@@ -7483,11 +7528,13 @@ class Main(Star):
         batch_id = str(active.get("batch_id") or active.get("active_batch_id") or "")
         if existing and existing.get("batch_id") == batch_id:
             return existing
-        snapshot = await self._store_call(self.store.research_input, as_of=as_of, deep_limit=300)
+        parameters = dict(RESEARCH_POOL_PARAMETERS)
+        snapshot = await self._store_call(self.store.research_input, as_of=as_of, deep_limit=parameters["deep_limit"])
         if not snapshot or snapshot["batch_id"] != batch_id:
             return {}
-        primary, radar, diagnostics = select_pools(snapshot["day_rows"], snapshot["histories"])
-        diagnostics["selection_policy"] = "technical-research-v1"
+        primary, radar, diagnostics = select_pools(snapshot["day_rows"], snapshot["histories"], **parameters)
+        diagnostics["selection_policy"] = RESEARCH_POOL_POLICY
+        diagnostics["parameters"] = {**parameters, "independent_of": list(RESEARCH_POOL_INDEPENDENT_OF)}
         return await self._store_call(self.store.save_research_pools, snapshot, primary, radar, diagnostics)
 
     async def _current_research_pools(self, today: str) -> dict:
@@ -7506,12 +7553,27 @@ class Main(Star):
         return await self._store_call(load_evidence, path, pools)
 
     @staticmethod
+    def _research_parameter_text(pools: Mapping[str, object]) -> str:
+        try:
+            raw = pools.get("diagnostics")
+            diagnostics = raw if isinstance(raw, Mapping) else json.loads(str(raw or "{}"))
+            recorded = diagnostics.get("parameters") if isinstance(diagnostics, Mapping) else None
+            values = {key: float(recorded[key]) for key in RESEARCH_POOL_PARAMETERS} if isinstance(recorded, dict) else None
+        except (TypeError, ValueError, KeyError):
+            values = None
+        if not values:
+            return "研究参数：冻结记录未包含参数（旧版本冻结）。"
+        return (f"研究参数（独立固定，不读取 {'/'.join(RESEARCH_POOL_INDEPENDENT_OF)}）：成交额前{values['deep_limit']:g}只深筛，"
+                f"重点{values['primary_limit']:g}、警戒{values['radar_limit']:g}，价格{values['price_min']:g}-{values['price_max']:g}元。")
+
+    @staticmethod
     def _research_pool_text(pools: Mapping[str, object], pool: str, evidence: dict | None = None) -> str:
         rows = pools.get("picks", {}).get(pool, [])
         title = "次日重点观察" if pool == "primary" else "名单外警戒观察"
         lines = [f"{title}｜{pools['trade_date']} 收盘后生成",
                  f"原始批次：{pools['batch_id']}；冻结：{pools['frozen_at']} UTC；来源：{pools['source']} 未复权",
-                 "技术排序仅供研究；停牌/涨跌停/公告未逐股核验时为未知，不代表可买。"]
+                 "技术排序仅供研究；停牌/涨跌停/公告未逐股核验时为未知，不代表可买。",
+                 Main._research_parameter_text(pools)]
         if pool == "radar":
             lines.append("盘中仅监听下列有限名单；相对冻结收盘价上涨达到警戒幅度才提示观察，不是全市场扫描。")
         for row in rows:
@@ -8045,7 +8107,7 @@ class Main(Star):
                     rows, _rejection = self._raw_indicator_rows(bars.get(quote.code, []), expected_code=quote.code)
                     apply_daily_indicators(quote, rows)
             else:
-                concurrency = self._int("max_concurrency", 5, 1, 20)
+                concurrency = self._max_concurrency(20)
                 try:
                     await self.quotes.enrich_indicators(quotes, concurrency)
                 except TypeError as exc:
