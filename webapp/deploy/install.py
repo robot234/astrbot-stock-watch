@@ -29,7 +29,7 @@ def main():
     assert manifest["release"] == release and set(manifest["files"]) == set(payload)
     assert all(hashlib.sha256(data).hexdigest() == manifest["files"][name] for name, data in payload.items())
     service = payload.get("webapp/deploy/stock-watch-web.service", b"")
-    assert b"--artifact /var/lib/stock-watch-web-snapshot/intraday_quotes.json" in service, "artifact_wiring_missing"
+    assert b"--artifact /home/pi/astrbot/data/plugin_data/astrbot_stock_watch/intraday_quotes.json" in service, "artifact_wiring_missing"
     web = Path("/home/pi/apps/stock-watch-web")
     helper = Path("/opt/stock-watch-web-snapshot")
     state = Path("/var/lib/stock-watch-web-snapshot")

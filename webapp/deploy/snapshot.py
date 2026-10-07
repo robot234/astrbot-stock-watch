@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import tempfile
 import time
@@ -12,6 +13,25 @@ import time
 SOURCE = Path("/home/pi/astrbot/data/plugin_data/astrbot_stock_watch/stock_watch.sqlite3")
 TARGET = Path("/var/lib/stock-watch-web-snapshot/stock_watch.sqlite3")
 STATUS_NAME = "snapshot_status.json"
+
+
+class Terminated(Exception):
+    """systemd stop or TimeoutStartSec; raised so publish() still removes its staging copy."""
+
+
+def _terminate(signum, _frame):
+    raise Terminated(signum)
+
+
+def remove_orphans(target):
+    """Staging files left by a run that was killed outright; call only while holding the refresh lock."""
+    removed = []
+    for pattern in (".snapshot-*", ".status-*"):
+        for path in sorted(Path(target).parent.glob(pattern)):
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
+                removed.append(path.name)
+    return removed
 
 
 def fingerprint(path):
@@ -130,16 +150,18 @@ def _record_check_quietly(target, result, category=None):
 def main():
     import fcntl
 
+    signal.signal(signal.SIGTERM, _terminate)
     with (TARGET.parent / ".refresh.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        orphans = len(remove_orphans(TARGET))
         try:
             result = publish(SOURCE, TARGET)
         except Exception as exc:
             _record_check_quietly(TARGET, {"status": "failed"}, type(exc).__name__)
-            print(json.dumps({"status": "failed", "category": type(exc).__name__}), flush=True)
+            print(json.dumps({"status": "failed", "category": type(exc).__name__, "orphans_removed": orphans}), flush=True)
             raise SystemExit(1) from None
         _record_check_quietly(TARGET, result)
-        print(json.dumps(result), flush=True)
+        print(json.dumps({**result, "orphans_removed": orphans}), flush=True)
 
 
 if __name__ == "__main__":

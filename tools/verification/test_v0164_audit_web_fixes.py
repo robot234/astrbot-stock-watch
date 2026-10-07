@@ -122,12 +122,16 @@ def test_provider_telemetry_and_rate_limit_deadlines_stay_separate(plugin_db):
     with sqlite3.connect(plugin_db) as db:
         db.execute("INSERT INTO provider_health(provider,last_success_at,last_error_at,success_count,error_count,last_quality) "
                    "VALUES('tushare','2026-09-30T08:00:00',NULL,10,0,'good')")
+        db.execute("INSERT INTO provider_health(provider,last_success_at,last_error_at,success_count,error_count,last_quality) "
+                   "VALUES('eastmoney','2026-08-29T04:07:44',NULL,2,0,'partial')")
         for name, blocked in (("stock_basic", now - 86400), ("daily", now + 3600), ("trade_cal", 0), ("index_daily", "garbage")):
             db.execute("INSERT INTO provider_api_state(api_name,blocked_until,updated_at) VALUES(?,?,'2026-10-07T01:00:00')",
                        (name, blocked))
     providers = {row["name"]: row for row in Dashboard(plugin_db, now=lambda: HOLIDAY).query("health")["data"]["providers"]}
     assert providers["tushare"]["telemetry"] == "provider_health"
     assert providers["tushare"]["success_at"].startswith("2026-09-30T08:00:00")
+    assert providers["tushare"]["stale"] is False
+    assert providers["eastmoney"]["stale"] is True and providers["eastmoney"]["last_activity_at"].startswith("2026-08-29")
     expired, future = providers["stock_basic"], providers["daily"]
     assert expired["telemetry"] == "api_rate_limit_state" and expired["success_at"] is None
     assert expired["blocked_until"] == datetime.fromtimestamp(now - 86400, timezone.utc).isoformat()

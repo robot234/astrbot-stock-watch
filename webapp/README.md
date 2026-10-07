@@ -99,6 +99,24 @@ No application route writes settings, sends messages, triggers screening or
 places trades. Deployment/reload, real-data acceptance and publication remain
 outside the first-version scope.
 
+## Update An Installed Release
+
+`deploy/install.py` is first-install only. Later releases use `deploy/update.py`
+on the Pi; it never touches the plugin directory or the AstrBot container.
+
+```powershell
+py webapp/deploy/package.py <release> <commit>   # packages committed bytes, not the CRLF checkout
+scp .local_records/pi-web-deployment/<release><commit>/runtime.tar.gz webapp/deploy/update.py pi@192.168.124.6:/tmp/
+ssh pi@192.168.124.6 "sudo /usr/bin/python3 -B /tmp/update.py /tmp/runtime.tar.gz <sha256> <release>"
+```
+
+It stages the release, probes a temporary `127.0.0.1:18767` instance against
+the live snapshot, switches `current` with automatic rollback, switches the
+snapshot helper, runs one snapshot check and writes
+`/home/pi/apps/stock-watch-web/deployments/<release>/rollback.sh`. Server
+arguments are read from the installed user unit. The snapshot helper removes
+staging files left by killed runs before each check and cleans up on SIGTERM.
+
 ## Explicit Existing Database
 
 Pass an already authorized, consistent **local** SQLite snapshot explicitly:

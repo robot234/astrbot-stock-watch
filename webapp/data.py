@@ -1076,7 +1076,11 @@ class Snapshot:
         result = []
         for row in self.rows("provider_health", required=("provider",), order="provider", limit=30):
             success, failure = instant(row.get("last_success_at")), instant(row.get("last_error_at"))
+            # The current plugin no longer writes provider_health; week-old rows are history, not today's state.
+            activity = max((value for value in (success, failure) if value), default=None)
             result.append({"name": safe_text(row.get("provider")), "telemetry": "provider_health",
+                           "last_activity_at": activity.isoformat() if activity else None,
+                           "stale": activity is None or (self.now - activity) > timedelta(days=7),
                            "success_at": success.isoformat() if success else None,
                            "error_at": failure.isoformat() if failure else None,
                            "quality": safe_text(row.get("last_quality")) or "unknown",
@@ -1089,6 +1093,7 @@ class Snapshot:
             updated = instant(row.get("updated_at"))
             streak = number(row.get("failure_streak"))
             result.append({"name": safe_text(row.get("api_name")), "telemetry": "api_rate_limit_state",
+                           "last_activity_at": updated.isoformat() if updated else None, "stale": False,
                            "success_at": None, "error_at": None, "quality": None,
                            "error": error_category(row.get("last_error")),
                            "success_count": None, "error_count": None,

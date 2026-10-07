@@ -42,10 +42,14 @@ check("legacy_expired_unix_seconds", app.providerKind({...healthy, blocked_until
 check("legacy_future_unix_seconds", app.providerKind({...healthy, blocked_until: now + 3600}) === "warn");
 check("invalid_deadline_not_pause", app.providerKind({...healthy, blocked_until: "garbage"}) === "ok");
 check("unix_seconds_display", app.bj(1759800000) !== "未知");
+const legacy = {name: "eastmoney", telemetry: "provider_health", stale: true, last_activity_at: "2026-08-29T04:07:44+00:00", success_at: "2026-08-29T04:07:44+00:00", quality: "partial"};
+check("stale_telemetry_unknown", app.providerKind(legacy) === "unk" && app.providerText(legacy).includes("旧版遥测"));
 
 app.state.ctx.overview = {meta: {status: "available"}, data: {batches: [{state: "published"}], quality: "good", complete: true, data_date: "2026-09-30"}};
 app.state.ctx.health = {data: {providers: [rate({blocked_active: false})]}};
 check("rate_only_not_outage", app.dataState().kind === "ok");
+app.state.ctx.health = {data: {providers: [legacy]}};
+check("stale_telemetry_not_outage", app.dataState().kind === "ok");
 app.state.ctx.health = {data: {providers: [rate({blocked_active: true, blocked_until: new Date((now + 3600) * 1000).toISOString()})]}};
 check("active_block_partial", app.dataState().kind === "warn");
 

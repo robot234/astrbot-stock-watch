@@ -222,6 +222,7 @@ const rateOnly = p => p.telemetry === "api_rate_limit_state";
 function providerKind(p) {
   if (blockedNow(p) || circuitNow(p)) return "warn";
   if (rateOnly(p)) return Number(p.failure_streak) > 0 || p.error ? "warn" : "unk";
+  if (p.stale) return "unk";
   const err = toDate(p.error_at), ok = toDate(p.success_at);
   if (err && (!ok || err > ok)) return "warn";
   if (!ok) return "unk";
@@ -231,7 +232,8 @@ function providerKind(p) {
 function providerText(p) {
   if (blockedNow(p)) return `${p.name} 接口限流暂停到 ${bj(p.blocked_until)}`;
   if (circuitNow(p)) return `${p.name} 接口熔断到 ${bj(p.circuit_open_until)}`;
-  if (rateOnly(p)) return Number(p.failure_streak) > 0 || p.error ? `${p.name} 接口最近连续失败 ${fmt(p.failure_streak, 0)} 次` : `${p.name} 只有限流状态，未采集成功记录`;
+  if (rateOnly(p)) return Number(p.failure_streak) > 0 || p.error ? `${p.name} 接口最近连续失败 ${fmt(p.failure_streak, 0)} 次（状态更新于 ${bj(p.state_updated_at)}）` : `${p.name} 只有限流状态，未采集成功记录`;
+  if (p.stale) return `${p.name} 旧版遥测，最后记录 ${bj(p.last_activity_at)}，当前插件已不再更新`;
   if (!toDate(p.success_at)) return `${p.name} 接口没有成功记录`;
   return toDate(p.error_at) > toDate(p.success_at) ? `${p.name} 接口最近一次请求失败` : `${p.name} 接口数据质量未达正常`;
 }
@@ -256,7 +258,7 @@ function dataState() {
   if (!providers) reasons.push({kind:"warn", label:"部分可用", text:"数据接口状态读取失败", code:h?.meta?.reason || "health_unavailable"});
   else providers.forEach(p => {
     const kind = providerKind(p);
-    if (kind === "ok" || (kind === "unk" && rateOnly(p))) return;
+    if (kind === "ok" || (kind === "unk" && (rateOnly(p) || p.stale))) return;
     const code = blockedNow(p) ? "rate_limited" : circuitNow(p) ? "breaker_open" : p.error || p.quality || "provider_unverified";
     reasons.push(kind === "warn" ? {kind:"warn", label:"部分可用", text:providerText(p), code} : {kind:"unk", label:"未知", text:providerText(p), code});
   });
@@ -360,7 +362,7 @@ function pipeline(d, chain) {
   if (!providers) steps.push(step("unk", "抓取", badge("unknown"), `接口状态读取失败 · 原因代码 ${health?.meta?.reason || "health_unavailable"}`, "—"));
   else {
     const kinds = providers.map(providerKind), bad = kinds.filter(k => k === "warn").length, unknown = kinds.filter(k => k === "unk").length;
-    const latest = providers.map(p => p.success_at).filter(v => toDate(v)).sort((a, b) => toDate(b) - toDate(a))[0];
+    const latest = providers.filter(p => !p.stale).map(p => p.success_at).filter(v => toDate(v)).sort((a, b) => toDate(b) - toDate(a))[0];
     const kind = bad ? "warn" : unknown === providers.length ? "unk" : "ok";
     steps.push(step(kind, "抓取", badge(bad ? "partial" : kind === "unk" ? "unknown" : "ok"), `${providers.length} 个接口/来源 · ${bad ? `${bad} 个暂停中或最近失败` : "没有生效中的暂停或最近失败"}${unknown ? ` · ${unknown} 个没有成功遥测` : ""}`, latest ? bj(latest) : "未知"));
   }
@@ -667,7 +669,7 @@ function renderHealth(d) {
   const svc = `<section class="panel"><div class="svc">${cell("数据库", `${badge(d.database)}${badge(d.integrity)}`, `${fmt(d.tables, 0)} 张表 · ${esc(checkText)}`)}${cell("Web 版本", webValue, webSub)}${cell("链路验收", kindBadge(chain.kind, chain.text), esc(acc ? `${acc.date} · 检查 ${bj(acc.checked_at)}` : chain.reasons[0]?.text || ""))}${cell("盘中行情", live?.status === "available" ? badge("available") : badge("live_market_missing"), `${esc(SESSION_HINT[session.phase] || "交易日历未知")} · 原因代码 ${esc(live?.reason || "live_market_missing")}`)}</div></section>`;
   const PK = {ok:"正常", warn:"部分可用", unk:"未知"}, TELEMETRY = {provider_health:"成功/失败遥测", api_rate_limit_state:"限流状态"};
   const deadline = p => p.blocked_until ? `${bj(p.blocked_until)}${blockedNow(p) ? "（生效中）" : "（已过期）"}` : p.circuit_open_until ? `熔断 ${bj(p.circuit_open_until)}${circuitNow(p) ? "（生效中）" : "（已过期）"}` : "—";
-  const prov = (d.providers || []).map(p => {const k = providerKind(p), rate = rateOnly(p); return `<tr><td>${esc(p.name)}<small>${esc(TELEMETRY[p.telemetry] || "来源未知")}</small></td><td>${kindBadge(k, PK[k], p.quality || "")}</td><td>${rate ? `<span class="muted">未采集</span>` : esc(bj(p.success_at))}</td><td>${esc(p.error_at ? bj(p.error_at) : "—")}</td><td>${rate ? `<span class="muted">不适用</span>` : badge(p.quality)}</td><td class="mono">${esc(p.error || (Number(p.failure_streak) > 0 ? `连续失败 ${p.failure_streak}` : "—"))}</td><td>${esc(deadline(p))}</td><td>${esc(p.state_updated_at ? bj(p.state_updated_at) : "—")}</td></tr>`;});
+  const prov = (d.providers || []).map(p => {const k = providerKind(p), rate = rateOnly(p); return `<tr><td>${esc(p.name)}<small>${esc(TELEMETRY[p.telemetry] || "来源未知")}${p.stale ? esc(`（旧版，最后记录 ${bj(p.last_activity_at)}，已停止更新）`) : ""}</small></td><td>${kindBadge(k, PK[k], p.quality || "")}</td><td>${rate ? `<span class="muted">未采集</span>` : esc(bj(p.success_at))}</td><td>${esc(p.error_at ? bj(p.error_at) : "—")}</td><td>${rate ? `<span class="muted">不适用</span>` : badge(p.quality)}</td><td class="mono">${esc(p.error || (Number(p.failure_streak) > 0 ? `连续失败 ${p.failure_streak}` : "—"))}</td><td>${esc(deadline(p))}</td><td>${esc(p.state_updated_at ? bj(p.state_updated_at) : "—")}</td></tr>`;});
   const batches = (d.batches || []).map(b => `<tr><td class="mono">${esc(b.id)}</td><td>${esc(b.date)}</td><td class="r num">${fmt(b.generation, 0)}</td><td>${badge(b.state)}</td><td class="r num">${fmt(b.rows, 0)}</td><td>${esc(b.basis === "unadjusted" ? "未复权" : b.basis || "未知")}</td><td>${esc(bj(b.published_at))}</td></tr>`);
   // Older records stay visible but folded, so a past failure is not read as today's outage.
   const current = d.data_date || acc?.date;

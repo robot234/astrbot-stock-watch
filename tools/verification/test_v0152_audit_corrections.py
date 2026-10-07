@@ -145,7 +145,7 @@ def test_packaged_service_explicitly_wires_artifact_and_dynamic_links_are_safe()
     service = (root / "webapp/deploy/stock-watch-web.service").read_text(encoding="utf-8")
     installer = (root / "webapp/deploy/install.py").read_text(encoding="utf-8")
     app = (root / "webapp/static/app.js").read_text(encoding="utf-8")
-    assert "--artifact /var/lib/stock-watch-web-snapshot/intraday_quotes.json" in service
+    assert "--artifact /home/pi/astrbot/data/plugin_data/astrbot_stock_watch/intraday_quotes.json" in service
     assert "artifact_wiring_missing" in installer
     assert "const stockHref" in app and "const percentWidth" in app
     assert 'href="#stock/${c.code}"' not in app
