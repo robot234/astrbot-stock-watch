@@ -38,8 +38,17 @@ CAPABILITIES = (
     "overview", "signals", "candidates", "research_pools", "research_parameters", "stock_detail",
     "stock_active_raw_bars", "stock_search", "performance", "health", "provider_state_v2",
     "session_calendar", "coverage_breakdown", "settings", "intraday", "revision",
-    "snapshot_check_status", "version",
+    "snapshot_check_status", "version", "research_catalog",
 )
+# Offline research freezes shown read-only; stages are curated from each study's own delivery documents.
+RESEARCH_CATALOG = (
+    {"file": "ULTRASHORT_REVERSAL_V1_FROZEN.json", "stages": ("not_passed", "forward_pending"),
+     "documents": ("ULTRASHORT_REVERSAL_V1_DELIVERY.md", "ULTRASHORT_REVERSAL_V1_EVALUATION.md",
+                   "ULTRASHORT_REVERSAL_V1_FORWARD_PLAN.md")},
+    {"file": "LLM_SECTOR_FIRST_EXP_V0_FROZEN.json", "stages": ("exploration",),
+     "documents": ("LLM_SECTOR_FIRST_EXP_V0.md", "LLM_SECTOR_FIRST_EXP_V0_REVIEW.md")},
+)
+RESEARCH_STAGES = ("not_passed", "exploration", "forward_pending", "passed")
 TRADING_PHASES = ((9 * 60 + 15, "pre_open"), (9 * 60 + 30, "call_auction"), (11 * 60 + 30, "trading"),
                   (13 * 60, "lunch_break"), (15 * 60, "trading"))
 PUBLIC_SETTINGS = {
@@ -133,6 +142,45 @@ def error_category(value):
 
 def safe_text(value, limit=120):
     return re.sub(r"[\x00-\x1f\x7f]", "", str(value or ""))[:limit]
+
+
+def catalog_entry(directory, spec):
+    """Project one frozen research file; the list stays separate from formal candidates."""
+    path = directory / spec["file"]
+    if path.stat().st_size > 262144:
+        raise ValueError("frozen_file_too_large")
+    raw = path.read_bytes()
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("frozen_file_not_object")
+    items = []
+    for row in arr(data.get("list"))[:20]:
+        if not isinstance(row, dict):
+            continue
+        daily = row.get("source_daily_risk") if isinstance(row.get("source_daily_risk"), dict) else {}
+        code = re.sub(r"^(?:sh|sz|bj)\.", "", str(row.get("code") or ""))
+        items.append({"rank": int(number(row.get("rank")) or 0) or None,
+                      "code": code if re.fullmatch(r"\d{6}", code) else None,
+                      "name": safe_text(row.get("name"), 40), "sector": safe_text(row.get("sector_id"), 40) or None,
+                      "close": number(row.get("close") if row.get("close") is not None else daily.get("close")),
+                      "return5": number(row.get("five_day_continuous_return", row.get("return5"))),
+                      "amount20": number(row.get("amount20")),
+                      "raw_sha256": safe_text(row.get("raw_sha256") or row.get("raw_file_sha256"), 64) or None})
+    risk_basis = data.get("risk_basis") or next((row.get("risk_basis") for row in arr(data.get("list")) if isinstance(row, dict)), "")
+    return {"id": safe_text(data.get("rule") or data.get("mode"), 60) or spec["file"], "file": spec["file"],
+            "file_sha256": hashlib.sha256(raw).hexdigest(), "label": safe_text(data.get("label"), 80) or None,
+            "frozen_at": safe_text(data.get("frozen_at"), 40) or None, "input_as_of": safe_text(data.get("input_as_of"), 20) or None,
+            "registration_commit": safe_text(data.get("registration_commit"), 40) or None,
+            "execution_commit": safe_text(data.get("execution_commit"), 40) or None,
+            "status": safe_text(data.get("status") or data.get("latest_capture_status"), 60) or None,
+            "historical_evaluation": safe_text(data.get("historical_evaluation_status"), 160) or None,
+            "next_observation": safe_text(data.get("next_observation"), 160) or None,
+            "selected_sectors": [safe_text(value, 40) for value in arr(data.get("selected_sectors"))[:10]],
+            "risk_basis": safe_text(risk_basis, 160) or None, "price_basis": safe_text(data.get("price_basis"), 60) or None,
+            "stages": [stage for stage in spec["stages"] if stage in RESEARCH_STAGES],
+            "eligibility": "research_only", "plugin_integrated": False,
+            "documents": ["docs/research/" + name for name in spec["documents"]],
+            "items": items}
 
 
 def ohlc(row, basis_key="price_basis"):
@@ -1149,7 +1197,20 @@ class Dashboard:
         self.snapshot_status_path = (Path(snapshot_status_path).absolute() if snapshot_status_path
                                      else self.database.with_name("snapshot_status.json"))
         self.build_info_path = ROOT / "webapp" / "build_info.json"
+        self.catalog_dir = ROOT / "docs" / "research"
         self.clock = now or (lambda: datetime.now(timezone.utc))
+
+    def research_catalog(self):
+        entries, unavailable = [], []
+        for spec in RESEARCH_CATALOG:
+            try:
+                entries.append(catalog_entry(self.catalog_dir, spec))
+            except FileNotFoundError:
+                unavailable.append({"file": spec["file"], "reason": "frozen_file_missing"})
+            except (OSError, UnicodeError, ValueError, TypeError):
+                unavailable.append({"file": spec["file"], "reason": "frozen_file_unreadable"})
+        return {"entries": entries, "unavailable": unavailable, "stage_vocabulary": list(RESEARCH_STAGES),
+                "formal_tables_written": False}
 
     def snapshot_check(self):
         """The refresh timer's last check; it can be recent while an unchanged copy stays old."""
@@ -1326,6 +1387,13 @@ class Dashboard:
             except Exception:
                 return {"meta": {"status": "unavailable", "reason": "artifact_unavailable", "read_only": True,
                                  "dataset_kind": "intraday_artifact", "at": self.clock().isoformat()}, "data": None}
+        if route == "research_catalog":
+            data = self.research_catalog()
+            return {"meta": {"status": "partial" if data["unavailable"] else "available", "read_only": True,
+                             "dataset_kind": "research_files", "database": self.database.name, "at": self.clock().isoformat(),
+                             "sources": [{"dataset": "research_catalog", "status": "frozen_files", "count": len(data["entries"])}],
+                             "notices": [item["file"] + ":" + item["reason"] for item in data["unavailable"]]},
+                    "data": data}
         if route == "version":
             data = self.version()
             return {"meta": {"status": "available" if data["build"]["status"] == "recorded" else "partial", "read_only": True,

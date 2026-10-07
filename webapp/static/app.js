@@ -83,6 +83,7 @@ const STATUS = {
   pending:["待到期","info"], running:["运行中","info"], valuation_in_progress:["估值中","info"], stored_not_live:["已存非实时","info"],
   unknown:["未知","unk"], unknown_order:["未知","unk"], not_checked:["未检查","unk"], closed:["休市","unk"], closed_day:["休市","unk"], live_market_missing:["无盘中行情","unk"],
   not_applicable:["不适用","unk"], recent:["近期","ok"], unchanged:["源未变化","ok"],
+  not_passed:["未通过检验","warn"], exploration:["探索","lab"], forward_pending:["待前瞻","info"], passed:["已通过","ok"],
   empty:["暂无冻结","unk"], not_comparable:["不可比","unk"], plan_expired:["计划过期","unk"], not_entered:["未入场","unk"],
   unfilled:["模拟未成交","unk"], not_filled:["未成交","unk"], not_executable:["不可执行","unk"],
   unverified:["未验证","lab"], research_only:["未验证","lab"], simulated_fill:["模拟成交","lab"], entered:["已模拟入场","lab"]
@@ -108,6 +109,7 @@ const REASONS = {
   old_business_date:"研究池业务日已超过 7 天，属于旧批次", freeze_identity_or_time_unverified:"冻结身份或时间无法核实，按未知处理",
   search_query_invalid:"请输入股票代码或名称", daily_bars_not_collected:"没有这只股票的已存日线（active raw 与旧日线表都没有）",
   no_formal_samples:"暂无正式推荐样本，无法计算；不等于 0%", insufficient_history:"已存日线少于 20 根，均线不完整",
+  research_catalog_unavailable:"当前 Web 后端没有研究成果目录接口，或冻结文件未随发布包部署",
   live_market_missing:"没有可用的盘中行情", filters_excluded_all:"当前筛选条件排除了全部候选", snapshot_metadata_missing:"快照元数据缺失",
   daily_acceptance_missing:"尚无每日链路验收记录", daily_acceptance_stale:"链路验收日期与数据日期不一致", no_candidates:"当前有效批次没有可见候选",
   no_records:"当前数据源下没有记录", no_signal_records:"当前 origin 下没有已存信号", bars_unavailable:"缺少可用的未复权 OHLC 数据",
@@ -139,7 +141,7 @@ const kpi = (label, value, sub = "", opts = {}) => `<div class="kpi ${opts.cls |
 const notice = (kind, icon, body) => `<div class="notice ${kind}">${ic(icon)}<div>${body}</div></div>`;
 const titleMap = {overview:"今日总览",signals:"盯盘",intraday:"盯盘",candidates:"候选池",stock:"个股详情",research:"研究观察池",performance:"历史表现",health:"系统健康",settings:"策略设置"};
 const defaultFilter = () => ({query:"", risk:"", sort:"desc", board:"all", cheap:false, noSt:false});
-const state = {view:"overview", watchSeg:"signals", selectedCode:null, horizon:5, period:60, ma:true, candidates:[], signals:[], performance:null, stock:null, request:0, chartCleanup:null, controller:null, dataRevision:null, snapshotRevision:null, artifactRevision:null, polling:false, meta:null, ctx:{overview:null, health:null, research:null, perf3:null, version:null}, filter:defaultFilter()};
+const state = {view:"overview", watchSeg:"signals", selectedCode:null, horizon:5, period:60, ma:true, candidates:[], signals:[], performance:null, stock:null, request:0, chartCleanup:null, controller:null, dataRevision:null, snapshotRevision:null, artifactRevision:null, polling:false, meta:null, ctx:{overview:null, health:null, research:null, perf3:null, version:null, catalog:null}, filter:defaultFilter()};
 
 async function api(route, signal) {
   const response = await fetch(`/api/${route}`, {signal, cache:"no-store"});
@@ -482,16 +484,30 @@ function paperHistoryRows(rows) {
     rows.map(r => `<tr><td>${esc(r.record_id)}<small>${esc(r.entry_date || bj(r.confirmed_at))}</small></td><td>${badge(r.fill_status)}<small>仅模拟记录，非真实持仓</small></td><td>${badge(r.current_qualification_state)}<small>${esc(r.entry_qualification_version || "绑定资格未知")}</small></td><td>${esc(r.accounting_version || "旧版未标明")}</td><td>${[1, 3, 5].map(h => mark(r, h)).join("")}</td></tr>`), 900);
 }
 const GATES = ["超额均值 > 0 且 t ≥ 2", "36 个月中 ≥ 24 个月为正", "超额胜率 > 0", "绝对收益均值 > 0", "2021、2022、2023 每年超额 > 0"];
+// Offline studies frozen in docs/research: each list stays on its own, never merged into formal candidates.
+function catalogSection(payload = state.ctx.catalog) {
+  const data = payload?.data;
+  if (!data) return panel("独立研究成果 · 离线冻结文件", empty("研究成果目录不可用", payload?.meta?.reason || "research_catalog_unavailable"));
+  const entry = e => {
+    const rows = (e.items || []).map(r => `<tr><td>${esc(r.rank ?? "—")}</td><td>${r.code ? link(r.code, r.name) : esc(r.name || "—")}</td><td>${esc(r.sector || "—")}</td><td class="r num">${fmt(r.close)}</td><td class="r num ${tone(r.return5)}">${finite(r.return5) ? pct(Number(r.return5) * 100) : "—"}</td><td class="r num">${finite(r.amount20) ? `${fmt(Number(r.amount20) / 1e8)}<small>亿</small>` : "—"}</td></tr>`);
+    const meta = `<div class="status-rows"><div class="status-row"><span>冻结时间 / 输入日</span><span>${esc(bj(e.frozen_at))} · ${esc(e.input_as_of || "未知")}</span></div><div class="status-row"><span>注册提交 / 文件哈希</span><span class="mono">${esc((e.registration_commit || "未知").slice(0, 12))} · ${esc((e.file_sha256 || "").slice(0, 16))}</span></div><div class="status-row"><span>历史检验</span><span>${esc(e.historical_evaluation || e.status || "未记录")}</span></div>${e.next_observation ? `<div class="status-row"><span>下一次观察</span><span>${esc(e.next_observation)}</span></div>` : ""}<div class="status-row"><span>风险口径</span><span>${esc(e.risk_basis || "未记录")}</span></div></div>`;
+    const title = `${esc(e.id)} · ${(e.stages || []).map(s => badge(s)).join("")} ${badge("research_only")}`;
+    return panel(title, `<div class="lab-band">${ic("flask-conical")}<div><b>${esc(e.label || "研究观察")}</b><br>独立冻结名单，不是正式推荐，未接入插件自动策略，不写入正式候选或推荐表。</div></div>` + meta +
+      table(["排名", "标的", "板块", {t:"冻结收盘", cls:"r"}, {t:"5日涨跌", cls:"r"}, {t:"20日成交额", cls:"r"}], rows, 720), `<span class="src">${esc(e.file)}</span>`);
+  };
+  const missing = (data.unavailable || []).map(u => notice("", "triangle-alert", `${esc(u.file)} 不可用 · 原因代码 ${esc(u.reason)}`)).join("");
+  return `<h2 class="section-title">独立研究成果 · 离线冻结文件（只读）</h2>` + missing + (data.entries || []).map(entry).join("");
+}
 function renderResearch() {
   const rs = state.ctx.research || {status:"unavailable", reason:"research_pool_schema_unavailable"};
   const band = `<div class="lab-band">${ic("flask-conical")}<div><b>未验证 · 不是买入建议</b><br>研究记录独立冻结，不进入历史表现统计。</div></div>`;
   const primary = rs.primary || [], radar = rs.radar || [], history = rs.paper_history || [];
   if (rs.status === "empty") {
-    return pageHead("研究观察池") + band + panel("研究观察池", empty("暂无研究冻结", rs.reason || "no_research_freeze", ["收盘后由插件 /观察选股 或自动收盘冻结", "冻结后等待下一次只读快照发布"]));
+    return pageHead("研究观察池") + band + panel("研究观察池", empty("暂无研究冻结", rs.reason || "no_research_freeze", ["收盘后由插件 /观察选股 或自动收盘冻结", "冻结后等待下一次只读快照发布"])) + catalogSection();
   }
   if (["unavailable", "missing"].includes(rs.status) || (!primary.length && !radar.length && !history.length && !rs.trade_date)) {
     const steps = rs.reason === "research_not_exposed" ? ["部署与 main 对应的 Web 后端（含研究池接口）", "部署后到系统健康页核对 Web 版本能力列表"] : ["确认研究冻结任务已在插件侧运行", "确认研究池表已同步到只读快照"];
-    return pageHead("研究观察池") + band + panel("研究观察池", empty("不可用", rs.reason || "research_pool_schema_unavailable", steps));
+    return pageHead("研究观察池") + band + panel("研究观察池", empty("不可用", rs.reason || "research_pool_schema_unavailable", steps)) + catalogSection();
   }
   const rule = (k, v) => `<div class="rule"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   const rp = rs.parameters;
@@ -504,7 +520,7 @@ function renderResearch() {
   const take = arr => {const out = arr.slice(0, Math.max(0, left)); left -= out.length; return out;};
   const p = take(primary), r = take(radar), h = take(history);
   return pageHead("研究观察池", "", [`记录上限 ${LIMITS.recommendations}`]) + band + rules + gates +
-    panel(`观察池 · ${p.length}`, researchRows(p)) + panel(`警戒池 · ${r.length}`, researchRows(r)) + panel(`历史模拟记录 · ${h.length}`, paperHistoryRows(h));
+    panel(`观察池 · ${p.length}`, researchRows(p)) + panel(`警戒池 · ${r.length}`, researchRows(r)) + panel(`历史模拟记录 · ${h.length}`, paperHistoryRows(h)) + catalogSection();
 }
 
 // Stock detail.
@@ -699,6 +715,7 @@ async function contextJobs(view, signal) {
   if (view !== "overview") jobs.overview = soft("overview", signal);
   if (view !== "health") jobs.health = soft("health", signal);
   if (view === "health") jobs.version = soft("version", signal);
+  if (view === "research") jobs.catalog = soft("research_catalog", signal);
   if (view === "overview") jobs.candidates = soft("candidates", signal);
   if (view === "candidates") jobs.perf3 = soft("performance?horizon=3", signal);
   const keys = Object.keys(jobs), values = await Promise.all(Object.values(jobs));
@@ -712,6 +729,7 @@ function applyContext(view, payload, ctx) {
   else if (ctx.candidates) state.ctx.research = researchOf(ctx.candidates);
   if (ctx.perf3) state.ctx.perf3 = ctx.perf3.data || null;
   if (ctx.version) state.ctx.version = ctx.version.data ? ctx.version : null;
+  if (ctx.catalog) state.ctx.catalog = ctx.catalog;
 }
 
 async function load({silent=false} = {}) {

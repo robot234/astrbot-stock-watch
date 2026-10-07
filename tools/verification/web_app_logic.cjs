@@ -81,6 +81,20 @@ const research = app.renderResearch();
 check("research_parameters", research.includes("深筛前 300") && research.includes("重点 7") && research.includes("technical-research-v1"));
 check("research_stale_reason", research.includes("已有更新交易日的行情"));
 
+// Offline research freezes render as separate, research-only lists.
+app.state.ctx.catalog = {meta: {status: "available"}, data: {unavailable: [], entries: [
+  {id: "ULTRASHORT_REVERSAL_V1", file: "ULTRASHORT_REVERSAL_V1_FROZEN.json", file_sha256: "a".repeat(64), label: "未通过检验，仅观察",
+   stages: ["not_passed", "forward_pending"], frozen_at: "2026-10-05T19:16:33+08:00", input_as_of: "2026-09-30",
+   items: [{rank: 1, code: "600857", name: "宁波中百", close: 17.22, return5: -0.2896, amount20: 222121814}]},
+  {id: "LLM_SECTOR_FIRST_EXP_V0", file: "LLM_SECTOR_FIRST_EXP_V0_FROZEN.json", file_sha256: "b".repeat(64), label: "研究观察，未验证收益",
+   stages: ["exploration"], items: [{rank: 1, code: "300110", name: "华仁药业", sector: "C27医药制造业", close: 3.17, return5: -0.1975}]}]}};
+const catalog = app.renderResearch();
+check("catalog_separate_lists", catalog.includes("ULTRASHORT_REVERSAL_V1") && catalog.includes("LLM_SECTOR_FIRST_EXP_V0") && catalog.includes("不写入正式候选或推荐表"));
+check("catalog_stages", catalog.includes("未通过检验") && catalog.includes("待前瞻") && catalog.includes("探索"));
+check("catalog_return_percent", catalog.includes("-28.96%") && catalog.includes("#stock/600857"));
+app.state.ctx.catalog = {meta: {status: "unavailable", reason: "route_not_found"}, data: null};
+check("catalog_unavailable", app.renderResearch().includes("研究成果目录不可用"));
+
 check("performance_empty", app.renderPerformance({sample_count: 0, records: [], status_counts: {}}).includes("暂无正式推荐样本"));
 
 const health = app.renderHealth({database: "readable", integrity: "not_checked", tables: 72, data_date: "2026-09-30",

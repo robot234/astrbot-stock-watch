@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -12,6 +13,7 @@ from webapp.deploy.snapshot import publish, record_check
 
 
 HOLIDAY = datetime(2026, 10, 7, 2, 30, tzinfo=timezone.utc)
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
@@ -204,6 +206,34 @@ def test_snapshot_check_distinguishes_unchanged_from_stopped_timer(tmp_path):
     (tmp_path / "snapshot_status.json").unlink()
     assert Dashboard(target, now=lambda: later).query("settings")["meta"]["snapshot"]["check"]["reason"] == "snapshot_status_missing"
     assert not list(tmp_path.glob(".status-*"))
+
+
+def test_research_catalog_binds_frozen_files_without_formal_promotion(plugin_db, tmp_path):
+    dashboard = Dashboard(plugin_db, now=lambda: HOLIDAY)
+    before = hashlib.sha256(plugin_db.read_bytes()).digest()
+    payload = dashboard.query("research_catalog")
+    assert payload["meta"]["status"] == "available"
+    data = payload["data"]
+    assert data["formal_tables_written"] is False
+    assert data["stage_vocabulary"] == ["not_passed", "exploration", "forward_pending", "passed"]
+    ultrashort, sector = data["entries"]
+    assert ultrashort["id"] == "ULTRASHORT_REVERSAL_V1" and ultrashort["stages"] == ["not_passed", "forward_pending"]
+    assert sector["id"] == "LLM_SECTOR_FIRST_EXP_V0" and sector["stages"] == ["exploration"]
+    frozen = dashboard.catalog_dir / "ULTRASHORT_REVERSAL_V1_FROZEN.json"
+    assert ultrashort["file_sha256"] == hashlib.sha256(frozen.read_bytes()).hexdigest()
+    assert [row["code"] for row in ultrashort["items"]] == ["600857", "601086", "603221", "600487", "603823"]
+    assert ultrashort["items"][0]["close"] == 17.22 and ultrashort["input_as_of"] == "2026-09-30"
+    assert [row["code"] for row in sector["items"]] == ["300110", "600664", "301201", "600246", "301093"]
+    assert sector["items"][0]["close"] == 3.17 and sector["items"][0]["sector"] == "C27医药制造业"
+    assert all(entry["eligibility"] == "research_only" and entry["plugin_integrated"] is False for entry in data["entries"])
+    assert hashlib.sha256(plugin_db.read_bytes()).digest() == before
+    dashboard.catalog_dir = tmp_path
+    (tmp_path / "LLM_SECTOR_FIRST_EXP_V0_FROZEN.json").write_text("{not json", encoding="utf-8")
+    degraded = dashboard.query("research_catalog")
+    assert degraded["meta"]["status"] == "partial" and degraded["data"]["entries"] == []
+    assert {item["reason"] for item in degraded["data"]["unavailable"]} == {"frozen_file_missing", "frozen_file_unreadable"}
+    package = (ROOT / "webapp" / "deploy" / "package.py").read_text(encoding="utf-8")
+    assert "docs/research/ULTRASHORT_REVERSAL_V1_FROZEN.json" in package and "docs/research/LLM_SECTOR_FIRST_EXP_V0_FROZEN.json" in package
 
 
 def test_version_reports_capabilities_and_build(plugin_db, tmp_path):

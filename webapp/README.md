@@ -39,6 +39,11 @@ Mobile acceptance here means a responsive browser viewport, not LAN access.
 - Settings: allowlisted public effective values and separate schema defaults.
 - `/api/version`: API version, capability list, build release/revision (written
   into `webapp/build_info.json` by `deploy/package.py`) and database schema.
+- `/api/research_catalog`: the allowlisted offline research freezes in
+  `docs/research/*_FROZEN.json` (packaged with the Web release), each with its
+  file SHA-256, freeze time, input date, registration commit and curated stage
+  (`not_passed`, `exploration`, `forward_pending`, `passed`). Lists are shown
+  separately on the research page and never written to formal tables.
 
 The snapshot timer writes `snapshot_status.json` beside the snapshot on every
 check (`published`, `unchanged` or `failed`). The dashboard reads it from next

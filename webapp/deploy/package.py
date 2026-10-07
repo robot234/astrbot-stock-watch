@@ -23,6 +23,7 @@ def main():
     paths = [ROOT / name for name in (
         "webapp/__init__.py", "webapp/server.py", "webapp/data.py",
         "data_evidence.py", "paper_forward.py", "paper_review.py", "_conf_schema.json",
+        "docs/research/ULTRASHORT_REVERSAL_V1_FROZEN.json", "docs/research/LLM_SECTOR_FIRST_EXP_V0_FROZEN.json",
         "webapp/deploy/snapshot.py", "webapp/deploy/stock-watch-web.service",
         "webapp/deploy/stock-watch-web-snapshot.service",
         "webapp/deploy/stock-watch-web-snapshot.timer",
